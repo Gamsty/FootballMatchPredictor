@@ -1,26 +1,30 @@
 """
 Data Collection Module
 
-Fetches football match data from Football-Data.org API
+Fetches football match data from the Football-Data.org API (v4).
+Free tier allows 10 requests/minute, so we enforce a 6-second delay between calls.
+
+Data pipeline:
+    1. Fetch raw match data from API (nested JSON) -> save to data/raw/
+    2. Flatten nested structure into tabular format -> save to data/processed/
+    3. Processed CSV is used by feature engineering and model training
 """
 
 import requests
 import pandas as pd
 import time
-import json
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 
-# Load enviroment variables
+# Load environment variables (reads FOOTBALL_API_KEY from .env)
 load_dotenv()
 
-class FootballDataCollecor:
-    # Handles data colection from Football-Data API
+class FootballDataCollector:
+    """Handles data collection from the Football-Data.org API."""
 
     def __init__(self, api_key=None):
         """
-        Initialize the data colector
+        Initialize the data collector.
 
         Args:
             api_key (str): API key for Football-Data.org
@@ -28,14 +32,15 @@ class FootballDataCollecor:
         self.api_key = api_key or os.getenv('FOOTBALL_API_KEY')
         self.base_url = 'https://api.football-data.org/v4'
         self.headers = {'X-Auth-Token': self.api_key}
-        self.rate_limit_delay = 6 # seconds (10 request/min = 6s between)
+        # Free tier: 10 requests/min, so we wait 6 seconds between API calls
+        self.rate_limit_delay = 6
 
     def _make_requests(self, endpoint, params=None):
         """
         Make API request with error handling and rate limiting
 
         Args:
-            endpoint (str): API endpoint (e.g., '/competitions)
+            endpoint (str): API endpoint (e.g., '/competitions')
             params (dict): Query parameters
 
         Returns:
@@ -92,7 +97,7 @@ class FootballDataCollecor:
             return pd.DataFrame(data['matches'])
         return pd.DataFrame()
     
-    def get_tea(self, team_id):
+    def get_team(self, team_id):
         """
         Get team details
 
@@ -127,7 +132,7 @@ class FootballDataCollecor:
 
         Args:
             competition_id (int): Competition ID
-            season (list): List of season years
+            seasons (list): List of season years
             output_file (str): Path to save CSV file
 
         Returns:
@@ -146,7 +151,7 @@ class FootballDataCollecor:
                 # Add season column
                 matches_df['season'] = season
                 all_matches.append(matches_df)
-                print(f"    Retrived {len(matches_df)} matches")
+                print(f"    Retrieved {len(matches_df)} matches")
             else:
                 print(f"    No data for season {season}")
 
@@ -154,7 +159,7 @@ class FootballDataCollecor:
         if all_matches:
             combined_df = pd.concat(all_matches, ignore_index=True)
 
-            # Filter only finished matched (only need the scores)
+            # Filter only finished matches (we only need completed games with final scores)
             finished_matches = combined_df[combined_df['status'] == 'FINISHED'].copy()
 
             print(f"\nTotal matches: {len(combined_df)}")
@@ -171,15 +176,18 @@ class FootballDataCollecor:
     
     def flatten_match_data(self, matches_df):
         """
-        Flatten nested JSON structure for easier analysis
+        Flatten nested JSON structure into flat columns for ML processing.
+
+        The API returns deeply nested dicts (e.g., match['homeTeam']['name']).
+        This extracts all relevant fields into a single-level dictionary per match,
+        making it suitable for DataFrame operations and model training.
 
         Args:
-            matches_df (pd.DataFrame): Raw matches structure
+            matches_df (pd.DataFrame): Raw matches with nested JSON columns
 
         Returns:
-            pd.DataFrame: Flattened dataframe
+            pd.DataFrame: Flattened dataframe with one column per field
         """
-        # Create a new dataframe with flattened structure
         flattened = []
 
         for _, match in matches_df.iterrows():
@@ -197,7 +205,7 @@ class FootballDataCollecor:
                     'home_team_name': match['homeTeam']['name'],
                     'home_team_short': match['homeTeam'].get('shortName', ''),
 
-                    # Awey team
+                    # Away team
                     'away_team_id': match['awayTeam']['id'],
                     'away_team_name': match['awayTeam']['name'],
                     'away_team_short': match['awayTeam'].get('shortName', ''),
@@ -219,13 +227,17 @@ class FootballDataCollecor:
             
         return pd.DataFrame(flattened)
     
-# Main execution
+# Main execution — runs the full data pipeline:
+# 1. Fetch raw match data from API for specified seasons
+# 2. Save raw data to CSV (data/raw/)
+# 3. Flatten nested JSON into tabular format
+# 4. Save processed data to CSV (data/processed/)
 if __name__ == "__main__":
-    # Initalize collector
-    collector = FootballDataCollecor()
+    # Initialize collector (reads API key from .env)
+    collector = FootballDataCollector()
 
-    # Competitions IDs (from API documentation)
-    PREMIER_LEAGE = 2021
+    # Competition IDs (from Football-Data.org API documentation)
+    PREMIER_LEAGUE = 2021
     LA_LIGA = 2014
     BUNDESLIGA = 2002
     SERIE_A = 2019
@@ -239,7 +251,7 @@ if __name__ == "__main__":
     seasons = [2021, 2022, 2023] # Seasons
 
     raw_data = collector.collect_historical_data(
-        competition_id=PREMIER_LEAGE,
+        competition_id=PREMIER_LEAGUE,
         seasons=seasons,
         output_file='../data/raw/premier_league_raw.csv'
     )
@@ -256,7 +268,7 @@ if __name__ == "__main__":
     flattened_data.to_csv(output_path, index=False)
 
     print(f"\nFlattened data saved to {output_path}")
-    print(f"Total recors: {len(flattened_data)}")
+    print(f"Total records: {len(flattened_data)}")
 
     # Show sample
     print("\nSample data:")
