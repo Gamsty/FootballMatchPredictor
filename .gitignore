@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files
+*.csv
+*.pkl
+*.joblib
+backend/data/
+
+# Models
+backend/models/*.pkl
+backend/models/*.joblib
+
+# Environment
+.env
+
+# VS Code
+.vscode/
+
+# Node
+node_modules/
+dist/
+.env.local
+
+# Database
+*.db
+*.sqlite

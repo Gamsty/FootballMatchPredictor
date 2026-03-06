@@ -1,0 +1,29 @@
+# Data Collection & Processing
+requests
+pandas
+numpy
+
+# Machine Learing
+scikit-learn
+xgboost
+joblib
+
+# Database
+psycopg2-binary
+sqlalchemy
+
+# API
+Flask
+Flask-CORS
+python-dotenv
+
+# Data Visialization (for notebooks)
+matplotlib
+seaborn
+
+# Jupyter (for analysis)
+jupyter
+notebook
+
+# Utilities
+schedule
