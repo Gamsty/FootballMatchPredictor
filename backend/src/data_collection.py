@@ -249,12 +249,12 @@ if __name__ == "__main__":
     print("FOOTBALL DATA COLLECTION")
     print("=" * 60)
 
-    # Dynamically get current + last 2 seasons
+    # Get current season (free tier only supports current season)
     # Football seasons start in August — before August, current season = previous year
     current_year = datetime.now().year
     current_season = current_year if datetime.now().month >= 8 else current_year - 1
-    seasons = list(range(current_season - 2, current_season + 1))
-    print(f"Collecting seasons: {seasons}")
+    seasons = [current_season]
+    print(f"Collecting season: {current_season}")
 
     raw_data = collector.collect_historical_data(
         competition_id=PREMIER_LEAGUE,
