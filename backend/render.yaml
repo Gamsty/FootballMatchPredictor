@@ -1,0 +1,26 @@
+services:
+  # Backend API
+  - type: web
+    name: football-predictor-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn wsgi:app"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: football-predictor-db
+          property: connectionString
+      - key: FLASK_ENV
+        value: production
+
+databases:
+  # PostgreSQL Database
+  - name: football-predictor-db
+    databaseName: football_predictor
+    user: football_user
+    region: oregon
+    plan: free
