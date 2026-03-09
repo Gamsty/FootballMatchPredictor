@@ -1,29 +1,24 @@
-# Data Collection & Processing
-requests
-pandas
-numpy
-
-# Machine Learing
-scikit-learn
-xgboost
-joblib
+# Core Flask
+Flask
+Flask-CORS
+Werkzeug
 
 # Database
 psycopg2-binary
-sqlalchemy
+SQLAchemy
 
-# API
-Flask
-Flask-CORS
+# ML & Data Science
+scikit-learn
+xgboost
+pandas
+numpy
+joblib
+
+# API & HTTP
+requests
+
+# Enviroment
 python-dotenv
 
-# Data Visialization (for notebooks)
-matplotlib
-seaborn
-
-# Jupyter (for analysis)
-jupyter
-notebook
-
-# Utilities
-schedule
+# Production Server
+gunicorn

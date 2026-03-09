@@ -19,8 +19,16 @@ import os
 load_dotenv()
 
 # Database connection setup — reads DATABASE_URL from .env file
-# Falls back to local PostgreSQL if not set
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost/football_predictor')
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Convert to postgreqsl
+if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+# Default to local database if not set
+if not DATABASE_URL:
+    DATABASE_URL= 'postgresql://postgres:password@localhost/football_predictor'
+
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)  # Factory for creating database sessions
 Base = declarative_base()  # Base class for all ORM models

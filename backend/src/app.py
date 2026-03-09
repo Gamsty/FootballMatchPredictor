@@ -19,6 +19,7 @@ from datetime import datetime
 import pandas as pd
 import joblib
 from dotenv import load_dotenv
+import os
 
 from database import DatabaseManager, Match, Team, Prediction, MatchFeatures
 from feature_engineering import FeatureEngineer
@@ -30,10 +31,12 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
-# Configure CORS — allows React frontend (Vite on 5173, CRA on 3000) to call the API
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+
+# Configure CORS — allows React frontend (CRA on 3000) to call the API
 CORS(app, resources={
     r"/api/*": {
-    "origins": ["http://localhost:5173", "http://localhost:3000"],
+    "origins": [FRONTEND_URL, "http://localhost:3000"],
     "methods": ["GET", "POST", "PUT", "DELETE"],
     "allow_headers": ["Content-Type"]
     }
