@@ -42,8 +42,9 @@ CORS(app, resources={
     }
 })
 
-# Load ML model
-MODEL_PATH = '../models/xgboost_model.pkl'
+# Load ML model (resolve path relative to this file, not the working directory)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, '..', 'models', 'xgboost_model.pkl')
 model_data = None
 
 def load_model():

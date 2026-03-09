@@ -17,11 +17,13 @@ ENV/
 *.csv
 *.pkl
 *.joblib
+!backend/models/xgboost_model.pkl
 backend/data/
 
-# Models
+# Models (exclude all except the production model)
 backend/models/*.pkl
 backend/models/*.joblib
+!backend/models/xgboost_model.pkl
 
 # Environment
 .env
