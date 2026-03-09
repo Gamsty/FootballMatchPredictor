@@ -39,3 +39,4 @@ dist/
 # Database
 *.db
 *.sqlite
+*.dump

@@ -33,10 +33,15 @@ app = Flask(__name__)
 
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
 
-# Configure CORS — allows React frontend (CRA on 3000) to call the API
+# Configure CORS — allows React frontend to call the API
 CORS(app, resources={
     r"/api/*": {
-    "origins": [FRONTEND_URL, "http://localhost:3000"],
+    "origins": [
+        FRONTEND_URL,
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://football-match-predictor-pearl.vercel.app",
+    ],
     "methods": ["GET", "POST", "PUT", "DELETE"],
     "allow_headers": ["Content-Type"]
     }
