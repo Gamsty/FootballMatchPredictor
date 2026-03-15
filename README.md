@@ -1,6 +1,6 @@
-# ⚽ Football Match Predictor
+# Football Match Predictor
 
-A full-stack machine learning application that predicts football match outcomes using historical data and XGBoost classification.
+A full-stack machine learning application that predicts football match outcomes across multiple betting markets. Uses XGBoost classification trained on 9 European leagues with 40,000+ historical matches.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Flask](https://img.shields.io/badge/Flask-3.1-green)
@@ -8,124 +8,120 @@ A full-stack machine learning application that predicts football match outcomes 
 ![ML](https://img.shields.io/badge/ML-XGBoost-orange)
 ![Deployment](https://img.shields.io/badge/Deployed-Vercel%20%2B%20Render-success)
 
-## 🌟 Features
+## Live Demo
 
-- **Match Prediction**: Predict outcomes (Home Win, Draw, Away Win) with probability scores
-- **ML Model**: XGBoost classifier trained on Premier League data
-- **Feature Engineering**: 13 statistical features including form, goals, and head-to-head records
-- **Statistics Dashboard**: Comprehensive analytics with model performance metrics
-- **Real-time API**: RESTful API serving predictions and historical data
-- **Dark Theme UI**: Modern React interface with Tailwind CSS
+- **Frontend**: [football-match-predictor-pearl.vercel.app](https://football-match-predictor-pearl.vercel.app)
+- **API**: [footballmatchpredictor.onrender.com](https://footballmatchpredictor.onrender.com)
 
-## 🏗️ Architecture
+> Note: The Render free tier spins down after inactivity — first load may take 30-60 seconds, maybe even longer.
+
+## Features
+
+- **Multi-market predictions** — Match result (H/D/A), Double Chance, BTTS, Over/Under 2.5, Half-Time result, Corners, Cards
+- **Combo bets** — Result+BTTS, Result+O/U, BTTS+O/U combinations with combined probabilities
+- **Smart bet recommendations** — "Best Bet" (highest edge) and "Safest Bet" (highest probability) with reasoning
+- **Accumulator builder** — Select bets across matches, calculates combined odds and potential returns
+- **Match tagging** — High Confidence, Upset Pick, Banker classifications
+- **Auto-refresh** — Daily fixture updates via APScheduler (06:00 UTC)
+- **9 leagues** — Premier League, Championship, La Liga, Bundesliga, Serie A, Ligue 1, Eredivisie, Primeira Liga, Champions League
+
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                 Frontend (React + Vite)                  │
-│         Deployed on Vercel                               │
-│  - Match Prediction Interface                            │
-│  - Statistics Dashboard                                  │
-│  - Toast Notification System                             │
+│              Frontend (React 19 + Vite 6)               │
+│                   Deployed on Vercel                    │
+│  - Dashboard with match cards grouped by league         │
+│  - Match detail modal with all betting markets          │
+│  - Accumulator builder with live odds calculation       │
+│  - Filter by confidence, upset picks, bankers           │
 └──────────────────────┬──────────────────────────────────┘
-                       │ HTTPS/REST API
+                       │ REST API (Axios)
 ┌──────────────────────┴──────────────────────────────────┐
-│              Backend (Flask + Gunicorn)                  │
-│         Deployed on Render                               │
-│  - ML Model Serving (XGBoost)                           │
-│  - Feature Engineering Pipeline                          │
-│  - RESTful API Endpoints                                 │
+│            Backend (Flask + Gunicorn)                    │
+│                  Deployed on Render                      │
+│  - XGBoost model serving (match result + 10 markets)    │
+│  - Feature engineering pipeline (13 features)           │
+│  - Prediction caching (LRU, 6-hour TTL)                │
+│  - APScheduler for daily fixture refresh                │
 └──────────────────────┬──────────────────────────────────┘
-                       │
+                       │ SQLAlchemy ORM
 ┌──────────────────────┴──────────────────────────────────┐
-│            Database (PostgreSQL)                        │
-│         Hosted on Render                                 │
-│  - Teams, Matches, Features, Predictions                │
+│               PostgreSQL Database                       │
+│                  Hosted on Render                        │
+│  - 40,000+ matches across 9 leagues                     │
+│  - Teams, Features, Standings, Predictions              │
 └─────────────────────────────────────────────────────────┘
 ```
 
-## 🚀 Live Demo
+## Prediction Markets
 
-- **Frontend**: [https://football-match-predictor-pearl.vercel.app](https://football-match-predictor-pearl.vercel.app)
-- **API**: [https://footballmatchpredictor.onrender.com](https://footballmatchpredictor.onrender.com)
+| Market | Outcomes | Description |
+|--------|----------|-------------|
+| Match Result | Home / Draw / Away | Main 1X2 prediction |
+| Double Chance | 1X / X2 / 12 | Combined outcome probabilities |
+| BTTS | Yes / No | Both teams to score |
+| Over/Under 2.5 | Over / Under | Total goals threshold |
+| Half-Time Result | Home / Draw / Away | First half prediction |
+| Corners O/U | Over / Under 9.5 | Total corners prediction |
+| Cards O/U | Over / Under 3.5 | Total cards prediction |
+| Combos | 18 combinations | Result+BTTS, Result+O/U, BTTS+O/U |
 
-## 📊 Model Performance
-
-- **Algorithm**: XGBoost Classifier
-- **Training Data**: Premier League matches (2021-2024 seasons)
-- **Compared Models**: XGBoost, Random Forest, Gradient Boosting, Logistic Regression
-- **Best Model**: XGBoost (selected for best performance)
-
-### Features Used
-
-| Feature | Description |
-|---------|-------------|
-| Home/Away Form | Win rate over last 5 matches |
-| Goals Scored | Average goals scored per match |
-| Goals Conceded | Average goals conceded per match |
-| Home/Away Win Rate | Historical win percentage at home/away |
-| Head-to-Head | Historical record between the two teams |
-| Days Since Last Match | Rest days before the match |
-
-## 🛠️ Tech Stack
+## Tech Stack
 
 ### Backend
-- Python 3.11
-- Flask 3.1 (API framework)
-- SQLAlchemy (ORM)
-- PostgreSQL (Database)
-- Scikit-learn (ML preprocessing)
-- XGBoost (Classification)
-- Pandas & NumPy (Data processing)
-- Gunicorn (Production server)
+- Python 3.11, Flask 3.1, Gunicorn
+- SQLAlchemy + PostgreSQL
+- XGBoost, Scikit-learn, Pandas, NumPy
+- APScheduler (daily fixture refresh)
+- football-data.org API (match data)
 
 ### Frontend
-- React 19
-- Vite 6 (Build tool)
-- Tailwind CSS 4 (Styling)
-- React Router 7 (Navigation)
-- Axios (HTTP client)
+- React 19, Vite 6
+- Tailwind CSS 4
+- React Router 7, Axios
 
 ### Deployment
-- Vercel (Frontend hosting)
-- Render (Backend + PostgreSQL database)
+- **Frontend**: Vercel (auto-deploy from GitHub)
+- **Backend**: Render (Web Service + PostgreSQL)
 
-## 📦 Installation
+## Installation
 
 ### Prerequisites
 - Python 3.11+
 - Node.js 18+
 - PostgreSQL 14+
+- API key from [football-data.org](https://www.football-data.org/)
 
 ### Backend Setup
 
 ```bash
-# Clone repository
-git clone https://github.com/Gamsty/FootballMatchPredictor.git
-cd FootballMatchPredictor/backend
+cd backend
 
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Set up environment variables
+# Configure environment
 cp .env.example .env
-# Edit .env with your configuration:
-#   FOOTBALL_API_KEY=your_api_key
-#   DATABASE_URL=postgresql://user:password@localhost:5432/football_predictor
+# Edit .env with your database URL and API key
 
-# Initialize database
+# Initialize database tables
 python src/database.py
 
-# Load historical data
+# Load historical match data from CSVs
 python src/load_data.py
 
-# Create features
+# Load external league data (standings, etc.)
+python src/load_external_csv.py
+
+# Compute features for all matches
 python src/feature_engineering.py
 
-# Train model (optional - pre-trained model included)
+# Train models (optional — pre-trained models included)
 python src/model_training.py
 
 # Run development server
@@ -137,159 +133,125 @@ python src/app.py
 ```bash
 cd frontend
 
-# Install dependencies
 npm install
-
-# Run development server
 npm run dev
 ```
 
 The app will be available at `http://localhost:5173` (frontend) and `http://localhost:5000` (API).
 
-## 🔌 API Endpoints
+## API Endpoints
 
-### Health Check
-- `GET /api/health` - API status and model info
-
-### Teams
-- `GET /api/teams` - Get all teams
-- `GET /api/teams/:id` - Get team details with statistics and recent form
+### Core
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/health` | API status and model info |
+| GET | `/api/teams` | List all teams |
+| GET | `/api/teams/:id` | Team details with stats and recent form |
+| GET | `/api/competitions` | List of leagues in database |
 
 ### Predictions
-- `POST /api/predict` - Predict match outcome
-```json
-{
-  "home_team_id": 1,
-  "away_team_id": 2
-}
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/predict` | Predict match result (H/D/A) |
+| POST | `/api/predict/markets` | Full multi-market prediction |
+| GET | `/api/predictions/upcoming` | Dashboard — batch predictions for next 3 days |
+| GET | `/api/predictions/history` | Past predictions with accuracy |
 
 ### Matches
-- `GET /api/matches` - Get matches (filterable by season, team, status)
-- `GET /api/matches/:id` - Get match details with features and prediction
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/matches` | List matches (filter by season, team, status) |
+| GET | `/api/matches/:id` | Match details with features |
+| GET | `/api/matches/upcoming` | Raw upcoming matches |
+| POST | `/api/fixtures/refresh` | Fetch new fixtures from API |
 
 ### Statistics
-- `GET /api/statistics/overview` - Overall match and goal statistics
-- `GET /api/statistics/head-to-head?home_team_id=1&away_team_id=2` - Head-to-head record
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/statistics/overview` | League-wide match and goal stats |
+| GET | `/api/statistics/head-to-head` | H2H record between two teams |
 
-### Prediction History
-- `GET /api/predictions/history` - Past predictions with accuracy stats
+## Features Used by ML Model
 
-## 📈 Development Process
+| Feature | Description |
+|---------|-------------|
+| Home/Away Form | Win rate over last 5 matches |
+| Goals Scored/Conceded | Average per match |
+| Home/Away Win Rate | Historical win percentage at venue |
+| Head-to-Head Record | Historical record between teams |
+| Days Since Last Match | Rest days before the match |
+| Elo Rating | Team strength rating |
+| League Standings | Current league position and points |
 
-### Phase 1: Data Collection
-- Integrated Football-Data.org API
-- Collected Premier League match data across multiple seasons
-
-### Phase 2: Exploratory Data Analysis
-- Analyzed match outcomes, goal distributions, and team performance
-- Jupyter notebooks for visualization and insights
-
-### Phase 3: Feature Engineering
-- Created 13 statistical features per match
-- Automated pipeline for computing features on new matches
-
-### Phase 4: Model Training
-- Compared 4 algorithms (XGBoost, Random Forest, Gradient Boosting, Logistic Regression)
-- XGBoost selected as best performer
-- Cross-validation for robustness
-
-### Phase 5: API Development
-- Built RESTful Flask API
-- ML model serving with real-time predictions
-- SQLAlchemy ORM for database operations
-
-### Phase 6: Frontend Development
-- React SPA with dark theme
-- Toast notification system for user feedback
-- Error boundary for crash protection
-
-### Phase 7: Integration & Testing
-- Connected frontend to backend API
-- End-to-end testing of prediction flow
-
-### Phase 8: Deployment
-- Backend deployed to Render with Gunicorn
-- Frontend deployed to Vercel
-- PostgreSQL database hosted on Render
-
-## 📁 Project Structure
+## Project Structure
 
 ```
 FootballMatchPredictor/
 ├── backend/
-│   ├── data/
-│   │   ├── raw/                    # Raw API data
-│   │   └── processed/             # Cleaned CSV data
-│   ├── models/                    # Trained ML models (.pkl)
-│   ├── notebooks/                 # Jupyter notebooks (EDA, analysis)
-│   │   ├── 01_api_exploration.ipynb
-│   │   ├── 02_exploratory_analysis.ipynb
-│   │   ├── 03_feature_analysis.ipynb
-│   │   └── 04_model_analysis.ipynb
+│   ├── models/                     # Trained ML models (.pkl)
+│   │   ├── best_model.pkl          # Main XGBoost match result model
+│   │   └── multi_market_models.pkl # BTTS, O/U, corners, cards models
 │   ├── src/
-│   │   ├── app.py                 # Flask API application
-│   │   ├── database.py            # SQLAlchemy models & DB manager
-│   │   ├── data_collection.py     # Football API data fetching
-│   │   ├── feature_engineering.py # Feature computation pipeline
-│   │   ├── load_data.py           # CSV to database loader
-│   │   └── model_training.py      # ML model training & evaluation
-│   ├── .env                       # Environment variables (not committed)
-│   ├── gunicorn.conf.py           # Gunicorn production config
-│   ├── render.yaml                # Render deployment config
-│   ├── requirements.txt           # Python dependencies
-│   └── wsgi.py                    # WSGI entry point
+│   │   ├── app.py                  # Flask API + APScheduler
+│   │   ├── database.py             # SQLAlchemy models & DB manager
+│   │   ├── data_collection.py      # football-data.org API client
+│   │   ├── feature_engineering.py  # Feature computation pipeline
+│   │   ├── prediction_service.py   # Multi-market prediction engine
+│   │   ├── cache.py                # LRU prediction cache (6h TTL)
+│   │   ├── load_data.py            # CSV → database loader
+│   │   ├── load_external_csv.py    # External league data loader
+│   │   └── model_training.py       # Model training & evaluation
+│   ├── .env.example                # Environment variable template
+│   ├── requirements.txt            # Python dependencies
+│   ├── wsgi.py                     # WSGI entry point for Gunicorn
+│   ├── gunicorn.conf.py            # Gunicorn production config
+│   └── render.yaml                 # Render deployment config
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── ErrorBoundary.jsx  # React error boundary
-│   │   │   ├── FeatureDisplay.jsx # Match feature visualization
-│   │   │   ├── Predict.jsx        # Prediction form & results
-│   │   │   ├── PredictionResult.jsx # Prediction outcome display
-│   │   │   ├── TeamSelector.jsx   # Team dropdown selectors
-│   │   │   └── ToastContainer.jsx # Toast notification renderer
-│   │   ├── contexts/
-│   │   │   └── ToastContext.jsx   # Toast notification context
+│   │   │   ├── MatchCard.jsx       # Compact match prediction card
+│   │   │   ├── MatchDetail.jsx     # Full match modal (all markets)
+│   │   │   ├── CategoryTabs.jsx    # Today / Upcoming tabs
+│   │   │   ├── FilterBar.jsx       # Confidence/upset/banker filters
+│   │   │   ├── ErrorBoundary.jsx   # React error boundary
+│   │   │   └── ToastContainer.jsx  # Toast notifications
 │   │   ├── pages/
-│   │   │   └── Statistics.jsx     # Statistics dashboard page
+│   │   │   └── Dashboard.jsx       # Main dashboard page
+│   │   ├── contexts/
+│   │   │   └── ToastContext.jsx     # Toast notification context
 │   │   ├── services/
-│   │   │   └── api.js             # Axios API client
-│   │   ├── App.jsx                # Root component with routing
-│   │   ├── main.jsx               # React entry point
-│   │   └── index.css              # Global styles & Tailwind
-│   ├── .env.production            # Production API URL
-│   ├── vercel.json                # Vercel deployment config
-│   └── package.json               # Node dependencies
-├── .gitignore
+│   │   │   └── api.js              # Axios API client
+│   │   ├── utils/
+│   │   │   └── constants.js        # Formatters, bet engine, config
+│   │   ├── App.jsx                 # Root component with routing
+│   │   └── main.jsx                # React entry point
+│   ├── vercel.json                 # Vercel deployment config
+│   └── package.json                # Node dependencies
+├── docs/
+│   └── DEPLOYMENT_CHECKLIST.md     # Step-by-step deployment guide
+├── LICENSE                         # MIT License
 └── README.md
 ```
 
-## 🔄 Updating Match Data
+## Deployment
 
-To update with new match results:
+See [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) for a full step-by-step deployment guide.
 
-```bash
-cd backend/src
+### Quick overview:
+1. **Backend** → Render Web Service (root: `backend`, start: `gunicorn wsgi:app`)
+2. **Database** → Render PostgreSQL (load data via `pg_dump`/`pg_restore`)
+3. **Frontend** → Vercel (root: `frontend`, framework: Vite)
+4. **Fixtures** refresh automatically daily at 06:00 UTC via APScheduler
 
-# Fetch and load new matches
-python load_data.py
+## Author
 
-# Recompute features
-python feature_engineering.py
-```
+**Adrian** — [@Gamsty](https://github.com/Gamsty)
 
-For production database, set the `DATABASE_URL` environment variable to your production connection string before running.
+## Acknowledgments
 
-## 👨‍💻 Author
-
-**Adrian**
-- GitHub: [@Gamsty](https://github.com/Gamsty)
-
-## 🙏 Acknowledgments
-
-- [Football-Data.org](https://www.football-data.org/) for providing the football API
-- Premier League for the match data
+- [Football-Data.org](https://www.football-data.org/) for the football data API
+- Data from 9 European leagues (2021–2025 seasons)
 
 ---
 
-⚽ Built with passion for football and machine learning
+Built with Python, React, and machine learning.

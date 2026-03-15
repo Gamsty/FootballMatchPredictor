@@ -15,15 +15,13 @@ ENV/
 
 # Data files
 *.csv
-*.pkl
-*.joblib
-!backend/models/xgboost_model.pkl
 backend/data/
 
-# Models (exclude all except the production model)
+# Models (exclude all except the production models)
 backend/models/*.pkl
 backend/models/*.joblib
-!backend/models/xgboost_model.pkl
+!backend/models/best_model.pkl
+!backend/models/multi_market_models.pkl
 
 # Environment
 .env

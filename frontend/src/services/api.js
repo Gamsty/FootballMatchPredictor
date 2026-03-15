@@ -1,4 +1,4 @@
-/* 
+/*
 API Service
 Handles all API calls to the backend
 */
@@ -46,9 +46,18 @@ export const footballAPI = {
         return response.data;
     },
 
-    // Predictions 
+    // Predict single match (H/D/A)
     predictMatch: async (homeTeamId, awayTeamId) => {
         const response = await api.post('/predict', {
+            home_team_id: homeTeamId,
+            away_team_id: awayTeamId,
+        });
+        return response.data;
+    },
+
+    // Full multi-market prediction (BTTS, O/U, corners, cards, combos, etc.)
+    predictAllMarkets: async (homeTeamId, awayTeamId) => {
+        const response = await api.post('/predict/markets', {
             home_team_id: homeTeamId,
             away_team_id: awayTeamId,
         });
@@ -61,6 +70,12 @@ export const footballAPI = {
         return response.data;
     },
 
+    // Dashboard: batch predictions for upcoming matches
+    getUpcomingPredictions: async (params = {}) => {
+        const response = await api.get('/predictions/upcoming', { params });
+        return response.data;
+    },
+
     // Matches — supports filters: { season, team_id, status, limit }
     getMatches: async (params = {}) => {
         const response = await api.get('/matches', { params });
@@ -69,6 +84,24 @@ export const footballAPI = {
 
     getMatch: async (matchId) => {
         const response = await api.get(`/matches/${matchId}`);
+        return response.data;
+    },
+
+    // Upcoming matches (basic, without full market predictions)
+    getUpcomingMatches: async (days = 14) => {
+        const response = await api.get('/matches/upcoming', { params: { days } });
+        return response.data;
+    },
+
+    // Competitions list
+    getCompetitions: async () => {
+        const response = await api.get('/competitions');
+        return response.data;
+    },
+
+    // Refresh fixtures from football-data.org
+    refreshFixtures: async (days = 14) => {
+        const response = await api.post('/fixtures/refresh', null, { params: { days } });
         return response.data;
     },
 
@@ -85,7 +118,7 @@ export const footballAPI = {
                 team1_id: team1Id,
                 team2_id: team2Id,
             },
-        }); 
+        });
         return response.data;
     },
 };
