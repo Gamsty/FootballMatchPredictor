@@ -111,62 +111,47 @@ graph TB
 - React Router 7, Axios
 
 ### Deployment
-- **Frontend**: Vercel (auto-deploy from GitHub)
-- **Backend**: Render (Web Service + PostgreSQL)
+- **Frontend**: Vercel (auto-deploy from GitHub `main`)
+- **Backend**: Azure Container Apps (deployed via Bicep + GitHub Actions OIDC)
+- **Database**: Azure PostgreSQL Flexible Server (Burstable B1ms)
+- **Models**: Azure Blob Storage (`models/production/`, hot-swappable via webhook)
+- **Secrets**: Azure Key Vault (no secrets in env vars or git)
 
-## Installation
+## Local development
 
 ### Prerequisites
-- Python 3.11+
-- Node.js 18+
-- PostgreSQL 14+
-- API key from [football-data.org](https://www.football-data.org/)
+- Python 3.12, Node.js 20+, PostgreSQL 16, API key from [football-data.org](https://www.football-data.org/)
 
-### Backend Setup
+### Run locally
 
 ```bash
+# Backend
 cd backend
-
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env        # fill in DATABASE_URL + FOOTBALL_API_KEY
+python wsgi.py              # auto-creates schema if missing
 
-# Configure environment
-cp .env.example .env
-# Edit .env with your database URL and API key
-
-# Initialize database tables
-python src/database.py
-
-# Load historical match data from CSVs
-python src/load_data.py
-
-# Load external league data (standings, etc.)
-python src/load_external_csv.py
-
-# Compute features for all matches
-python src/feature_engineering.py
-
-# Train models (optional — pre-trained models included)
-python src/model_training.py
-
-# Run development server
-python src/app.py
-```
-
-### Frontend Setup
-
-```bash
+# Frontend (new terminal)
 cd frontend
-
 npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:5173` (frontend) and `http://localhost:5000` (API).
+The app will be available at `http://localhost:5174` (frontend) and `http://localhost:5000` (API).
+
+### Bootstrap data
+
+If your local database is empty, populate it from the CSVs:
+
+```bash
+cd backend
+python src/load_data.py            # historical matches → database
+python src/load_external_csv.py    # standings, external league data
+python src/feature_engineering.py  # compute ML features
+python src/model_training.py       # train models (optional — pre-trained .pkl included)
+```
 
 ## API Endpoints
 
@@ -217,11 +202,12 @@ The app will be available at `http://localhost:5173` (frontend) and `http://loca
 ```
 FootballMatchPredictor/
 ├── backend/
-│   ├── models/                     # Trained ML models (.pkl)
+│   ├── Dockerfile                  # Multi-stage build for Container Apps
+│   ├── models/                     # Pre-trained ML models (.pkl, also in Blob)
 │   │   ├── best_model.pkl          # Main XGBoost match result model
 │   │   └── multi_market_models.pkl # BTTS, O/U, corners, cards models
 │   ├── src/
-│   │   ├── app.py                  # Flask API + APScheduler
+│   │   ├── app.py                  # Flask API
 │   │   ├── database.py             # SQLAlchemy models & DB manager
 │   │   ├── data_collection.py      # football-data.org API client
 │   │   ├── feature_engineering.py  # Feature computation pipeline
@@ -229,48 +215,99 @@ FootballMatchPredictor/
 │   │   ├── cache.py                # LRU prediction cache (6h TTL)
 │   │   ├── load_data.py            # CSV → database loader
 │   │   ├── load_external_csv.py    # External league data loader
-│   │   └── model_training.py       # Model training & evaluation
-│   ├── .env.example                # Environment variable template
-│   ├── requirements.txt            # Python dependencies
-│   ├── wsgi.py                     # WSGI entry point for Gunicorn
-│   ├── gunicorn.conf.py            # Gunicorn production config
-│   └── render.yaml                 # Render deployment config
+│   │   ├── model_training.py       # Model training & evaluation
+│   │   ├── model_storage.py        # Blob storage abstraction (Managed Identity)
+│   │   └── telemetry.py            # Application Insights wiring
+│   ├── jobs/
+│   │   ├── Dockerfile              # Retrain job container
+│   │   └── retrain.py              # Nightly retrain + AUC validation gate
+│   ├── requirements.txt
+│   ├── wsgi.py
+│   └── gunicorn.conf.py
 ├── frontend/
+│   ├── Dockerfile                  # Multi-stage build (used for parity, prod is Vercel)
+│   ├── nginx.conf
 │   ├── src/
-│   │   ├── components/
-│   │   │   ├── MatchCard.jsx       # Compact match prediction card
-│   │   │   ├── MatchDetail.jsx     # Full match modal (all markets)
-│   │   │   ├── CategoryTabs.jsx    # Today / Upcoming tabs
-│   │   │   ├── FilterBar.jsx       # Confidence/upset/banker filters
-│   │   │   ├── ErrorBoundary.jsx   # React error boundary
-│   │   │   └── ToastContainer.jsx  # Toast notifications
-│   │   ├── pages/
-│   │   │   └── Dashboard.jsx       # Main dashboard page
-│   │   ├── contexts/
-│   │   │   └── ToastContext.jsx     # Toast notification context
-│   │   ├── services/
-│   │   │   └── api.js              # Axios API client
-│   │   ├── utils/
-│   │   │   └── constants.js        # Formatters, bet engine, config
-│   │   ├── App.jsx                 # Root component with routing
-│   │   └── main.jsx                # React entry point
-│   ├── vercel.json                 # Vercel deployment config
-│   └── package.json                # Node dependencies
+│   │   ├── components/             # MatchCard, MatchDetail, FilterBar, etc.
+│   │   ├── pages/Dashboard.jsx
+│   │   ├── services/api.js         # Axios client (uses VITE_API_URL)
+│   │   ├── utils/constants.js
+│   │   ├── App.jsx
+│   │   └── main.jsx
+│   ├── vercel.json
+│   └── package.json
+├── infra/                          # Bicep IaC
+│   ├── main.bicep                  # Composes all modules
+│   ├── main.parameters.prod.json
+│   └── modules/
+│       ├── acr.bicep
+│       ├── appInsights.bicep
+│       ├── containerApp.bicep      # Includes RBAC role assignments
+│       ├── containerAppsEnv.bicep
+│       ├── keyVault.bicep
+│       ├── logAnalytics.bicep
+│       ├── postgres.bicep
+│       └── storage.bicep
+├── .github/workflows/
+│   ├── backend.yml                 # Test + build + push + deploy via OIDC
+│   └── infra.yml                   # Bicep deploy via OIDC
+├── docker-compose.yml              # Local dev convenience (postgres + backend + frontend)
 ├── docs/
-│   └── DEPLOYMENT_CHECKLIST.md     # Step-by-step deployment guide
-├── LICENSE                         # MIT License
+│   └── azure-runbook.md            # Step-by-step Azure deployment commands
+├── LICENSE
 └── README.md
 ```
 
 ## Deployment
 
-See [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) for a full step-by-step deployment guide.
+### Architecture
 
-### Quick overview:
-1. **Backend** → Render Web Service (root: `backend`, start: `gunicorn wsgi:app`)
-2. **Database** → Render PostgreSQL (load data via `pg_dump`/`pg_restore`)
-3. **Frontend** → Vercel (root: `frontend`, framework: Vite)
-4. **Fixtures** refresh automatically daily at 06:00 UTC via APScheduler
+| Component | Service | Notes |
+|---|---|---|
+| Frontend | Vercel | Auto-deploys from `main` |
+| Backend API | Azure Container Apps | Scale-to-zero, system-assigned managed identity |
+| Database | Azure PostgreSQL Flexible Server | Burstable B1ms |
+| Model artifacts | Azure Blob Storage | `models/production/`, `models/candidate/` |
+| Secrets | Azure Key Vault | DB connection string, API keys, hot-reload token |
+| Container registry | Azure Container Registry | Basic SKU |
+| Observability | Azure Application Insights | Structured logs, custom metrics |
+| Nightly retrain | Azure Container Apps Job | Cron `0 3 * * *`, AUC validation gate |
+| CI/CD | GitHub Actions (OIDC) | No long-lived credentials |
+| IaC | Azure Bicep | Full stack reproducible from `main.bicep` |
+
+### Deploy from scratch
+
+See [docs/azure-runbook.md](docs/azure-runbook.md) for the complete step-by-step runbook.
+
+Short version:
+```powershell
+# 1. Provision everything
+az deployment group create `
+  --resource-group rg-fotballpred-prod `
+  --template-file infra/main.bicep `
+  --parameters infra/main.parameters.prod.json `
+  --parameters postgresAdminPassword=<...> footballApiKey=<...>
+
+# 2. Build + push backend image
+docker build -t fotballpred-backend:v1 ./backend
+az acr login --name acrfotballpredprod
+docker tag fotballpred-backend:v1 acrfotballpredprod.azurecr.io/fotballpred-backend:latest
+docker push acrfotballpredprod.azurecr.io/fotballpred-backend:latest
+
+# 3. Migrate DB + upload models (one-time)
+pg_restore ...
+az storage blob upload ...
+
+# 4. Vercel: set VITE_API_URL=https://<container-app-fqdn>/api, redeploy
+```
+
+### Continuous deployment
+
+Push to `main` triggers `.github/workflows/backend.yml`:
+1. Lint + test against ephemeral Postgres
+2. Build Docker image, push to ACR with commit SHA tag
+3. Update Container App revision
+4. Smoke-test `/api/health`
 
 ## Author
 
