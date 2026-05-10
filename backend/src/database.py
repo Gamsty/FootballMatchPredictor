@@ -29,7 +29,14 @@ if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
 if not DATABASE_URL:
     DATABASE_URL= 'postgresql://postgres:password@localhost/football_predictor'
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=2,
+    pool_recycle=300,
+    pool_timeout=10,
+)
 SessionLocal = sessionmaker(bind=engine)  # Factory for creating database sessions
 ScopedSession = scoped_session(SessionLocal)  # Thread-safe session factory
 Base = declarative_base()  # Base class for all ORM models

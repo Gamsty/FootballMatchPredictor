@@ -29,14 +29,25 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     log_loss,
+    roc_auc_score,
 )
 import xgboost as xgb
 import joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime
 from collections import defaultdict
 import os
+import tempfile
+
+# matplotlib + seaborn are heavy and only needed when running model_training.py
+# directly (CLI). The retrain job (train_xgboost) imports model_training but never
+# triggers plotting, so we lazy-import inside _plot_confusion_matrix / feature_importance
+# instead of at module level.
+try:
+    import matplotlib.pyplot as plt  # noqa: F401
+    import seaborn as sns  # noqa: F401
+    _PLOTTING_AVAILABLE = True
+except ImportError:
+    _PLOTTING_AVAILABLE = False
 
 
 # ============================================================================
@@ -1366,6 +1377,244 @@ def train_all_markets(csv_path='../data/processed/match_features.csv',
     print(f"\nResults saved to ../data/multi_market_results.csv")
 
     return all_market_models
+
+
+# ============================================================================
+# RETRAIN ENTRY POINT (used by jobs/retrain.py)
+# ============================================================================
+
+def _build_xy_from_csv(csv_path, include_odds=False, binary_mode=False):
+    """
+    Internal helper: load CSV, compute Elo, build feature DataFrame X and target y.
+    Mirrors MatchPredictor.load_data() but is callable without instantiating the class.
+
+    Returns: (X, y, df_with_elo, feature_names, elo_ratings)
+    """
+    df = pd.read_csv(csv_path)
+    df = df.sort_values('date').reset_index(drop=True) if 'date' in df.columns else df
+
+    # Elo ratings (chronological, no leakage)
+    elo_ratings = None
+    if 'home_team' in df.columns and 'away_team' in df.columns:
+        home_elos, away_elos, elo_ratings = compute_elo_ratings(df)
+        df['home_elo'] = home_elos
+        df['away_elo'] = away_elos
+
+    base_cols = [
+        'home_form_5', 'away_form_5',
+        'home_goals_scored_avg', 'home_goals_conceded_avg',
+        'away_goals_scored_avg', 'away_goals_conceded_avg',
+        'h2h_home_wins', 'h2h_draws', 'h2h_away_wins',
+        'home_win_rate', 'away_win_rate',
+        'days_since_home_last_match', 'days_since_away_last_match',
+        'home_league_position', 'away_league_position',
+        'home_points', 'away_points',
+        'home_goal_difference', 'away_goal_difference'
+    ]
+    X = df[base_cols].copy()
+
+    for col in ['days_since_home_last_match', 'days_since_away_last_match']:
+        X[col] = X[col].fillna(X[col].median())
+    X = X.fillna(0)
+
+    # Derived features (must match MatchPredictor.load_data exactly)
+    X['position_diff'] = X['home_league_position'] - X['away_league_position']
+    X['points_diff'] = X['home_points'] - X['away_points']
+    X['gd_diff'] = X['home_goal_difference'] - X['away_goal_difference']
+    X['form_diff'] = X['home_form_5'] - X['away_form_5']
+    X['win_rate_diff'] = X['home_win_rate'] - X['away_win_rate']
+    X['home_attack_vs_away_defense'] = X['home_goals_scored_avg'] - X['away_goals_conceded_avg']
+    X['away_attack_vs_home_defense'] = X['away_goals_scored_avg'] - X['home_goals_conceded_avg']
+    X['h2h_dominance'] = X['h2h_home_wins'] - X['h2h_away_wins']
+    X['rest_diff'] = X['days_since_home_last_match'] - X['days_since_away_last_match']
+
+    if 'home_elo' in df.columns:
+        X['home_elo'] = df['home_elo']
+        X['away_elo'] = df['away_elo']
+        X['elo_diff'] = df['home_elo'] - df['away_elo']
+
+    optional_cols = [
+        'home_draw_rate', 'away_draw_rate',
+        'home_clean_sheet_rate', 'away_clean_sheet_rate',
+        'home_weighted_form', 'away_weighted_form',
+        'home_shots_on_target_avg', 'away_shots_on_target_avg',
+        'home_corners_avg', 'away_corners_avg',
+        'home_cards_avg', 'away_cards_avg',
+        'home_points_from_top', 'away_points_from_top',
+        'home_points_from_relegation', 'away_points_from_relegation',
+        'season_progress',
+        'home_avg_position_3yr', 'away_avg_position_3yr',
+        'home_artificial_pitch',
+    ]
+    for col in optional_cols:
+        if col in df.columns:
+            X[col] = df[col].fillna(0)
+
+    if 'home_draw_rate' in X.columns:
+        X['draw_rate_sum'] = X['home_draw_rate'] + X['away_draw_rate']
+    if 'home_weighted_form' in X.columns:
+        X['weighted_form_diff'] = X['home_weighted_form'] - X['away_weighted_form']
+    if 'home_shots_on_target_avg' in X.columns:
+        X['shots_on_target_diff'] = X['home_shots_on_target_avg'] - X['away_shots_on_target_avg']
+    if 'home_corners_avg' in X.columns:
+        X['corners_diff'] = X['home_corners_avg'] - X['away_corners_avg']
+    if 'home_points_from_top' in X.columns:
+        X['motivation_diff'] = X['away_points_from_top'] - X['home_points_from_top']
+    if 'home_avg_position_3yr' in X.columns:
+        X['squad_strength_diff'] = X['away_avg_position_3yr'] - X['home_avg_position_3yr']
+
+    if include_odds and all(c in df.columns for c in ['avg_home_prob', 'avg_draw_prob', 'avg_away_prob']):
+        for col in ['avg_home_prob', 'avg_draw_prob', 'avg_away_prob']:
+            X[col] = df[col].fillna(0)
+        X['odds_home_away_diff'] = X['avg_home_prob'] - X['avg_away_prob']
+
+    feature_names = list(X.columns)
+
+    # Drop matches without target (e.g., scheduled but unfinished)
+    target_mask = df['target'].notna()
+    X = X[target_mask].copy().reset_index(drop=True)
+    df_filtered = df[target_mask].copy().reset_index(drop=True)
+
+    if binary_mode:
+        draw_mask = df_filtered['target'] == 'DRAW'
+        X = X[~draw_mask].copy().reset_index(drop=True)
+        df_filtered = df_filtered[~draw_mask].copy().reset_index(drop=True)
+        y = df_filtered['target'].map({'HOME_TEAM': 1, 'AWAY_TEAM': 0})
+    else:
+        y = df_filtered['target'].map({'HOME_TEAM': 2, 'DRAW': 1, 'AWAY_TEAM': 0})
+
+    return X, y, df_filtered, feature_names, elo_ratings
+
+
+def train_xgboost(db, holdout_days=90, include_odds=False):
+    """
+    Train an XGBoost 3-class model from the database. Time-based holdout split
+    so the validation reflects future performance rather than random sampling.
+
+    Pipeline:
+        1. Compute features for all FINISHED matches in DB (idempotent — skips already-done)
+        2. Export to a temp CSV
+        3. Time-based split: rows with date < (today - holdout_days) -> train, rest -> holdout
+        4. Compute Elo on the FULL chronological data (no leakage), build features
+        5. Fit StandardScaler on train, transform both
+        6. Train XGBoost with sane defaults (no tuning — fast for nightly runs)
+        7. Return model_data dict + scaled holdout for the caller's validation gate
+
+    Args:
+        db: DatabaseManager instance
+        holdout_days: Last N days of finished matches reserved for AUC evaluation
+        include_odds: Include odds features (False for live API; True only if odds in DB)
+
+    Returns:
+        dict with keys:
+            'model_data': dict (model, scaler, feature_names, model_type, elo_ratings, created_at)
+            'X_holdout': scaled holdout features as DataFrame (preserves feature_names ordering)
+            'y_holdout': holdout targets (Series of 0/1/2)
+            'holdout_size': int
+            'train_size': int
+    """
+    # Local imports — feature_engineering pulls in DB, we want this lazy when imported
+    from feature_engineering import FeatureEngineer
+    import io as _io
+
+    fe = FeatureEngineer()
+    try:
+        print("[train_xgboost] Computing features for all matches in DB...")
+        fe.create_features_for_all_matches(save_to_db=True)
+
+        # Export to a temp CSV that _build_xy_from_csv consumes
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp:
+            tmp_csv = tmp.name
+        try:
+            print(f"[train_xgboost] Exporting features to {tmp_csv}...")
+            fe.export_features_to_csv(output_path=tmp_csv)
+
+            X, y, df, feature_names, elo_ratings = _build_xy_from_csv(
+                tmp_csv, include_odds=include_odds, binary_mode=False
+            )
+
+            # Time-based split (uses df['date'] which load_data preserves)
+            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
+            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=holdout_days)
+            train_mask = df['date'] < cutoff
+            hold_mask = df['date'] >= cutoff
+
+            X_train = X[train_mask].copy()
+            y_train = y[train_mask].copy()
+            X_hold = X[hold_mask].copy()
+            y_hold = y[hold_mask].copy()
+
+            print(f"[train_xgboost] Train: {len(X_train)}, Holdout: {len(X_hold)} (last {holdout_days}d)")
+            if len(X_train) < 100:
+                raise RuntimeError(f"Training set too small ({len(X_train)} < 100)")
+
+            # Scale
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_hold_scaled_arr = scaler.transform(X_hold) if len(X_hold) else np.empty((0, X_train.shape[1]))
+
+            # Train (no CV, no tuning — fast)
+            model = xgb.XGBClassifier(
+                n_estimators=300,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                eval_metric='mlogloss',
+                objective='multi:softprob',
+            )
+            print("[train_xgboost] Fitting XGBoost...")
+            start = datetime.now()
+            model.fit(X_train_scaled, y_train)
+            print(f"[train_xgboost] Trained in {(datetime.now() - start).total_seconds():.1f}s")
+
+            model_data = {
+                'model': model,
+                'scaler': scaler,
+                'feature_names': feature_names,
+                'model_type': 'xgboost',
+                'elo_ratings': elo_ratings,
+                'created_at': datetime.now().isoformat(),
+            }
+
+            # Wrap holdout back into a DataFrame so callers can index by feature_names
+            X_hold_scaled = pd.DataFrame(X_hold_scaled_arr, columns=feature_names) if len(X_hold) else pd.DataFrame(columns=feature_names)
+
+            return {
+                'model_data': model_data,
+                'X_holdout': X_hold_scaled,
+                'y_holdout': y_hold.reset_index(drop=True),
+                'holdout_size': len(X_hold),
+                'train_size': len(X_train),
+            }
+        finally:
+            try:
+                os.unlink(tmp_csv)
+            except OSError:
+                pass
+    finally:
+        fe.close()
+
+
+def evaluate_auc(model_data, X_scaled, y, labels=(0, 1, 2)):
+    """
+    Multi-class one-vs-rest AUC for a trained model_data dict.
+
+    Args:
+        model_data: dict with 'model' (and optionally 'feature_names' for column alignment)
+        X_scaled: features ALREADY scaled by the model's scaler. Pass DataFrame to align by name,
+                  or numpy array if you've already aligned.
+        y: target Series (0=AWAY, 1=DRAW, 2=HOME for 3-class)
+        labels: full set of class labels — pass even if some classes are missing in y
+
+    Returns:
+        float: macro-averaged one-vs-rest AUC
+    """
+    if hasattr(X_scaled, 'columns') and 'feature_names' in model_data:
+        X_scaled = X_scaled[model_data['feature_names']]
+    proba = model_data['model'].predict_proba(X_scaled)
+    return float(roc_auc_score(y, proba, multi_class='ovr', labels=list(labels)))
 
 
 # ============================================================================

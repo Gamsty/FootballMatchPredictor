@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+data/raw/
+data/processed/
+data/external/
+*.png
+*.csv
+.pytest_cache/
+.git/
+.gitignore
+.vscode/
+.idea/

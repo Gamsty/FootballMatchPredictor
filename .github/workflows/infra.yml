@@ -1,0 +1,63 @@
+name: Infrastructure (Bicep)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra.yml'
+  pull_request:
+    paths:
+      - 'infra/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Bicep build (lint)
+        run: az bicep build --file infra/main.bicep
+
+      - name: What-if (preview changes)
+        run: |
+          az deployment group what-if \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --template-file infra/main.bicep \
+            --parameters infra/main.parameters.prod.json \
+            --parameters postgresAdminPassword=${{ secrets.POSTGRES_ADMIN_PASSWORD }} \
+                         footballApiKey=${{ secrets.FOOTBALL_API_KEY }}
+
+  deploy:
+    needs: validate
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        run: |
+          az deployment group create \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --template-file infra/main.bicep \
+            --parameters infra/main.parameters.prod.json \
+            --parameters postgresAdminPassword=${{ secrets.POSTGRES_ADMIN_PASSWORD }} \
+                         footballApiKey=${{ secrets.FOOTBALL_API_KEY }}

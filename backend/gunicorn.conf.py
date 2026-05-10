@@ -2,15 +2,20 @@
 Gunicorn configuration for production
 """
 
-import multiprocessing
+import os
 
-# Bind to PORT enviroment variable (for Render)
-bind = "0.0.0.0:5000"
+bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
 
-# Worker processes
-workers = multiprocessing.cpu_count() * 2 + 1
+# Worker count: respect WEB_CONCURRENCY (Heroku/Render/Azure standard).
+# Default to 2 — each worker loads ~500MB of XGBoost models, so cpu_count*2+1
+# OOMs anything smaller than ~16GB of container RAM.
+workers = int(os.environ.get('WEB_CONCURRENCY', '2'))
 worker_class = "sync"
 worker_connections = 1000
+
+# Restart workers after this many requests to avoid memory creep
+max_requests = 1000
+max_requests_jitter = 50
 
 # Timeout
 timeout = 120
