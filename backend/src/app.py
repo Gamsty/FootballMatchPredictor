@@ -24,15 +24,20 @@ from datetime import datetime, timezone
 import pandas as pd
 import joblib
 from dotenv import load_dotenv
+import io
+import logging
 import os
+import re
 import atexit
 
-from database import DatabaseManager, Match, Team, Prediction, MatchFeatures
+from database import DatabaseManager, Match, Team, Prediction, MatchFeatures, init_db
 from feature_engineering import FeatureEngineer
 from prediction_service import (
     compute_features, predict_match_result, predict_all_markets, classify_match
 )
 from cache import PredictionCache
+from model_storage import load_model_bytes
+from telemetry import setup_telemetry
 from sqlalchemy import and_, desc, distinct
 
 # Load environment variables
@@ -41,50 +46,77 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
+# Wire up Azure Monitor (no-op when APPLICATIONINSIGHTS_CONNECTION_STRING is unset)
+setup_telemetry(app)
+logger = logging.getLogger("fotballpred")
+logger.setLevel(logging.INFO)
+
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
 
-# Configure CORS — allows React frontend to call the API
+# Allowed CORS origins. Vercel preview deploys get matched via regex.
+ALLOWED_ORIGINS = [
+    FRONTEND_URL,
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "https://football-match-predictor-pearl.vercel.app",
+]
+VERCEL_PREVIEW_REGEX = re.compile(
+    r"^https://football-match-predictor-pearl-[a-z0-9-]+\.vercel\.app$"
+)
+
 CORS(app, resources={
     r"/api/*": {
-    "origins": [
-        FRONTEND_URL,
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://football-match-predictor-pearl.vercel.app",
-    ],
-    "methods": ["GET", "POST", "PUT", "DELETE"],
-    "allow_headers": ["Content-Type"]
+        "origins": ALLOWED_ORIGINS + [VERCEL_PREVIEW_REGEX],
+        "methods": ["GET", "POST", "PUT", "DELETE"],
+        "allow_headers": ["Content-Type"]
     }
 })
 
-# Load ML models (resolve path relative to this file, not the working directory)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, '..', 'models', 'best_model.pkl')
-MULTI_MARKET_PATH = os.path.join(BASE_DIR, '..', 'models', 'multi_market_models.pkl')
+# Models load via model_storage abstraction:
+# - prod (USE_BLOB_STORAGE=true): from Azure Blob via Managed Identity
+# - dev: from backend/models/ on local disk
 model_data = None
 multi_market_models = None
 
 def load_model():
-    """Load ML models at startup"""
+    """Load ML models at startup (blob in prod, local in dev)."""
     global model_data, multi_market_models
     try:
-        model_data = joblib.load(MODEL_PATH)
-        print(f"Model loaded successfully from {MODEL_PATH}")
-        print(f"    Model type: {model_data['model_type']}")
-        print(f"    Features: {len(model_data['feature_names'])}")
+        model_bytes = load_model_bytes("best_model.pkl")
+        model_data = joblib.load(io.BytesIO(model_bytes))
+        logger.info(
+            "Main model loaded",
+            extra={
+                "model_type": model_data.get("model_type"),
+                "feature_count": len(model_data.get("feature_names", [])),
+            },
+        )
     except Exception as e:
-        print(f"Error loading main model: {e}")
+        logger.error(f"Error loading main model: {e}")
         model_data = None
 
     try:
-        multi_market_models = joblib.load(MULTI_MARKET_PATH)
-        print(f"Multi-market models loaded: {list(multi_market_models.keys())}")
+        mm_bytes = load_model_bytes("multi_market_models.pkl")
+        multi_market_models = joblib.load(io.BytesIO(mm_bytes))
+        logger.info(
+            "Multi-market models loaded",
+            extra={"markets": list(multi_market_models.keys())},
+        )
     except Exception as e:
-        print(f"Multi-market models not found (optional): {e}")
+        logger.warning(f"Multi-market models not found (optional): {e}")
         multi_market_models = None
 
 # Load models on startup
 load_model()
+
+# Ensure schema exists (idempotent — no-op if tables already present).
+# Critical for fresh Postgres containers / first deploys to Azure Flexible Server.
+try:
+    init_db()
+except Exception as e:
+    logger.error(f"init_db failed (continuing — will retry on first query): {e}")
 
 # Database manager
 db = DatabaseManager()
@@ -150,6 +182,24 @@ def health_check():
         'model_type': model_data['model_type'] if model_data else None,
         'cache_size': prediction_cache.size,
         'timestamp': datetime.now(timezone.utc).isoformat()
+    }), 200
+
+
+@app.route('/api/admin/reload-model', methods=['POST'])
+def reload_model():
+    """
+    Hot-reload the ML model from blob storage without restarting the container.
+    Called by the retraining job after a successful validation+promotion.
+    Auth: shared secret in X-Reload-Token header.
+    """
+    expected_token = os.getenv("RELOAD_TOKEN")
+    if not expected_token or request.headers.get("X-Reload-Token") != expected_token:
+        return jsonify({"error": "Unauthorized"}), 401
+    load_model()
+    prediction_cache.clear()
+    return jsonify({
+        "reloaded": True,
+        "model_type": model_data["model_type"] if model_data else None,
     }), 200
 
 # ============================================================================
@@ -1002,16 +1052,18 @@ def scheduled_fixture_refresh():
             print(f"[Scheduler] Fixture refresh failed: {e}")
 
 
-# Start the scheduler (only in the main process, not in reloader)
-if os.environ.get('WERKZEUG_RUN_MAIN') != 'true' or os.environ.get('FLASK_ENV') == 'production':
+# Scheduler: opt-in via ENABLE_SCHEDULER=true.
+# In Azure the retrain Container Apps Job handles scheduled work (Fase 10), so the
+# backend container does NOT run a scheduler. Setting this in every gunicorn worker
+# (which is what the old guard did) created N parallel schedulers and OOM'd local Docker.
+# Locally: also off by default; turn on with ENABLE_SCHEDULER=true if you want cron-in-app.
+if os.environ.get('ENABLE_SCHEDULER', 'false').lower() == 'true':
     from apscheduler.schedulers.background import BackgroundScheduler
 
     scheduler = BackgroundScheduler()
-    # Run daily at 06:00 UTC
     scheduler.add_job(func=scheduled_fixture_refresh, trigger='cron', hour=6, minute=0, id='daily_fixture_refresh')
     scheduler.start()
-    print("[Scheduler] Daily fixture refresh scheduled for 06:00 UTC")
-
+    logger.info("Daily fixture refresh scheduled for 06:00 UTC")
     atexit.register(lambda: scheduler.shutdown())
 
 # ============================================================================

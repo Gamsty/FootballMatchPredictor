@@ -2,18 +2,28 @@
 
 A full-stack machine learning application that predicts football match outcomes across multiple betting markets. Uses XGBoost classification trained on 9 European leagues with 40,000+ historical matches.
 
-![Python](https://img.shields.io/badge/Python-3.11-blue)
+![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Flask](https://img.shields.io/badge/Flask-3.1-green)
 ![React](https://img.shields.io/badge/React-19-blue)
 ![ML](https://img.shields.io/badge/ML-XGBoost-orange)
-![Deployment](https://img.shields.io/badge/Deployed-Vercel%20%2B%20Render-success)
+![Azure](https://img.shields.io/badge/Backend-Azure%20Container%20Apps-0078D4?logo=microsoftazure)
+![Vercel](https://img.shields.io/badge/Frontend-Vercel-black?logo=vercel)
+![IaC](https://img.shields.io/badge/IaC-Bicep-blue)
+![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions%20%2B%20OIDC-2088FF?logo=githubactions)
 
 ## Live Demo
 
 - **Frontend**: [football-match-predictor-pearl.vercel.app](https://football-match-predictor-pearl.vercel.app)
-- **API**: [footballmatchpredictor.onrender.com](https://footballmatchpredictor.onrender.com)
+- **API**: Azure Container Apps (scale-to-zero — first request after idle takes ~5–10 sec to spin up)
 
-> Note: The Render free tier spins down after inactivity — first load may take 30-60 seconds, maybe even longer.
+## Highlights
+
+- **Hybrid cloud architecture** — Vercel for frontend, Azure for backend, ML, and data
+- **Container Apps with managed identity** — zero-trust auth to Storage, Key Vault, ACR (no secrets in env vars)
+- **Infrastructure as Code** — full Bicep, `az deployment group create` rebuilds the entire stack
+- **CI/CD via GitHub Actions + OIDC** — no long-lived credentials in GitHub
+- **MLOps with validation gates** — nightly retraining job; new model must hold AUC within 0.02 of production before promotion
+- **Observability** — Application Insights with structured logs and custom metrics
 
 ## Features
 
@@ -27,32 +37,40 @@ A full-stack machine learning application that predicts football match outcomes 
 
 ## Architecture
 
+```mermaid
+graph TB
+    Vercel[Vercel<br/>React + Vite frontend]
+    GHA[GitHub Actions<br/>OIDC, no long-lived secrets]
+
+    subgraph Azure
+        CA[Container Apps<br/>Flask + gunicorn<br/>scale-to-zero]
+        Job[Container Apps Job<br/>nightly retrain<br/>+ AUC validation gate]
+        PG[(PostgreSQL Flexible<br/>+ pgBouncer)]
+        Blob[(Blob Storage<br/>models/production<br/>models/candidate)]
+        KV[Key Vault<br/>DB string, API keys]
+        AI[Application Insights<br/>logs + metrics]
+        ACR[Container Registry]
+    end
+
+    Vercel -->|HTTPS| CA
+    GHA -->|OIDC + az acr build| ACR
+    GHA -->|az containerapp update| CA
+    GHA -->|az deployment group create| Azure
+    ACR -->|managed identity pull| CA
+    ACR -->|managed identity pull| Job
+    CA -->|managed identity| Blob
+    CA -->|managed identity| KV
+    CA --> PG
+    CA --> AI
+    Job --> Blob
+    Job --> PG
+    Job --> AI
+    Job -->|hot reload webhook| CA
 ```
-┌─────────────────────────────────────────────────────────┐
-│              Frontend (React 19 + Vite 6)               │
-│                   Deployed on Vercel                    │
-│  - Dashboard with match cards grouped by league         │
-│  - Match detail modal with all betting markets          │
-│  - Accumulator builder with live odds calculation       │
-│  - Filter by confidence, upset picks, bankers           │
-└──────────────────────┬──────────────────────────────────┘
-                       │ REST API (Axios)
-┌──────────────────────┴──────────────────────────────────┐
-│            Backend (Flask + Gunicorn)                    │
-│                  Deployed on Render                      │
-│  - XGBoost model serving (match result + 10 markets)    │
-│  - Feature engineering pipeline (13 features)           │
-│  - Prediction caching (LRU, 6-hour TTL)                │
-│  - APScheduler for daily fixture refresh                │
-└──────────────────────┬──────────────────────────────────┘
-                       │ SQLAlchemy ORM
-┌──────────────────────┴──────────────────────────────────┐
-│               PostgreSQL Database                       │
-│                  Hosted on Render                        │
-│  - 40,000+ matches across 9 leagues                     │
-│  - Teams, Features, Standings, Predictions              │
-└─────────────────────────────────────────────────────────┘
-```
+
+### Local development
+
+`docker compose up --build` brings up backend, frontend, and a postgres container in three commands.
 
 ## Prediction Markets
 
@@ -70,11 +88,22 @@ A full-stack machine learning application that predicts football match outcomes 
 ## Tech Stack
 
 ### Backend
-- Python 3.11, Flask 3.1, Gunicorn
-- SQLAlchemy + PostgreSQL
+- Python 3.12, Flask 3.1, Gunicorn
+- SQLAlchemy + PostgreSQL (Azure Flexible Server with pgBouncer)
 - XGBoost, Scikit-learn, Pandas, NumPy
 - APScheduler (daily fixture refresh)
 - football-data.org API (match data)
+- azure-identity + azure-storage-blob (model storage via Managed Identity)
+- azure-monitor-opentelemetry (structured logs + custom metrics to Application Insights)
+
+### Infrastructure
+- Azure Container Apps (scale-to-zero) + Container Apps Jobs (cron retrain)
+- Azure PostgreSQL Flexible Server (Burstable B1ms with pgBouncer enabled)
+- Azure Blob Storage (`models/production/` + `models/candidate/`)
+- Azure Key Vault (secrets via managed identity references)
+- Azure Container Registry
+- Bicep modules in `infra/` — full stack reproducible via `az deployment group create`
+- GitHub Actions workflows in `.github/workflows/` (backend.yml + infra.yml, both via OIDC)
 
 ### Frontend
 - React 19, Vite 6

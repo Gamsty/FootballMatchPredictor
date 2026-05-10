@@ -25,3 +25,13 @@ APScheduler==3.11.2
 
 # Production Server
 gunicorn==25.1.0
+
+# Azure (model storage from Blob, Key Vault auth via Managed Identity)
+azure-identity==1.21.0
+azure-storage-blob==12.26.0
+
+# Observability (Application Insights via OpenTelemetry)
+azure-monitor-opentelemetry==1.6.5
+opentelemetry-instrumentation-flask==0.51b0
+opentelemetry-instrumentation-sqlalchemy==0.51b0
+opentelemetry-instrumentation-requests==0.51b0

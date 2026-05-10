@@ -1,0 +1,43 @@
+# ===== Builder =====
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+# --only-binary=:all: fails fast if a wheel is missing instead of compiling from source
+# (which can take 15+ minutes for scikit-learn/xgboost and OOM Docker on Windows).
+RUN pip install --user --no-cache-dir --only-binary=:all: -r requirements.txt
+
+# ===== Runtime =====
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash app
+
+COPY --from=builder /root/.local /home/app/.local
+
+COPY --chown=app:app src/ ./src/
+COPY --chown=app:app wsgi.py gunicorn.conf.py ./
+COPY --chown=app:app models/ ./models/
+
+USER app
+ENV PATH=/home/app/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:5000/api/health || exit 1
+
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "wsgi:app"]
