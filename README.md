@@ -15,6 +15,7 @@ A full-stack machine learning application that predicts football match outcomes 
 
 - **Frontend**: [football-match-predictor-pearl.vercel.app](https://football-match-predictor-pearl.vercel.app)
 - **API**: Azure Container Apps (scale-to-zero — first request after idle takes ~5–10 sec to spin up)
+- **Model**: Stacked ensemble (XGBoost + Random Forest + Logistic Regression) — AUC 0.79 on 90-day holdout, ~56% accuracy on the 3-class match outcome
 
 ## Highlights
 
@@ -23,6 +24,7 @@ A full-stack machine learning application that predicts football match outcomes 
 - **Infrastructure as Code** — full Bicep, `az deployment group create` rebuilds the entire stack
 - **CI/CD via GitHub Actions + OIDC** — no long-lived credentials in GitHub
 - **MLOps with validation gates** — nightly retraining job; new model must hold AUC within 0.02 of production before promotion
+- **Model audit trail** — rejected candidates preserved in `models/candidate/` with timestamps; promoted models versioned as `best_model_YYYYMMDDTHHMMSS.pkl` with manifest (`latest.json`) recording AUC before/after, holdout size, and training set size
 - **Observability** — Application Insights with structured logs and custom metrics
 
 ## Features
@@ -66,10 +68,6 @@ graph TB
     Job --> AI
     Job -->|hot reload webhook| CA
 ```
-
-### Local development
-
-`docker compose up --build` brings up backend, frontend, and a postgres container in three commands.
 
 ## Prediction Markets
 
@@ -309,12 +307,23 @@ Push to `main` triggers `.github/workflows/backend.yml`:
 
 ## Author
 
-**Adrian** — [@Gamsty](https://github.com/Gamsty)
+**Adrian Klo Gamst** — Recent UiO informatics graduate, based in Oslo.
+
+- 🌐 [adrianklogamst.no](https://adrianklogamst.no) (portfolio)
+- 💼 [LinkedIn](https://linkedin.com/in/adrian-klo-gamst)
+- 🐙 [@Gamsty](https://github.com/Gamsty)
+- ✉️ gamsten55@outlook.com
+
+Open to graduate, junior, and internship engineering roles starting 2026.
 
 ## Acknowledgments
 
 - [Football-Data.org](https://www.football-data.org/) for the football data API
 - Data from 9 European leagues (2021–2025 seasons)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ---
 
