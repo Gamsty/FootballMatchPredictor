@@ -32,7 +32,7 @@ A full-stack machine learning application that predicts football match outcomes 
 - **Smart bet recommendations** — "Best Bet" (highest edge) and "Safest Bet" (highest probability) with reasoning
 - **Accumulator builder** — Select bets across matches, calculates combined odds and potential returns
 - **Match tagging** — High Confidence, Upset Pick, Banker classifications
-- **Auto-refresh** — Daily fixture updates via APScheduler (06:00 UTC)
+- **Nightly retrain + auto-refresh** — Container Apps Job runs at 03:00 UTC: pulls fresh fixtures, retrains XGBoost, validates AUC against production, promotes or rejects
 - **9 leagues** — Premier League, Championship, La Liga, Bundesliga, Serie A, Ligue 1, Eredivisie, Primeira Liga, Champions League
 
 ## Architecture
@@ -45,7 +45,7 @@ graph TB
     subgraph Azure
         CA[Container Apps<br/>Flask + gunicorn<br/>scale-to-zero]
         Job[Container Apps Job<br/>nightly retrain<br/>+ AUC validation gate]
-        PG[(PostgreSQL Flexible<br/>+ pgBouncer)]
+        PG[(PostgreSQL Flexible<br/>Burstable B1ms)]
         Blob[(Blob Storage<br/>models/production<br/>models/candidate)]
         KV[Key Vault<br/>DB string, API keys]
         AI[Application Insights<br/>logs + metrics]
@@ -53,9 +53,8 @@ graph TB
     end
 
     Vercel -->|HTTPS| CA
-    GHA -->|OIDC + az acr build| ACR
+    GHA -->|OIDC + docker push| ACR
     GHA -->|az containerapp update| CA
-    GHA -->|az deployment group create| Azure
     ACR -->|managed identity pull| CA
     ACR -->|managed identity pull| Job
     CA -->|managed identity| Blob
@@ -89,16 +88,15 @@ graph TB
 
 ### Backend
 - Python 3.12, Flask 3.1, Gunicorn
-- SQLAlchemy + PostgreSQL (Azure Flexible Server with pgBouncer)
+- SQLAlchemy + PostgreSQL (Azure Flexible Server, client-side connection pooling)
 - XGBoost, Scikit-learn, Pandas, NumPy
-- APScheduler (daily fixture refresh)
 - football-data.org API (match data)
 - azure-identity + azure-storage-blob (model storage via Managed Identity)
 - azure-monitor-opentelemetry (structured logs + custom metrics to Application Insights)
 
 ### Infrastructure
-- Azure Container Apps (scale-to-zero) + Container Apps Jobs (cron retrain)
-- Azure PostgreSQL Flexible Server (Burstable B1ms with pgBouncer enabled)
+- Azure Container Apps (scale-to-zero) + Container Apps Jobs (cron retrain at 03:00 UTC)
+- Azure PostgreSQL Flexible Server (Burstable B1ms)
 - Azure Blob Storage (`models/production/` + `models/candidate/`)
 - Azure Key Vault (secrets via managed identity references)
 - Azure Container Registry
