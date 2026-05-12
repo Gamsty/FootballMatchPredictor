@@ -15,7 +15,13 @@ Required env vars:
   FOOTBALL_API_KEY=...
 
 Optional:
-  AUC_TOLERANCE=0.02            How much AUC can drop before we reject the new model
+  AUC_TOLERANCE=0.02            How much AUC can drop before we reject the new model.
+                                NOTE: Was previously bumped to 0.10 in Azure to work around
+                                a stacked-ensemble (prod) vs plain XGBoost (retrain) mismatch.
+                                That's now resolved (retrain trains the same architecture),
+                                so set this back to 0.02 in the Container App Job env vars:
+                                    az containerapp job update -g $RG -n retrain-job \
+                                      --set-env-vars AUC_TOLERANCE=0.02
   HOLDOUT_DAYS=90               Time-based holdout window
   MIN_HOLDOUT_SIZE=50           Refuse to validate on tiny holdouts (cold-start safety)
   BACKEND_RELOAD_URL=...        POST URL to /api/admin/reload-model
@@ -104,12 +110,17 @@ def main() -> int:
     new_fixtures = refresh_fixtures(db)
     logger.info(f"Refreshed fixtures: {new_fixtures} new")
 
-    # 2. Train new model with time-based holdout
-    logger.info(f"Training new XGBoost model (holdout={HOLDOUT_DAYS} days)...")
-    result = model_training.train_xgboost(db, holdout_days=HOLDOUT_DAYS)
+    # 2. Train new model with time-based holdout.
+    # Uses the SAME architecture as production (stacked ensemble: XGBoost + RandomForest
+    # → LogisticRegression meta-learner). Comparing apples-to-apples lets AUC_TOLERANCE
+    # stay tight; previously we trained a plain XGBoost here and compared it against a
+    # stacked-ensemble production model, forcing the tolerance to be widened.
+    logger.info(f"Training new stacked-ensemble model (holdout={HOLDOUT_DAYS} days)...")
+    result = model_training.train_production_model(db, holdout_days=HOLDOUT_DAYS)
     new_model_data = result['model_data']
     X_hold = result['X_holdout']
     y_hold = result['y_holdout']
+    cutoff = result['cutoff']
     logger.info(f"Train: {result['train_size']}, Holdout: {result['holdout_size']}")
 
     # 3. Validation gate
@@ -138,8 +149,11 @@ def main() -> int:
         try:
             prod_bytes = load_model_bytes("best_model.pkl", prefix="production")
             prod_model_data = joblib.load(io.BytesIO(prod_bytes))
-            # Rebuild RAW holdout using same time split, then scale with prod's scaler
-            prod_auc = _eval_prod_on_same_holdout(db, prod_model_data, y_hold)
+            # Rebuild RAW holdout using same time split, then scale with prod's scaler.
+            # Pass the exact cutoff used during training so the two evaluations look at
+            # identical match sets (otherwise calling now() seconds apart can shift the
+            # boundary and produce a one-match length mismatch).
+            prod_auc = _eval_prod_on_same_holdout(db, prod_model_data, y_hold, cutoff)
             logger.info(f"Production AUC (same holdout): {prod_auc:.4f}")
         except Exception as e:
             logger.warning(f"Could not evaluate production model: {e} — defaulting to PASS")
@@ -178,9 +192,17 @@ def main() -> int:
             return 0
         else:
             drop = prod_auc - new_auc
-            logger.warning(f"Validation FAILED (drop={drop:.4f} > tolerance={AUC_TOLERANCE}) — keeping in candidate")
+            # Validation gate rejecting a worse model is the EXPECTED behavior of a
+            # working safe-deploy pipeline, not a job failure. Exit 0 so Azure doesn't
+            # surface this as a failed execution (which would trigger ops alerts). The
+            # candidate is preserved in `models/candidate/` for offline inspection, and
+            # the WARNING-level log makes the rejection visible in Application Insights.
+            logger.warning(
+                f"Validation REJECTED — new model dropped {drop:.4f} AUC vs production "
+                f"(tolerance={AUC_TOLERANCE}). Candidate preserved at candidate/failed_{timestamp}.pkl"
+            )
             upload_model(candidate_path, f"failed_{timestamp}.pkl", prefix="candidate")
-            return 2
+            return 0
 
 
 def _isnan(x) -> bool:
@@ -190,7 +212,7 @@ def _isnan(x) -> bool:
         return False
 
 
-def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected):
+def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected, cutoff):
     """
     Re-build the same time-based holdout using PRODUCTION model's feature pipeline,
     then evaluate. Necessary because train_xgboost only returns the new model's scaled
@@ -198,6 +220,9 @@ def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected):
 
     Strategy: rebuild raw features with model_training._build_xy_from_csv (deterministic),
     apply prod's scaler (column-aligned to prod's feature_names), evaluate AUC.
+
+    `cutoff` is the same Timestamp used during training — passed in to guarantee both
+    models are evaluated on the exact same matches.
     """
     from feature_engineering import FeatureEngineer
     import pandas as pd
@@ -211,7 +236,6 @@ def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected):
             X, y, df, _, _ = model_training._build_xy_from_csv(tmp_csv, include_odds=False, binary_mode=False)
 
             df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=HOLDOUT_DAYS)
             hold_mask = df['date'] >= cutoff
 
             X_hold_raw = X[hold_mask].copy()

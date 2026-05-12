@@ -21,14 +21,13 @@ Endpoints:
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, timezone
-import pandas as pd
 import joblib
 from dotenv import load_dotenv
+import hmac
 import io
 import logging
 import os
 import re
-import atexit
 
 from database import DatabaseManager, Match, Team, Prediction, MatchFeatures, init_db
 from feature_engineering import FeatureEngineer
@@ -40,11 +39,19 @@ from model_storage import load_model_bytes
 from telemetry import setup_telemetry
 from sqlalchemy import and_, desc, distinct
 
-# Load environment variables
-load_dotenv()
+# Load environment variables. Only read a local .env file in development; in
+# production (Azure Container Apps), env vars come from Key Vault references and
+# allowing .env to override them would be a footgun if one ever slipped into an image.
+if os.getenv("FLASK_ENV", "development") != "production":
+    load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Reject request bodies over 256 KB. Our largest legitimate request is a single
+# /api/predict body (~200 bytes), so this is a generous ceiling against
+# memory-exhaustion DoS from unbounded JSON.
+app.config['MAX_CONTENT_LENGTH'] = 256 * 1024
 
 # Wire up Azure Monitor (no-op when APPLICATIONINSIGHTS_CONNECTION_STRING is unset)
 setup_telemetry(app)
@@ -62,8 +69,10 @@ ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "https://football-match-predictor-pearl.vercel.app",
 ]
+# Matches any Vercel deploy URL for this project: production alias (-pearl), per-commit
+# (-<sha>-gamstys-projects), branch previews. Stays scoped to football-match-predictor-*.
 VERCEL_PREVIEW_REGEX = re.compile(
-    r"^https://football-match-predictor-pearl-[a-z0-9-]+\.vercel\.app$"
+    r"^https://football-match-predictor-[a-z0-9-]+\.vercel\.app$"
 )
 
 CORS(app, resources={
@@ -146,10 +155,10 @@ def warm_cache():
                 prediction_cache.set(match.home_team_id, match.away_team_id, prediction_data, date_str)
                 count += 1
             except Exception as e:
-                print(f"  Cache warm skip {match.id}: {e}")
-        print(f"Cache warmed: {count} matches precomputed")
-    except Exception as e:
-        print(f"Cache warm error: {e}")
+                logger.warning("Cache warm skip match_id=%s: %s", match.id, e)
+        logger.info("Cache warmed: %d matches precomputed", count)
+    except Exception:
+        logger.exception("Cache warm error")
 
 # Warm cache at startup
 warm_cache()
@@ -185,6 +194,34 @@ def health_check():
     }), 200
 
 
+def _error_response(message: str, status: int, exc: Exception | None = None, *, endpoint: str | None = None):
+    """
+    Return a sanitized JSON error to the client while logging the full exception
+    (and traceback) server-side. Avoids leaking SQL errors, file paths, stack frames,
+    or DB schema names through the response body.
+    """
+    if exc is not None:
+        logger.exception("Unhandled error in %s: %s", endpoint or "endpoint", exc)
+    else:
+        logger.warning("Error in %s: %s", endpoint or "endpoint", message)
+    return jsonify({"error": message}), status
+
+
+def _require_admin_token() -> bool:
+    """
+    Constant-time shared-secret check for admin endpoints. Returns True iff the
+    request carries a valid X-Reload-Token matching the RELOAD_TOKEN env var.
+    Used by both /api/admin/reload-model and /api/fixtures/refresh.
+    """
+    expected_token = os.getenv("RELOAD_TOKEN")
+    provided_token = request.headers.get("X-Reload-Token", "")
+    if not expected_token:
+        return False
+    # hmac.compare_digest is constant-time — avoids leaking token length/prefix
+    # via response-time analysis.
+    return hmac.compare_digest(expected_token, provided_token)
+
+
 @app.route('/api/admin/reload-model', methods=['POST'])
 def reload_model():
     """
@@ -192,8 +229,7 @@ def reload_model():
     Called by the retraining job after a successful validation+promotion.
     Auth: shared secret in X-Reload-Token header.
     """
-    expected_token = os.getenv("RELOAD_TOKEN")
-    if not expected_token or request.headers.get("X-Reload-Token") != expected_token:
+    if not _require_admin_token():
         return jsonify({"error": "Unauthorized"}), 401
     load_model()
     prediction_cache.clear()
@@ -222,7 +258,7 @@ def get_teams():
         return jsonify(teams_list), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load teams", 500, e, endpoint="get_teams")
 
 @app.route('/api/teams/<int:team_id>', methods=['GET'])
 def get_team(team_id):
@@ -299,7 +335,7 @@ def get_team(team_id):
         }), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load team", 500, e, endpoint="get_team")
 
 # ============================================================================
 # PREDICTIONS
@@ -310,14 +346,14 @@ def predict_match():
     """Predict match outcome (H/D/A) for two teams."""
     try:
         if not model_data:
-            return jsonify({'error': 'Model not loaded'}), 500
+            return jsonify({'error': 'Model not loaded'}), 503
 
-        data = request.json
-        if 'home_team_id' not in data or 'away_team_id' not in data:
-            return jsonify({'error': 'Missing home_team_id or away_team_id'}), 400
-
-        home_team_id = int(data['home_team_id'])
-        away_team_id = int(data['away_team_id'])
+        data = request.get_json(silent=True) or {}
+        try:
+            home_team_id = int(data['home_team_id'])
+            away_team_id = int(data['away_team_id'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'error': 'home_team_id and away_team_id must be integers'}), 400
 
         home_team = db.session.query(Team).filter_by(id=home_team_id).first()
         away_team = db.session.query(Team).filter_by(id=away_team_id).first()
@@ -349,10 +385,7 @@ def predict_match():
         return jsonify(response), 200
 
     except Exception as e:
-        print(f"Prediction error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Prediction failed", 500, e, endpoint="predict_match")
 
 
 @app.route('/api/predict/markets', methods=['POST'])
@@ -366,14 +399,14 @@ def predict_markets():
     """
     try:
         if not model_data:
-            return jsonify({'error': 'Main model not loaded'}), 500
+            return jsonify({'error': 'Main model not loaded'}), 503
 
-        data = request.json
-        if 'home_team_id' not in data or 'away_team_id' not in data:
-            return jsonify({'error': 'Missing home_team_id or away_team_id'}), 400
-
-        home_team_id = int(data['home_team_id'])
-        away_team_id = int(data['away_team_id'])
+        data = request.get_json(silent=True) or {}
+        try:
+            home_team_id = int(data['home_team_id'])
+            away_team_id = int(data['away_team_id'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'error': 'home_team_id and away_team_id must be integers'}), 400
 
         home_team = db.session.query(Team).filter_by(id=home_team_id).first()
         away_team = db.session.query(Team).filter_by(id=away_team_id).first()
@@ -408,10 +441,7 @@ def predict_markets():
         return jsonify(response), 200
 
     except Exception as e:
-        print(f"Multi-market prediction error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Prediction failed", 500, e, endpoint="predict_markets")
 
 
 @app.route('/api/predictions/history', methods=['GET'])
@@ -461,7 +491,7 @@ def get_prediction_history():
         }), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load prediction history", 500, e, endpoint="prediction_history")
 
 
 @app.route('/api/predictions/upcoming', methods=['GET'])
@@ -478,9 +508,11 @@ def get_upcoming_predictions():
     """
     try:
         if not model_data:
-            return jsonify({'error': 'Model not loaded'}), 500
+            return jsonify({'error': 'Model not loaded'}), 503
 
-        days = request.args.get('days', 14, type=int)
+        # Clamp days to a 30-day forward window — anything longer hits matches we
+        # don't have fixtures for and just wastes DB queries.
+        days = max(1, min(request.args.get('days', 14, type=int) or 14, 30))
         competition_filter = request.args.get('competition', '')
         min_confidence = request.args.get('min_confidence', 0, type=float)
         sort_by = request.args.get('sort_by', 'date')
@@ -525,6 +557,12 @@ def get_upcoming_predictions():
                 if category and category not in tags:
                     continue
 
+                # Apply min_confidence filter (documented query param)
+                if min_confidence > 0:
+                    pred_confidence = prediction_data.get('match_result', {}).get('confidence', 0)
+                    if pred_confidence < min_confidence:
+                        continue
+
                 results.append({
                     'id': match.id,
                     'date': match.date.isoformat(),
@@ -543,7 +581,7 @@ def get_upcoming_predictions():
                 })
 
             except Exception as e:
-                print(f"Prediction error for match {match.id}: {e}")
+                logger.warning("Per-match prediction error match_id=%s: %s", match.id, e)
                 # Still include the match, just without prediction
                 results.append({
                     'id': match.id,
@@ -585,10 +623,7 @@ def get_upcoming_predictions():
         }), 200
 
     except Exception as e:
-        print(f"Upcoming predictions error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load upcoming predictions", 500, e, endpoint="upcoming_predictions")
 
 
 # ============================================================================
@@ -603,7 +638,7 @@ def get_competitions():
         competitions = [c[0] for c in comps if c[0]]
         return jsonify(competitions), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load competitions", 500, e, endpoint="competitions")
 
 
 # ============================================================================
@@ -615,11 +650,20 @@ def refresh_fixtures():
     """
     Fetch upcoming fixtures from football-data.org and upsert into DB.
     This syncs new SCHEDULED/TIMED matches.
+
+    Auth: same X-Reload-Token shared secret as /api/admin/reload-model.
+    Without this, anyone could trigger the endpoint and burn our football-data.org
+    free-tier quota (10 req/min), churn the DB, and force a full prediction-cache
+    rewarm on every call.
     """
+    if not _require_admin_token():
+        return jsonify({"error": "Unauthorized"}), 401
     try:
         from data_collection import FootballDataCollector
 
         days = request.args.get('days', 14, type=int)
+        # Clamp to free-tier-friendly range — caller can't request a 10-year sync.
+        days = max(1, min(days, 60))
         collector = FootballDataCollector()
         fixtures = collector.get_upcoming_fixtures(days=days)
 
@@ -679,10 +723,7 @@ def refresh_fixtures():
 
     except Exception as e:
         db.session.rollback()
-        print(f"Fixture refresh error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Fixture refresh failed", 500, e, endpoint="fixture_refresh")
 
 
 # ============================================================================
@@ -696,7 +737,8 @@ def get_matches():
         season = request.args.get('season', type=int)
         team_id = request.args.get('team_id', type=int)
         status = request.args.get('status')
-        limit = request.args.get('limit', 50, type=int)
+        # Cap to 500 — without this, a single request could pull every row in the table.
+        limit = max(1, min(request.args.get('limit', 50, type=int) or 50, 500))
 
         query = db.session.query(Match)
 
@@ -731,7 +773,7 @@ def get_matches():
         }), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load matches", 500, e, endpoint="get_matches")
 
 @app.route('/api/matches/<int:match_id>', methods=['GET'])
 def get_match(match_id):
@@ -797,13 +839,13 @@ def get_match(match_id):
         return jsonify(match_data), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load match", 500, e, endpoint="get_match")
 
 @app.route('/api/matches/upcoming', methods=['GET'])
 def get_upcoming_matches():
     """Get upcoming scheduled matches with basic predictions"""
     try:
-        days = request.args.get('days', 14, type=int)
+        days = max(1, min(request.args.get('days', 14, type=int) or 14, 30))
         matches = db.get_upcoming_matches(days)
 
         results = []
@@ -817,7 +859,7 @@ def get_upcoming_matches():
                     )
                     match_prediction = predict_match_result(features, model_data)
                 except Exception as e:
-                    print(f"Prediction error for match {match.id}: {e}")
+                    logger.warning("Per-match prediction error match_id=%s: %s", match.id, e)
 
             results.append({
                 'id': match.id,
@@ -841,7 +883,7 @@ def get_upcoming_matches():
         return jsonify(results)
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load upcoming matches", 500, e, endpoint="upcoming_matches")
 
 # ============================================================================
 # STATISTICS
@@ -897,7 +939,7 @@ def get_statistics_overview():
         }), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load statistics", 500, e, endpoint="statistics_overview")
 
 @app.route('/api/statistics/head-to-head', methods=['GET'])
 def get_head_to_head():
@@ -982,7 +1024,7 @@ def get_head_to_head():
         }), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _error_response("Failed to load head-to-head", 500, e, endpoint="head_to_head")
 
 # ============================================================================
 # ERROR HANDLERS
@@ -996,75 +1038,11 @@ def not_found(error):
 def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
 
-# ============================================================================
-# SCHEDULED JOBS — Automatic daily fixture refresh
-# Runs via APScheduler at 06:00 UTC every day.
-# Fetches upcoming fixtures from football-data.org, adds new matches to the DB,
-# clears the prediction cache, and warms it with fresh predictions.
-# ============================================================================
-
-def scheduled_fixture_refresh():
-    """Auto-refresh fixtures from football-data.org (called by APScheduler)."""
-    with app.app_context():
-        try:
-            from data_collection import FootballDataCollector
-            collector = FootballDataCollector()
-            fixtures = collector.get_upcoming_fixtures(days=3)
-
-            added = 0
-            for fixture in fixtures:
-                home_team = db.session.query(Team).filter_by(
-                    api_id=fixture['home_team_api_id']
-                ).first()
-                away_team = db.session.query(Team).filter_by(
-                    api_id=fixture['away_team_api_id']
-                ).first()
-
-                if not home_team or not away_team:
-                    continue
-
-                existing = db.session.query(Match).filter_by(
-                    api_id=fixture['api_id']
-                ).first()
-
-                if existing:
-                    existing.status = fixture['status']
-                    existing.date = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00'))
-                else:
-                    db.session.add(Match(
-                        api_id=fixture['api_id'],
-                        home_team_id=home_team.id,
-                        away_team_id=away_team.id,
-                        season=fixture['season'],
-                        matchday=fixture.get('matchday'),
-                        competition=fixture['competition'],
-                        stage=fixture.get('stage', 'REGULAR_SEASON'),
-                        date=datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')),
-                        status=fixture['status'],
-                    ))
-                    added += 1
-
-            db.session.commit()
-            prediction_cache.clear()
-            warm_cache()
-            print(f"[Scheduler] Fixtures refreshed: {added} new matches added")
-        except Exception as e:
-            print(f"[Scheduler] Fixture refresh failed: {e}")
-
-
-# Scheduler: opt-in via ENABLE_SCHEDULER=true.
-# In Azure the retrain Container Apps Job handles scheduled work (Fase 10), so the
-# backend container does NOT run a scheduler. Setting this in every gunicorn worker
-# (which is what the old guard did) created N parallel schedulers and OOM'd local Docker.
-# Locally: also off by default; turn on with ENABLE_SCHEDULER=true if you want cron-in-app.
-if os.environ.get('ENABLE_SCHEDULER', 'false').lower() == 'true':
-    from apscheduler.schedulers.background import BackgroundScheduler
-
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=scheduled_fixture_refresh, trigger='cron', hour=6, minute=0, id='daily_fixture_refresh')
-    scheduler.start()
-    logger.info("Daily fixture refresh scheduled for 06:00 UTC")
-    atexit.register(lambda: scheduler.shutdown())
+# Scheduled fixture refresh and nightly retraining are handled by the Azure
+# Container Apps Job defined in backend/jobs/retrain.py — not by an in-process
+# scheduler. The backend container is stateless and scale-to-zero, so a per-process
+# cron would either run N times (one per gunicorn worker) or not at all (when scaled
+# down). The job runs once nightly at 03:00 UTC regardless of replica state.
 
 # ============================================================================
 # RUN APP
@@ -1076,8 +1054,13 @@ if __name__ == '__main__':
     print("=" * 70)
     print(f"Model: {model_data['model_type'] if model_data else 'NOT_LOADED'}")
     print(f"Multi-market: {'Loaded' if multi_market_models else 'NOT_LOADED'}")
-    print(f"Database: Connected")
+    print("Database: Connected")
     print(f"CORS: Enabled for {FRONTEND_URL}")
     print("=" * 70 + "\n")
 
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Debug mode exposes the Werkzeug interactive debugger — never enable in
+    # production. Production uses gunicorn (see gunicorn.conf.py) and never hits
+    # this block, but we gate on FLASK_DEBUG anyway so an accidental `python app.py`
+    # in prod can't open the debugger pin endpoint to the world.
+    debug = os.getenv("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
+    app.run(debug=debug, host='0.0.0.0', port=5000)

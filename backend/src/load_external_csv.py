@@ -28,7 +28,7 @@ import pandas as pd
 import os
 import sys
 import time
-from database import DatabaseManager, Team, Match, Standing
+from database import DatabaseManager, Team
 
 # ============================================================
 # Configuration
@@ -373,7 +373,7 @@ def download_csv(league_code, season_code, save_dir="../data/external"):
 
         # Check if we got actual CSV data (not an error page)
         if len(response.content) < 100:
-            print(f"      Empty response, skipping")
+            print("      Empty response, skipping")
             return None
 
         with open(save_path, 'wb') as f:
@@ -517,9 +517,12 @@ def process_csv(csv_path, league_code, competition_name, season):
         b365_h = row.get('B365H') if 'B365H' in df.columns else None
         b365_d = row.get('B365D') if 'B365D' in df.columns else None
         b365_a = row.get('B365A') if 'B365A' in df.columns else None
-        if pd.notna(b365_h): entry['b365_home'] = float(b365_h)
-        if pd.notna(b365_d): entry['b365_draw'] = float(b365_d)
-        if pd.notna(b365_a): entry['b365_away'] = float(b365_a)
+        if pd.notna(b365_h):
+            entry['b365_home'] = float(b365_h)
+        if pd.notna(b365_d):
+            entry['b365_draw'] = float(b365_d)
+        if pd.notna(b365_a):
+            entry['b365_away'] = float(b365_a)
 
         processed.append(entry)
 
@@ -744,9 +747,9 @@ def load_all_external_data(only_league=None):
     print("=" * 60)
     print(f"    Total matches loaded: {grand_total_matches}")
     print(f"    Total standing entries: {grand_total_standings}")
-    print(f"\nNext steps:")
-    print(f"    1. Run: python feature_engineering.py")
-    print(f"    2. Run: python model_training.py")
+    print("\nNext steps:")
+    print("    1. Run: python feature_engineering.py")
+    print("    2. Run: python model_training.py")
 
 
 if __name__ == "__main__":

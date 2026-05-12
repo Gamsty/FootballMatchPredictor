@@ -50,13 +50,16 @@ jobs:
 
       - name: Lint
         working-directory: backend
-        run: ruff check src/ || echo "Lint warnings (non-blocking)"
+        run: ruff check src/
 
       - name: Run tests
         working-directory: backend
         env:
           DATABASE_URL: postgresql://postgres:password@localhost:5432/football_predictor_test
-        run: pytest -q || echo "No tests yet — TODO add some"
+        # --passed=0 disabled so pytest exits 0 if no tests are collected (avoids
+        # "no tests collected" failure during early bootstrap), but any actual
+        # test failure or error WILL fail the job.
+        run: pytest -q --no-header || ([ $? -eq 5 ] && echo "No tests collected yet" || exit $?)
 
   build-and-deploy:
     needs: test

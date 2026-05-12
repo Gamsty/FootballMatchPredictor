@@ -20,9 +20,6 @@ requests==2.32.5
 # Environment
 python-dotenv==1.2.2
 
-# Scheduling
-APScheduler==3.11.2
-
 # Production Server
 gunicorn==25.1.0
 

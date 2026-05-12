@@ -16,7 +16,7 @@ Pipeline: match_features.csv → load/clean → Elo ratings → train/test split
 
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
@@ -134,6 +134,11 @@ class MatchPredictor:
         df = pd.read_csv(csv_path)
         print(f"Loaded {len(df)} records")
 
+        # Elo only makes sense chronologically — ensure rows are date-ordered.
+        # Without this, an unsorted CSV would produce garbage Elo features.
+        if 'date' in df.columns:
+            df = df.sort_values('date').reset_index(drop=True)
+
         # --- Compute Elo ratings ---
         if 'home_team' in df.columns and 'away_team' in df.columns:
             print("Computing Elo ratings...")
@@ -160,9 +165,10 @@ class MatchPredictor:
 
         X = df[base_cols].copy()
 
-        # Fill missing rest days with median
+        # Rest-days imputation: fixed 7-day default. Median over the full dataset
+        # would leak holdout/test statistics into train (see _build_xy_from_csv).
         for col in ['days_since_home_last_match', 'days_since_away_last_match']:
-            X[col] = X[col].fillna(X[col].median())
+            X[col] = X[col].fillna(7)
         X = X.fillna(0)
 
         # --- Derived features ---
@@ -249,7 +255,7 @@ class MatchPredictor:
             y = df['target'].map({'HOME_TEAM': 2, 'DRAW': 1, 'AWAY_TEAM': 0})
 
         print(f"\nFeatures shape: {X.shape}")
-        print(f"Target distribution:")
+        print("Target distribution:")
         if binary_mode:
             target_map = {0: 'AWAY_TEAM', 1: 'HOME_TEAM'}
         else:
@@ -259,13 +265,31 @@ class MatchPredictor:
 
         return X, y, df
 
-    def split_data(self, X, y, test_size=0.2, random_state=42):
-        """Split data into train and test sets"""
-        print(f"\nSplitting data: {int((1-test_size)*100)}% train, {int(test_size*100)}% test")
+    def split_data(self, X, y, test_size=0.2, random_state=42, time_based=True):
+        """Split data into train and test sets.
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
+        Defaults to a chronological (time-based) split: last `test_size` of rows by date
+        are held out. This matches the production retrain pipeline and avoids the
+        leakage that random splits cause on time-series features (Elo, form, league
+        position all use the chronological history available at match time).
+
+        Set time_based=False for a random stratified split (legacy/benchmark use only —
+        the resulting accuracy will be optimistic).
+        """
+        if time_based:
+            # X is already date-ordered by load_data (we sort in load_data after
+            # reading the CSV). Take the trailing slice as test.
+            split_idx = int(len(X) * (1 - test_size))
+            X_train = X.iloc[:split_idx]
+            X_test = X.iloc[split_idx:]
+            y_train = y.iloc[:split_idx]
+            y_test = y.iloc[split_idx:]
+            print(f"\nSplitting data (time-based): {int((1-test_size)*100)}% train, {int(test_size*100)}% test")
+        else:
+            print(f"\nSplitting data (random stratified): {int((1-test_size)*100)}% train, {int(test_size*100)}% test")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state, stratify=y
+            )
 
         print(f"Training set: {len(X_train)} samples")
         print(f"Test set: {len(X_test)} samples")
@@ -403,11 +427,11 @@ class MatchPredictor:
         print(f"\nOverall Accuracy: {accuracy:.4f}")
         if logloss is not None:
             print(f"Log Loss: {logloss:.4f}")
-        print(f"\nMacro Averages:")
+        print("\nMacro Averages:")
         print(f"    Precision: {precision_macro:.4f}")
         print(f"    Recall: {recall_macro:.4f}")
         print(f"    F1 Score: {f1_macro:.4f}")
-        print(f"\nWeighted Averages:")
+        print("\nWeighted Averages:")
         print(f"    Precision: {precision_weighted:.4f}")
         print(f"    Recall: {recall_weighted:.4f}")
         print(f"    F1 Score: {f1_weighted:.4f}")
@@ -884,14 +908,14 @@ def compare_models(tune=True, n_iter=50):
     # If stacked 3-class is better than best individual, save it as best_model
     if stack_metrics['accuracy'] > best_acc_no_odds:
         stack_predictor.save_model(filename='../models/best_model.pkl')
-        print(f"\nStacked ensemble beat individual models! Saved as best_model.pkl")
+        print("\nStacked ensemble beat individual models! Saved as best_model.pkl")
         best_acc_no_odds = stack_metrics['accuracy']
         best_type_no_odds = 'stacked_ensemble'
 
     # If stacked binary is better than best binary, save it
     if stack_binary_metrics['accuracy'] > best_acc_binary:
         stack_binary_predictor.save_model(filename='../models/best_binary_model.pkl')
-        print(f"\nStacked binary beat individual models! Saved as best_binary_model.pkl")
+        print("\nStacked binary beat individual models! Saved as best_binary_model.pkl")
         best_acc_binary = stack_binary_metrics['accuracy']
         best_type_binary = 'stacked_ensemble'
 
@@ -914,7 +938,7 @@ def compare_models(tune=True, n_iter=50):
     if cal_ll is not None:
         print(f"\n  Calibrated model log loss: {cal_ll:.4f}")
 
-    print(f"\n  Elo ratings: Computed for all teams (stored in model pickle)")
+    print("\n  Elo ratings: Computed for all teams (stored in model pickle)")
     print(f"  Odds boost: +{(best_acc_with_odds - best_acc_no_odds)*100:.1f}%")
     print(f"  Binary boost over 3-class: +{(best_acc_binary - best_acc_no_odds)*100:.1f}%")
 
@@ -1210,7 +1234,7 @@ def train_market_model(market_name, market_def, df, feature_cols, elo_ratings=No
     print(f"\n  Accuracy: {accuracy:.4f}")
     if logloss:
         print(f"  Log Loss: {logloss:.4f}")
-    print(f"\n  Classification Report:")
+    print("\n  Classification Report:")
     print(classification_report(y_test, y_pred, target_names=labels, digits=4))
 
     return {
@@ -1374,7 +1398,7 @@ def train_all_markets(csv_path='../data/processed/match_features.csv',
 
     # Save results CSV
     pd.DataFrame(market_results).T.to_csv('../data/multi_market_results.csv')
-    print(f"\nResults saved to ../data/multi_market_results.csv")
+    print("\nResults saved to ../data/multi_market_results.csv")
 
     return all_market_models
 
@@ -1413,8 +1437,11 @@ def _build_xy_from_csv(csv_path, include_odds=False, binary_mode=False):
     ]
     X = df[base_cols].copy()
 
+    # Rest-days imputation: fixed 7-day default. Computing median over the full
+    # dataset would leak holdout statistics into the train set (a holdout match's
+    # rest-days distribution would influence the imputation seen at train time).
     for col in ['days_since_home_last_match', 'days_since_away_last_match']:
-        X[col] = X[col].fillna(X[col].median())
+        X[col] = X[col].fillna(7)
     X = X.fillna(0)
 
     # Derived features (must match MatchPredictor.load_data exactly)
@@ -1515,7 +1542,6 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
     """
     # Local imports — feature_engineering pulls in DB, we want this lazy when imported
     from feature_engineering import FeatureEngineer
-    import io as _io
 
     fe = FeatureEngineer()
     try:
@@ -1535,7 +1561,8 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
 
             # Time-based split (uses df['date'] which load_data preserves)
             df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=holdout_days)
+            # pd.Timestamp.utcnow() is deprecated in pandas 3.x — use tz-aware now('UTC')
+            cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=holdout_days)
             train_mask = df['date'] < cutoff
             hold_mask = df['date'] >= cutoff
 
@@ -1587,6 +1614,128 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
                 'y_holdout': y_hold.reset_index(drop=True),
                 'holdout_size': len(X_hold),
                 'train_size': len(X_train),
+                # Pass the exact cutoff so a follow-up production-model eval can
+                # reproduce the same holdout window (no drift from calling
+                # pd.Timestamp.now() seconds later).
+                'cutoff': cutoff,
+            }
+        finally:
+            try:
+                os.unlink(tmp_csv)
+            except OSError:
+                pass
+    finally:
+        fe.close()
+
+
+def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5):
+    """
+    Train the SAME architecture used in production (stacked ensemble: XGBoost + RandomForest
+    with a LogisticRegression meta-learner). Time-based holdout split and TimeSeriesSplit CV
+    so the validation gate in the retrain job compares apples-to-apples against the deployed
+    model — previously the gate compared a freshly-trained plain XGBoost against a production
+    stacked ensemble, which forced the AUC tolerance to be widened until the gate became a
+    no-op.
+
+    Pipeline:
+        1. Compute features for all FINISHED matches in DB (idempotent)
+        2. Export to a temp CSV, build (X, y) with leakage-safe imputation
+        3. Time-based split on `holdout_days`
+        4. Fit StandardScaler on TRAIN only, transform both
+        5. Stack XGBoost + RandomForest via 5-fold TimeSeriesSplit CV → LR meta-learner
+        6. Return model_data dict + scaled holdout for the caller's validation gate
+
+    Returns:
+        dict with the same keys as train_xgboost(): model_data, X_holdout, y_holdout,
+        holdout_size, train_size, cutoff.
+    """
+    from feature_engineering import FeatureEngineer
+
+    fe = FeatureEngineer()
+    try:
+        print("[train_production_model] Computing features for all matches in DB...")
+        fe.create_features_for_all_matches(save_to_db=True)
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp:
+            tmp_csv = tmp.name
+        try:
+            print(f"[train_production_model] Exporting features to {tmp_csv}...")
+            fe.export_features_to_csv(output_path=tmp_csv)
+
+            X, y, df, feature_names, elo_ratings = _build_xy_from_csv(
+                tmp_csv, include_odds=include_odds, binary_mode=False
+            )
+
+            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
+            cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=holdout_days)
+            train_mask = df['date'] < cutoff
+            hold_mask = df['date'] >= cutoff
+
+            X_train = X[train_mask].copy()
+            y_train = y[train_mask].copy()
+            X_hold = X[hold_mask].copy()
+            y_hold = y[hold_mask].copy()
+
+            print(f"[train_production_model] Train: {len(X_train)}, Holdout: {len(X_hold)} (last {holdout_days}d)")
+            if len(X_train) < 100:
+                raise RuntimeError(f"Training set too small ({len(X_train)} < 100)")
+
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_hold_scaled_arr = scaler.transform(X_hold) if len(X_hold) else np.empty((0, X_train.shape[1]))
+
+            # Base estimators — match compare_models() defaults so retrain produces the
+            # same architecture that ships from the CLI training pipeline.
+            xgb_est = xgb.XGBClassifier(
+                n_estimators=300, max_depth=5, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, random_state=42,
+                eval_metric='mlogloss', objective='multi:softprob',
+            )
+            rf_est = RandomForestClassifier(
+                n_estimators=300, max_depth=10, min_samples_leaf=2,
+                random_state=42, n_jobs=-1,
+            )
+
+            # TimeSeriesSplit instead of default StratifiedKFold: meta-features for the
+            # LR meta-learner are generated using ONLY past data within each fold, mirroring
+            # how the model will be used at inference time.
+            ts_cv = TimeSeriesSplit(n_splits=cv_splits)
+
+            stacking = StackingClassifier(
+                estimators=[('xgb', xgb_est), ('rf', rf_est)],
+                final_estimator=LogisticRegression(max_iter=1000, C=1.0, random_state=42),
+                cv=ts_cv,
+                stack_method='predict_proba',
+                passthrough=False,
+                n_jobs=1,  # base estimators already use n_jobs=-1 internally; nesting hangs on some CI runners
+            )
+
+            print(f"[train_production_model] Fitting stacked ensemble (CV={cv_splits} time-series folds)...")
+            start = datetime.now()
+            stacking.fit(X_train_scaled, y_train)
+            print(f"[train_production_model] Trained in {(datetime.now() - start).total_seconds():.1f}s")
+
+            model_data = {
+                'model': stacking,
+                'scaler': scaler,
+                'feature_names': feature_names,
+                'model_type': 'stacked_ensemble',
+                'elo_ratings': elo_ratings,
+                'created_at': datetime.now().isoformat(),
+            }
+
+            X_hold_scaled = (
+                pd.DataFrame(X_hold_scaled_arr, columns=feature_names)
+                if len(X_hold) else pd.DataFrame(columns=feature_names)
+            )
+
+            return {
+                'model_data': model_data,
+                'X_holdout': X_hold_scaled,
+                'y_holdout': y_hold.reset_index(drop=True),
+                'holdout_size': len(X_hold),
+                'train_size': len(X_train),
+                'cutoff': cutoff,
             }
         finally:
             try:

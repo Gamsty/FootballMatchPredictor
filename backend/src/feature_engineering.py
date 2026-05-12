@@ -18,7 +18,6 @@ Pipeline: database (matches table) → compute features → match_features table
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-from datetime import datetime
 from database import DatabaseManager, Match, Team, MatchFeatures, Standing
 from sqlalchemy import and_, or_
 
@@ -657,11 +656,15 @@ class FeatureEngineer:
             pts = 0
             for m in matches:
                 if m.home_team_id == team_id:
-                    if m.winner == 'HOME_TEAM': pts += 3
-                    elif m.winner == 'DRAW': pts += 1
+                    if m.winner == 'HOME_TEAM':
+                        pts += 3
+                    elif m.winner == 'DRAW':
+                        pts += 1
                 else:
-                    if m.winner == 'AWAY_TEAM': pts += 3
-                    elif m.winner == 'DRAW': pts += 1
+                    if m.winner == 'AWAY_TEAM':
+                        pts += 3
+                    elif m.winner == 'DRAW':
+                        pts += 1
             return float(pts)
 
         # Goals scored/conceded avg (last 5 home/away matches)
@@ -684,13 +687,19 @@ class FeatureEngineer:
         h2h_home_wins = h2h_draws = h2h_away_wins = 0
         for m in h2h_matches:
             if m.home_team_id == home_id:
-                if m.winner == 'HOME_TEAM': h2h_home_wins += 1
-                elif m.winner == 'AWAY_TEAM': h2h_away_wins += 1
-                else: h2h_draws += 1
+                if m.winner == 'HOME_TEAM':
+                    h2h_home_wins += 1
+                elif m.winner == 'AWAY_TEAM':
+                    h2h_away_wins += 1
+                else:
+                    h2h_draws += 1
             else:
-                if m.winner == 'AWAY_TEAM': h2h_home_wins += 1
-                elif m.winner == 'HOME_TEAM': h2h_away_wins += 1
-                else: h2h_draws += 1
+                if m.winner == 'AWAY_TEAM':
+                    h2h_home_wins += 1
+                elif m.winner == 'HOME_TEAM':
+                    h2h_away_wins += 1
+                else:
+                    h2h_draws += 1
 
         # Rest days
         home_all = self._get_before(self._team_all_matches[home_id], match_date, 1)
@@ -844,19 +853,35 @@ class FeatureEngineer:
 
         all_features = []
 
-        # Get already-processed match IDs to skip them on re-runs
-        existing_ids = set()
+        # Get features computed-at timestamps so we can skip matches whose underlying
+        # data hasn't changed since features were last computed. Previously this used
+        # set membership only, which meant a match that got its final score (status
+        # SCHEDULED → FINISHED) never had its features recomputed — silently serving
+        # stale features as new results came in.
+        existing_features = {}
         if save_to_db:
-            existing_ids = {
-                row[0] for row in self.db.session.query(MatchFeatures.match_id).all()
+            existing_features = {
+                row[0]: row[1]
+                for row in self.db.session.query(
+                    MatchFeatures.match_id, MatchFeatures.created_at
+                ).all()
             }
-            if existing_ids:
-                print(f"Skipping {len(existing_ids)} already-processed matches...")
+            if existing_features:
+                print(f"Found {len(existing_features)} previously-processed matches (will skip those still up-to-date)...")
+
+        skipped_count = 0
 
         for idx, match in enumerate(matches):
-            # Skip already-processed matches (saves time on re-runs)
-            if match.id in existing_ids:
-                continue
+            features_created_at = existing_features.get(match.id)
+            if features_created_at is not None:
+                # Skip if features were computed AFTER the match was last updated.
+                # match.updated_at has onupdate=datetime.utcnow so it advances whenever
+                # any column changes (e.g. score or status). If match has never been
+                # touched since features were computed, no need to recompute.
+                match_updated = match.updated_at or match.created_at
+                if match_updated is None or features_created_at >= match_updated:
+                    skipped_count += 1
+                    continue
 
             # Create features
             features = self.create_match_features(match)
@@ -900,7 +925,8 @@ class FeatureEngineer:
         # Convert to DataFrame
         df = pd.DataFrame(all_features)
 
-        print(f"\nFeatures created: {len(df)} rows, {len(df.columns)} columns")
+        print(f"\nFeatures created: {len(df)} rows, {len(df.columns)} columns "
+              f"({skipped_count} skipped as up-to-date)")
         print(f"Feature columns: {list(df.columns)}")
 
         return df
