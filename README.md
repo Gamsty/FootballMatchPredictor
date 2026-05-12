@@ -17,6 +17,8 @@ A full-stack machine learning application that predicts football match outcomes 
 - **API**: Azure Container Apps (scale-to-zero — first request after idle takes ~5–10 sec to spin up)
 - **Model**: Stacked ensemble (XGBoost + Random Forest + Logistic Regression) — AUC 0.79 on 90-day holdout, ~56% accuracy on the 3-class match outcome
 
+![Match Predictions dashboard](docs/screenshots/football-predictor-dashboard.png)
+
 ## Highlights
 
 - **Hybrid cloud architecture** — Vercel for frontend, Azure for backend, ML, and data
