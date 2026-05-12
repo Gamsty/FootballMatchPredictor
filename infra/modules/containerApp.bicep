@@ -35,6 +35,14 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/secrets/football-api-key'
           identity: 'system'
         }
+        {
+          // Shared secret for admin endpoints (/api/admin/reload-model, /api/fixtures/refresh).
+          // Backend rejects requests without a matching X-Reload-Token header. The Key Vault
+          // secret must be created out-of-band — Bicep only references it.
+          name: 'reload-token'
+          keyVaultUrl: 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/secrets/reload-token'
+          identity: 'system'
+        }
       ]
     }
     template: {
@@ -49,6 +57,7 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FLASK_ENV', value: 'production' }
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'FOOTBALL_API_KEY', secretRef: 'football-api-key' }
+            { name: 'RELOAD_TOKEN', secretRef: 'reload-token' }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
           ]
           probes: [
