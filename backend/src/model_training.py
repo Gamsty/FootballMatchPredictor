@@ -16,7 +16,7 @@ Pipeline: match_features.csv → load/clean → Elo ratings → train/test split
 
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
@@ -1617,6 +1617,124 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
                 # Pass the exact cutoff so a follow-up production-model eval can
                 # reproduce the same holdout window (no drift from calling
                 # pd.Timestamp.now() seconds later).
+                'cutoff': cutoff,
+            }
+        finally:
+            try:
+                os.unlink(tmp_csv)
+            except OSError:
+                pass
+    finally:
+        fe.close()
+
+
+def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5):
+    """
+    Train the SAME architecture used in production (stacked ensemble: XGBoost + RandomForest
+    with a LogisticRegression meta-learner). Time-based holdout split and TimeSeriesSplit CV
+    so the validation gate in the retrain job compares apples-to-apples against the deployed
+    model — previously the gate compared a freshly-trained plain XGBoost against a production
+    stacked ensemble, which forced the AUC tolerance to be widened until the gate became a
+    no-op.
+
+    Pipeline:
+        1. Compute features for all FINISHED matches in DB (idempotent)
+        2. Export to a temp CSV, build (X, y) with leakage-safe imputation
+        3. Time-based split on `holdout_days`
+        4. Fit StandardScaler on TRAIN only, transform both
+        5. Stack XGBoost + RandomForest via 5-fold TimeSeriesSplit CV → LR meta-learner
+        6. Return model_data dict + scaled holdout for the caller's validation gate
+
+    Returns:
+        dict with the same keys as train_xgboost(): model_data, X_holdout, y_holdout,
+        holdout_size, train_size, cutoff.
+    """
+    from feature_engineering import FeatureEngineer
+
+    fe = FeatureEngineer()
+    try:
+        print("[train_production_model] Computing features for all matches in DB...")
+        fe.create_features_for_all_matches(save_to_db=True)
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp:
+            tmp_csv = tmp.name
+        try:
+            print(f"[train_production_model] Exporting features to {tmp_csv}...")
+            fe.export_features_to_csv(output_path=tmp_csv)
+
+            X, y, df, feature_names, elo_ratings = _build_xy_from_csv(
+                tmp_csv, include_odds=include_odds, binary_mode=False
+            )
+
+            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
+            cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=holdout_days)
+            train_mask = df['date'] < cutoff
+            hold_mask = df['date'] >= cutoff
+
+            X_train = X[train_mask].copy()
+            y_train = y[train_mask].copy()
+            X_hold = X[hold_mask].copy()
+            y_hold = y[hold_mask].copy()
+
+            print(f"[train_production_model] Train: {len(X_train)}, Holdout: {len(X_hold)} (last {holdout_days}d)")
+            if len(X_train) < 100:
+                raise RuntimeError(f"Training set too small ({len(X_train)} < 100)")
+
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_hold_scaled_arr = scaler.transform(X_hold) if len(X_hold) else np.empty((0, X_train.shape[1]))
+
+            # Base estimators — match compare_models() defaults so retrain produces the
+            # same architecture that ships from the CLI training pipeline.
+            xgb_est = xgb.XGBClassifier(
+                n_estimators=300, max_depth=5, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, random_state=42,
+                eval_metric='mlogloss', objective='multi:softprob',
+            )
+            rf_est = RandomForestClassifier(
+                n_estimators=300, max_depth=10, min_samples_leaf=2,
+                random_state=42, n_jobs=-1,
+            )
+
+            # TimeSeriesSplit instead of default StratifiedKFold: meta-features for the
+            # LR meta-learner are generated using ONLY past data within each fold, mirroring
+            # how the model will be used at inference time.
+            ts_cv = TimeSeriesSplit(n_splits=cv_splits)
+
+            stacking = StackingClassifier(
+                estimators=[('xgb', xgb_est), ('rf', rf_est)],
+                final_estimator=LogisticRegression(max_iter=1000, C=1.0, random_state=42),
+                cv=ts_cv,
+                stack_method='predict_proba',
+                passthrough=False,
+                n_jobs=1,  # base estimators already use n_jobs=-1 internally; nesting hangs on some CI runners
+            )
+
+            print(f"[train_production_model] Fitting stacked ensemble (CV={cv_splits} time-series folds)...")
+            start = datetime.now()
+            stacking.fit(X_train_scaled, y_train)
+            print(f"[train_production_model] Trained in {(datetime.now() - start).total_seconds():.1f}s")
+
+            model_data = {
+                'model': stacking,
+                'scaler': scaler,
+                'feature_names': feature_names,
+                'model_type': 'stacked_ensemble',
+                'elo_ratings': elo_ratings,
+                'created_at': datetime.now().isoformat(),
+            }
+
+            X_hold_scaled = (
+                pd.DataFrame(X_hold_scaled_arr, columns=feature_names)
+                if len(X_hold) else pd.DataFrame(columns=feature_names)
+            )
+
+            return {
+                'model_data': model_data,
+                'X_holdout': X_hold_scaled,
+                'y_holdout': y_hold.reset_index(drop=True),
+                'holdout_size': len(X_hold),
+                'train_size': len(X_train),
                 'cutoff': cutoff,
             }
         finally:

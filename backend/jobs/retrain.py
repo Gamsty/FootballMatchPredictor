@@ -15,7 +15,13 @@ Required env vars:
   FOOTBALL_API_KEY=...
 
 Optional:
-  AUC_TOLERANCE=0.02            How much AUC can drop before we reject the new model
+  AUC_TOLERANCE=0.02            How much AUC can drop before we reject the new model.
+                                NOTE: Was previously bumped to 0.10 in Azure to work around
+                                a stacked-ensemble (prod) vs plain XGBoost (retrain) mismatch.
+                                That's now resolved (retrain trains the same architecture),
+                                so set this back to 0.02 in the Container App Job env vars:
+                                    az containerapp job update -g $RG -n retrain-job \
+                                      --set-env-vars AUC_TOLERANCE=0.02
   HOLDOUT_DAYS=90               Time-based holdout window
   MIN_HOLDOUT_SIZE=50           Refuse to validate on tiny holdouts (cold-start safety)
   BACKEND_RELOAD_URL=...        POST URL to /api/admin/reload-model
@@ -104,9 +110,13 @@ def main() -> int:
     new_fixtures = refresh_fixtures(db)
     logger.info(f"Refreshed fixtures: {new_fixtures} new")
 
-    # 2. Train new model with time-based holdout
-    logger.info(f"Training new XGBoost model (holdout={HOLDOUT_DAYS} days)...")
-    result = model_training.train_xgboost(db, holdout_days=HOLDOUT_DAYS)
+    # 2. Train new model with time-based holdout.
+    # Uses the SAME architecture as production (stacked ensemble: XGBoost + RandomForest
+    # → LogisticRegression meta-learner). Comparing apples-to-apples lets AUC_TOLERANCE
+    # stay tight; previously we trained a plain XGBoost here and compared it against a
+    # stacked-ensemble production model, forcing the tolerance to be widened.
+    logger.info(f"Training new stacked-ensemble model (holdout={HOLDOUT_DAYS} days)...")
+    result = model_training.train_production_model(db, holdout_days=HOLDOUT_DAYS)
     new_model_data = result['model_data']
     X_hold = result['X_holdout']
     y_hold = result['y_holdout']

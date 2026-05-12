@@ -31,7 +31,6 @@ function Dashboard() {
     const [matches, setMatches] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
-    const [refreshing, setRefreshing] = useState(false);
 
     // UI state
     const [activeTab, setActiveTab] = useState('today');
@@ -69,19 +68,10 @@ function Dashboard() {
         return () => clearInterval(interval);
     }, [fetchPredictions]);
 
-    // Refresh fixtures
-    const handleRefreshFixtures = async () => {
-        setRefreshing(true);
-        try {
-            const result = await footballAPI.refreshFixtures(3); // today + tomorrow + day after
-            alert(`Fixtures refreshed! Added: ${result.added}, Updated: ${result.updated}, Skipped: ${result.skipped}`);
-            fetchPredictions();
-        } catch (err) {
-            alert('Failed to refresh fixtures: ' + (err.response?.data?.error || err.message));
-        } finally {
-            setRefreshing(false);
-        }
-    };
+    // Fixture refresh is handled exclusively by the nightly Azure Container Apps Job
+    // (backend/jobs/retrain.py). The /api/fixtures/refresh endpoint requires an admin
+    // token so it can't be triggered from this public UI — exposing it to all visitors
+    // would burn our football-data.org free-tier quota (10 req/min).
 
     // Client-side filtering: tabs + categories
     const activeCategories = filters.categories || [];
@@ -169,16 +159,6 @@ function Dashboard() {
                         {filteredMatches.length} matches
                     </p>
                 </div>
-                <button
-                    onClick={handleRefreshFixtures}
-                    disabled={refreshing}
-                    className="bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 px-3 py-1.5 rounded-lg text-xs
-                             font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed
-                             flex items-center gap-1.5 border border-gray-700/50"
-                >
-                    <span className={refreshing ? 'animate-spin' : ''}>🔄</span>
-                    {refreshing ? 'Refreshing...' : 'Refresh Fixtures'}
-                </button>
             </div>
 
             {/* Tabs */}
@@ -269,15 +249,8 @@ function Dashboard() {
                     <div className="text-4xl mb-3 opacity-50">⚽</div>
                     <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches found</h3>
                     <p className="text-gray-500 text-sm mb-4">
-                        Try adjusting your filters or refresh fixtures.
+                        Try adjusting your filters. New fixtures sync automatically every night.
                     </p>
-                    <button
-                        onClick={handleRefreshFixtures}
-                        className="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-lg
-                                 text-sm font-medium transition-colors"
-                    >
-                        Refresh Fixtures
-                    </button>
                 </div>
             )}
 
