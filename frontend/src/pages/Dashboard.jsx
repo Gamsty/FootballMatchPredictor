@@ -164,7 +164,7 @@ function Dashboard() {
             {/* Hero */}
             <section className="mb-10">
                 <div className="eyebrow mb-4">Today's slate</div>
-                <h1 className="display text-5xl sm:text-6xl font-light leading-[0.95] mb-5">
+                <h1 className="display text-[2.5rem] sm:text-5xl md:text-6xl font-light leading-[0.95] mb-5">
                     Match
                     <span className="display-italic"> predictions</span>
                     <span className="text-accent">.</span>
