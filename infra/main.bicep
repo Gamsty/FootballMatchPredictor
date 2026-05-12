@@ -94,7 +94,6 @@ module containerApp 'modules/containerApp.bicep' = {
     location: location
     environmentId: cae.outputs.environmentId
     acrLoginServer: acr.outputs.loginServer
-    acrName: acr.outputs.name
     storageAccountName: storage.outputs.name
     keyVaultName: keyVault.outputs.name
     appInsightsConnectionString: appInsights.outputs.connectionString
