@@ -178,9 +178,17 @@ def main() -> int:
             return 0
         else:
             drop = prod_auc - new_auc
-            logger.warning(f"Validation FAILED (drop={drop:.4f} > tolerance={AUC_TOLERANCE}) — keeping in candidate")
+            # Validation gate rejecting a worse model is the EXPECTED behavior of a
+            # working safe-deploy pipeline, not a job failure. Exit 0 so Azure doesn't
+            # surface this as a failed execution (which would trigger ops alerts). The
+            # candidate is preserved in `models/candidate/` for offline inspection, and
+            # the WARNING-level log makes the rejection visible in Application Insights.
+            logger.warning(
+                f"Validation REJECTED — new model dropped {drop:.4f} AUC vs production "
+                f"(tolerance={AUC_TOLERANCE}). Candidate preserved at candidate/failed_{timestamp}.pkl"
+            )
             upload_model(candidate_path, f"failed_{timestamp}.pkl", prefix="candidate")
-            return 2
+            return 0
 
 
 def _isnan(x) -> bool:

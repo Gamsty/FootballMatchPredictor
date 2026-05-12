@@ -24,11 +24,11 @@ from datetime import datetime, timezone
 import pandas as pd
 import joblib
 from dotenv import load_dotenv
+import hmac
 import io
 import logging
 import os
 import re
-import atexit
 
 from database import DatabaseManager, Match, Team, Prediction, MatchFeatures, init_db
 from feature_engineering import FeatureEngineer
@@ -62,8 +62,10 @@ ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "https://football-match-predictor-pearl.vercel.app",
 ]
+# Matches any Vercel deploy URL for this project: production alias (-pearl), per-commit
+# (-<sha>-gamstys-projects), branch previews. Stays scoped to football-match-predictor-*.
 VERCEL_PREVIEW_REGEX = re.compile(
-    r"^https://football-match-predictor-pearl-[a-z0-9-]+\.vercel\.app$"
+    r"^https://football-match-predictor-[a-z0-9-]+\.vercel\.app$"
 )
 
 CORS(app, resources={
@@ -190,10 +192,12 @@ def reload_model():
     """
     Hot-reload the ML model from blob storage without restarting the container.
     Called by the retraining job after a successful validation+promotion.
-    Auth: shared secret in X-Reload-Token header.
+    Auth: shared secret in X-Reload-Token header. Compared in constant time to
+    avoid leaking token length/prefix via response-time analysis.
     """
     expected_token = os.getenv("RELOAD_TOKEN")
-    if not expected_token or request.headers.get("X-Reload-Token") != expected_token:
+    provided_token = request.headers.get("X-Reload-Token", "")
+    if not expected_token or not hmac.compare_digest(expected_token, provided_token):
         return jsonify({"error": "Unauthorized"}), 401
     load_model()
     prediction_cache.clear()
@@ -996,75 +1000,11 @@ def not_found(error):
 def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
 
-# ============================================================================
-# SCHEDULED JOBS — Automatic daily fixture refresh
-# Runs via APScheduler at 06:00 UTC every day.
-# Fetches upcoming fixtures from football-data.org, adds new matches to the DB,
-# clears the prediction cache, and warms it with fresh predictions.
-# ============================================================================
-
-def scheduled_fixture_refresh():
-    """Auto-refresh fixtures from football-data.org (called by APScheduler)."""
-    with app.app_context():
-        try:
-            from data_collection import FootballDataCollector
-            collector = FootballDataCollector()
-            fixtures = collector.get_upcoming_fixtures(days=3)
-
-            added = 0
-            for fixture in fixtures:
-                home_team = db.session.query(Team).filter_by(
-                    api_id=fixture['home_team_api_id']
-                ).first()
-                away_team = db.session.query(Team).filter_by(
-                    api_id=fixture['away_team_api_id']
-                ).first()
-
-                if not home_team or not away_team:
-                    continue
-
-                existing = db.session.query(Match).filter_by(
-                    api_id=fixture['api_id']
-                ).first()
-
-                if existing:
-                    existing.status = fixture['status']
-                    existing.date = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00'))
-                else:
-                    db.session.add(Match(
-                        api_id=fixture['api_id'],
-                        home_team_id=home_team.id,
-                        away_team_id=away_team.id,
-                        season=fixture['season'],
-                        matchday=fixture.get('matchday'),
-                        competition=fixture['competition'],
-                        stage=fixture.get('stage', 'REGULAR_SEASON'),
-                        date=datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')),
-                        status=fixture['status'],
-                    ))
-                    added += 1
-
-            db.session.commit()
-            prediction_cache.clear()
-            warm_cache()
-            print(f"[Scheduler] Fixtures refreshed: {added} new matches added")
-        except Exception as e:
-            print(f"[Scheduler] Fixture refresh failed: {e}")
-
-
-# Scheduler: opt-in via ENABLE_SCHEDULER=true.
-# In Azure the retrain Container Apps Job handles scheduled work (Fase 10), so the
-# backend container does NOT run a scheduler. Setting this in every gunicorn worker
-# (which is what the old guard did) created N parallel schedulers and OOM'd local Docker.
-# Locally: also off by default; turn on with ENABLE_SCHEDULER=true if you want cron-in-app.
-if os.environ.get('ENABLE_SCHEDULER', 'false').lower() == 'true':
-    from apscheduler.schedulers.background import BackgroundScheduler
-
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=scheduled_fixture_refresh, trigger='cron', hour=6, minute=0, id='daily_fixture_refresh')
-    scheduler.start()
-    logger.info("Daily fixture refresh scheduled for 06:00 UTC")
-    atexit.register(lambda: scheduler.shutdown())
+# Scheduled fixture refresh and nightly retraining are handled by the Azure
+# Container Apps Job defined in backend/jobs/retrain.py — not by an in-process
+# scheduler. The backend container is stateless and scale-to-zero, so a per-process
+# cron would either run N times (one per gunicorn worker) or not at all (when scaled
+# down). The job runs once nightly at 03:00 UTC regardless of replica state.
 
 # ============================================================================
 # RUN APP

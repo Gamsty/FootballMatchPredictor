@@ -4,6 +4,7 @@ Gunicorn configuration for production
 
 import os
 
+# Bind to PORT env var (Azure Container Apps sets it via targetPort), default 5000
 bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
 
 # Worker count: respect WEB_CONCURRENCY (Heroku/Render/Azure standard).
