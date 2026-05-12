@@ -47,7 +47,7 @@ $AI_NAME = "ai-fotballpred-prod"
 $DBADMIN = "fotballadmin"
 $DBPASS = "<GENERER-STERK-PASSORD>"   # f.eks. fra 1Password
 $EMAIL = "gamsten502@gmail.com"
-$REPO = "adriakg/FootballMatchPredictor"  # juster
+$REPO = "Gamsty/FootballMatchPredictor"   # juster til ditt GitHub repo
 $SUB_ID = az account show --query id -o tsv
 ```
 
@@ -115,7 +115,29 @@ az deployment group create `
 
 **Første deploy feiler** — Container App-ressursen prøver å pulle `fotballpred-backend:latest` fra ACR som ikke finnes ennå. Det er forventet. Fortsett til steg 5 for å bygge imaget, så kjør Bicep-deploy på nytt.
 
-> **Alternativ:** Hvis du vil gjøre stegene manuelt for å lære dem (uten Bicep), følg fasene 2–5 i `azure-implementation-guide.md`. Bicep-veien anbefales — den lar deg slette og bygge opp igjen alt med én kommando.
+---
+
+## 4.1 Manuell RBAC for Container Apps (én gang per miljø)
+
+Bicep-templaten har **ikke** med rolle-tildelingene for Container App-ens system-assigned
+managed identity, fordi den deploying-identiteten (UAMI for GitHub OIDC) bare har
+`Contributor`, ikke `Microsoft.Authorization/roleAssignments/write`. Disse må gis manuelt
+av en bruker med Owner på resource-gruppen:
+
+```powershell
+$CA_OID = az containerapp show -g $RG -n $CA --query identity.principalId -o tsv
+$ACR_ID = az acr show --name $ACR --query id -o tsv
+$ST_ID  = az storage account show --name $ST --resource-group $RG --query id -o tsv
+$KV_ID  = az keyvault show --name $KV --query id -o tsv
+
+az role assignment create --assignee $CA_OID --role "AcrPull"                  --scope $ACR_ID
+az role assignment create --assignee $CA_OID --role "Storage Blob Data Reader" --scope $ST_ID
+az role assignment create --assignee $CA_OID --role "Key Vault Secrets User"   --scope $KV_ID
+```
+
+Uten dette steget vil Container App ikke kunne pulle imaget, lese modeller fra Blob,
+eller hente secrets fra Key Vault. RBAC kan ta opptil 5 min å propagere — restart
+revisjonen om backend fortsatt feiler etter rolle-tildeling.
 
 ---
 
@@ -220,31 +242,53 @@ az containerapp revision restart --name $CA --resource-group $RG --revision (az 
 
 ## 10. CI/CD med GitHub Actions (Fase 7)
 
-### 10.1 OIDC service principal
+### 10.1 OIDC via User-Assigned Managed Identity (UAMI)
+
+På UiO-tenant er `az ad sp create-for-rbac` ofte blokkert for studentkontoer. Vi bruker en
+UAMI istedenfor en service principal — federated credentials kobler GitHub OIDC-token til UAMI.
 
 ```powershell
-$APP_NAME = "github-actions-fotballpred"
-$SP = az ad sp create-for-rbac --name $APP_NAME --role contributor `
-  --scopes "/subscriptions/$SUB_ID/resourceGroups/$RG" `
-  --json-auth | ConvertFrom-Json
+$UAMI = "uami-github-fotballpred"
 
-$APP_ID = $SP.clientId
-$TENANT_ID = $SP.tenantId
-$APP_OBJECT_ID = az ad app show --id $APP_ID --query id -o tsv
+# Opprett UAMI
+az identity create --name $UAMI --resource-group $RG --location $LOC
+$APP_ID = az identity show --name $UAMI --resource-group $RG --query clientId -o tsv
+$UAMI_OID = az identity show --name $UAMI --resource-group $RG --query principalId -o tsv
+$TENANT_ID = az account show --query tenantId -o tsv
 
-$fedCred = @{
-  name = "github-main"
-  issuer = "https://token.actions.githubusercontent.com"
-  subject = "repo:${REPO}:ref:refs/heads/main"
-  audiences = @("api://AzureADTokenExchange")
-} | ConvertTo-Json
-$fedCred | Out-File -Encoding utf8 fedcred.json
-az ad app federated-credential create --id $APP_OBJECT_ID --parameters "@fedcred.json"
-Remove-Item fedcred.json
+# Federated credential for push til main
+az identity federated-credential create `
+  --name github-main `
+  --identity-name $UAMI `
+  --resource-group $RG `
+  --issuer "https://token.actions.githubusercontent.com" `
+  --subject "repo:${REPO}:ref:refs/heads/main" `
+  --audiences "api://AzureADTokenExchange"
 
-# AcrPush rolle for å kunne pushe images
+# Federated credential for pull requests
+az identity federated-credential create `
+  --name github-pull-request `
+  --identity-name $UAMI `
+  --resource-group $RG `
+  --issuer "https://token.actions.githubusercontent.com" `
+  --subject "repo:${REPO}:pull_request" `
+  --audiences "api://AzureADTokenExchange"
+
+# Federated credential for environment:production
+# Kreves fordi infra.yml-jobben bruker `environment: production` for godkjenningskrav.
+# GitHub setter da OIDC-tokenets `sub` til `...:environment:production`, ikke `...:ref:refs/heads/main`.
+az identity federated-credential create `
+  --name github-env-production `
+  --identity-name $UAMI `
+  --resource-group $RG `
+  --issuer "https://token.actions.githubusercontent.com" `
+  --subject "repo:${REPO}:environment:production" `
+  --audiences "api://AzureADTokenExchange"
+
+# Roller: Contributor for å kunne kjøre Bicep + push images
 $ACR_ID = az acr show --name $ACR --query id -o tsv
-az role assignment create --assignee $APP_ID --role "AcrPush" --scope $ACR_ID
+az role assignment create --assignee $UAMI_OID --role "Contributor" --scope "/subscriptions/$SUB_ID/resourceGroups/$RG"
+az role assignment create --assignee $UAMI_OID --role "AcrPush" --scope $ACR_ID
 
 Write-Host "AZURE_CLIENT_ID: $APP_ID"
 Write-Host "AZURE_TENANT_ID: $TENANT_ID"
@@ -286,19 +330,20 @@ Merg en PR til `main` → workflow `Backend CI/CD` skal kjøre og deploye automa
 az acr build --registry $ACR --image fotballpred-retrain:v1 --image fotballpred-retrain:latest --file backend/jobs/Dockerfile .
 ```
 
-### 11.2 Generer reload-token
+### 11.2 Generer reload-token i Key Vault (én gang per miljø)
+
+Backend bruker `RELOAD_TOKEN`-env-varen som delt secret for admin-endepunktene
+(`/api/admin/reload-model` og `/api/fixtures/refresh`). Bicep refererer denne fra Key Vault,
+så du må sette verdien manuelt før første deploy.
 
 ```powershell
 $RELOAD_TOKEN = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_})
 az keyvault secret set --vault-name $KV --name "reload-token" --value $RELOAD_TOKEN
-
-# Sett på Container App også
-$RELOAD_URI = az keyvault secret show --vault-name $KV --name "reload-token" --query id -o tsv
-az containerapp secret set --name $CA --resource-group $RG `
-  --secrets "reload-token=keyvaultref:$RELOAD_URI,identityref:system"
-az containerapp update --name $CA --resource-group $RG `
-  --set-env-vars "RELOAD_TOKEN=secretref:reload-token"
+Write-Host "Reload token: $RELOAD_TOKEN  (lagre denne — brukes av retrain-jobben for å hot-reload backend)"
 ```
+
+Container App-templaten i `infra/modules/containerApp.bicep` plukker den opp automatisk —
+ingen `az containerapp secret set` eller `--set-env-vars` nødvendig.
 
 ### 11.3 Hent KV-secret URIs for jobben
 
@@ -361,7 +406,11 @@ az containerapp job start --name $JOB --resource-group $RG
 az containerapp job execution list --name $JOB --resource-group $RG -o table
 ```
 
-> ⚠️ `backend/src/model_training.py` må eksponere `train_xgboost(db)` som returnerer `model_data`-dict-en med samme shape som `best_model.pkl`. Hvis ikke kommer jobben til å feile med "model_training.py does not expose train_xgboost(db)". Refaktor i så fall.
+> ⚠️ `backend/src/model_training.py` må eksponere `train_production_model(db, holdout_days=...)`
+> som returnerer en dict med nøklene `model_data`, `X_holdout`, `y_holdout`, `holdout_size`,
+> `train_size`, `cutoff`. Denne funksjonen trener samme arkitektur som produksjon
+> (stacked ensemble: XGBoost + RandomForest → LR meta-learner med TimeSeriesSplit CV),
+> slik at validation-gaten sammenligner like modeller.
 
 ---
 
@@ -427,11 +476,13 @@ az group create --name $RG --location $LOC
 az deployment group create --resource-group $RG --template-file infra/main.bicep --parameters infra/main.parameters.prod.json --parameters postgresAdminPassword=$DBPASS footballApiKey="<key>"
 ```
 
-Du må gjenta:
-- Steg 5 (bygg backend-image)
-- Steg 6 (re-restore database)
-- Steg 7 (last opp modeller)
-- Steg 11 (gjenskape job-en)
+Du må gjenta de manuelle stegene som Bicep ikke dekker:
+- Steg 4.1 (RBAC for Container Apps managed identity — krever Owner)
+- Steg 5 (bygg backend-image, eller la GitHub Actions gjøre det)
+- Steg 6 (re-restore database fra dump)
+- Steg 7 (last opp modeller til Blob)
+- Steg 11.2 (sett `reload-token` i Key Vault hvis det ikke finnes fra før)
+- Steg 11.4 (gjenskape Container Apps Job — ikke i Bicep-modulene ennå)
 
 Det er en god kandidat for et `scripts/bootstrap.ps1`-script som dokumenterer disse manuelle trinnene.
 
@@ -444,6 +495,7 @@ Det er en god kandidat for et `scripts/bootstrap.ps1`-script som dokumenterer di
 | Container App svarer ikke (502) | `az containerapp logs show --name $CA --resource-group $RG --follow` |
 | `DefaultAzureCredential` feiler i container | Verifiser `--system-assigned`, og at managed identity har RBAC på Storage/KV |
 | KV secret-referanse feiler | RBAC kan ta opptil 5 min å propagere — vent og restart revision |
-| Postgres connection refused | Sjekk firewall (`az postgres flexible-server firewall-rule list ...`), at du bruker port 6432 fra app, 5432 for admin-tasks |
-| `pgbouncer.enabled` ble ignorert | Krever restart av Flexible Server: `az postgres flexible-server restart ...` |
-| GitHub Actions OIDC feiler | Federated credential `subject` må matche eksakt: `repo:owner/repo:ref:refs/heads/main` |
+| Postgres connection refused | Sjekk firewall (`az postgres flexible-server firewall-rule list ...`). Burstable B1ms støtter ikke pgBouncer, så porten er alltid 5432. |
+| Bicep what-if/deploy gir `ServerStoppedError` | Postgres må kjøre under deploy. `az postgres flexible-server start -g $RG -n $PSQL` og vent på `Ready` |
+| Bicep feiler med `Authorization failed ... roleAssignments/write` | RBAC-tildelingene gjøres manuelt — se steg 4.1 nedenfor |
+| GitHub Actions OIDC feiler med `AADSTS700213: No matching federated identity` | Subject må matche eksakt. Sjekk om jobben bruker `environment:` — da må subjectet være `repo:owner/repo:environment:<env-name>`, ikke `:ref:refs/heads/main` |

@@ -1,11 +1,11 @@
 # Football Match Predictor
 
-A full-stack machine learning application that predicts football match outcomes across multiple betting markets. Uses XGBoost classification trained on 9 European leagues with 40,000+ historical matches.
+A full-stack machine learning application that predicts football match outcomes across multiple betting markets. Production model is a stacked ensemble (XGBoost + RandomForest with a logistic-regression meta-learner) trained on 9 European leagues with 40,000+ historical matches.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Flask](https://img.shields.io/badge/Flask-3.1-green)
 ![React](https://img.shields.io/badge/React-19-blue)
-![ML](https://img.shields.io/badge/ML-XGBoost-orange)
+![ML](https://img.shields.io/badge/ML-XGBoost%20%2B%20RandomForest%20stacked-orange)
 ![Azure](https://img.shields.io/badge/Backend-Azure%20Container%20Apps-0078D4?logo=microsoftazure)
 ![Vercel](https://img.shields.io/badge/Frontend-Vercel-black?logo=vercel)
 ![IaC](https://img.shields.io/badge/IaC-Bicep-blue)
@@ -23,8 +23,10 @@ A full-stack machine learning application that predicts football match outcomes 
 - **Container Apps with managed identity** — zero-trust auth to Storage, Key Vault, ACR (no secrets in env vars)
 - **Infrastructure as Code** — full Bicep, `az deployment group create` rebuilds the entire stack
 - **CI/CD via GitHub Actions + OIDC** — no long-lived credentials in GitHub
-- **MLOps with validation gates** — nightly retraining job; new model must hold AUC within 0.02 of production before promotion
+- **MLOps with validation gates** — nightly retraining job trains the same stacked-ensemble architecture as production; new model must hold AUC within 0.02 of the deployed model before promotion
+- **Leakage-safe training** — chronological train/test split, TimeSeriesSplit CV for stacking meta-features, constant rest-day imputation, Elo computed only from past matches
 - **Model audit trail** — rejected candidates preserved in `models/candidate/` with timestamps; promoted models versioned as `best_model_YYYYMMDDTHHMMSS.pkl` with manifest (`latest.json`) recording AUC before/after, holdout size, and training set size
+- **Defensive API surface** — admin endpoints (model reload, fixture refresh) gated by constant-time token check; sanitized error responses (no stack traces or SQL fragments leak to clients); request body capped at 256 KB; query params clamped
 - **Observability** — Application Insights with structured logs and custom metrics
 
 ## Features
@@ -34,7 +36,7 @@ A full-stack machine learning application that predicts football match outcomes 
 - **Smart bet recommendations** — "Best Bet" (highest edge) and "Safest Bet" (highest probability) with reasoning
 - **Accumulator builder** — Select bets across matches, calculates combined odds and potential returns
 - **Match tagging** — High Confidence, Upset Pick, Banker classifications
-- **Nightly retrain + auto-refresh** — Container Apps Job runs at 03:00 UTC: pulls fresh fixtures, retrains XGBoost, validates AUC against production, promotes or rejects
+- **Nightly retrain + auto-refresh** — Container Apps Job runs at 03:00 UTC: pulls fresh fixtures, retrains the stacked ensemble with TimeSeriesSplit CV, validates AUC against production on a time-based holdout, promotes or rejects
 - **9 leagues** — Premier League, Championship, La Liga, Bundesliga, Serie A, Ligue 1, Eredivisie, Primeira Liga, Champions League
 
 ## Architecture
@@ -173,13 +175,18 @@ python src/model_training.py       # train models (optional — pre-trained .pkl
 | GET | `/api/matches` | List matches (filter by season, team, status) |
 | GET | `/api/matches/:id` | Match details with features |
 | GET | `/api/matches/upcoming` | Raw upcoming matches |
-| POST | `/api/fixtures/refresh` | Fetch new fixtures from API |
 
 ### Statistics
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/statistics/overview` | League-wide match and goal stats |
 | GET | `/api/statistics/head-to-head` | H2H record between two teams |
+
+### Admin (require `X-Reload-Token` header)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/admin/reload-model` | Hot-reload the model from Blob without restarting the container — called by the retrain job after a successful promotion |
+| POST | `/api/fixtures/refresh` | Sync upcoming fixtures from football-data.org into the DB. Auth-gated because the endpoint burns external-API quota and clears the prediction cache |
 
 ## Features Used by ML Model
 
@@ -208,7 +215,7 @@ FootballMatchPredictor/
 │   │   ├── data_collection.py      # football-data.org API client
 │   │   ├── feature_engineering.py  # Feature computation pipeline
 │   │   ├── prediction_service.py   # Multi-market prediction engine
-│   │   ├── cache.py                # LRU prediction cache (6h TTL)
+│   │   ├── cache.py                # In-memory TTL prediction cache (2h)
 │   │   ├── load_data.py            # CSV → database loader
 │   │   ├── load_external_csv.py    # External league data loader
 │   │   ├── model_training.py       # Model training & evaluation
@@ -224,7 +231,7 @@ FootballMatchPredictor/
 │   ├── Dockerfile                  # Multi-stage build (used for parity, prod is Vercel)
 │   ├── nginx.conf
 │   ├── src/
-│   │   ├── components/             # MatchCard, MatchDetail, FilterBar, etc.
+│   │   ├── components/             # MatchCard, MatchDetail, FilterBar, AboutModel, etc.
 │   │   ├── pages/Dashboard.jsx
 │   │   ├── services/api.js         # Axios client (uses VITE_API_URL)
 │   │   ├── utils/constants.js
@@ -238,7 +245,7 @@ FootballMatchPredictor/
 │   └── modules/
 │       ├── acr.bicep
 │       ├── appInsights.bicep
-│       ├── containerApp.bicep      # Includes RBAC role assignments
+│       ├── containerApp.bicep      # CA + Key Vault secret refs (RBAC granted out-of-band)
 │       ├── containerAppsEnv.bicep
 │       ├── keyVault.bicep
 │       ├── logAnalytics.bicep
@@ -277,24 +284,32 @@ See [docs/azure-runbook.md](docs/azure-runbook.md) for the complete step-by-step
 
 Short version:
 ```powershell
-# 1. Provision everything
+# 1. Provision everything (also seeds Key Vault secrets)
 az deployment group create `
   --resource-group rg-fotballpred-prod `
   --template-file infra/main.bicep `
   --parameters infra/main.parameters.prod.json `
   --parameters postgresAdminPassword=<...> footballApiKey=<...>
 
-# 2. Build + push backend image
+# 2. Grant the Container App's system-assigned identity the three runtime roles.
+#    Bicep can't create role assignments without 'Role Based Access Control Admin'
+#    on the deploying identity, so it's a one-time manual step.
+$CA_OID = az containerapp show -g rg-fotballpred-prod -n ca-fotballpred-prod --query identity.principalId -o tsv
+az role assignment create --assignee $CA_OID --role "AcrPull"                  --scope <ACR_ID>
+az role assignment create --assignee $CA_OID --role "Storage Blob Data Reader" --scope <SA_ID>
+az role assignment create --assignee $CA_OID --role "Key Vault Secrets User"   --scope <KV_ID>
+
+# 3. Build + push backend image (or let GitHub Actions do it)
 docker build -t fotballpred-backend:v1 ./backend
 az acr login --name acrfotballpredprod
 docker tag fotballpred-backend:v1 acrfotballpredprod.azurecr.io/fotballpred-backend:latest
 docker push acrfotballpredprod.azurecr.io/fotballpred-backend:latest
 
-# 3. Migrate DB + upload models (one-time)
+# 4. Migrate DB + upload models (one-time)
 pg_restore ...
 az storage blob upload ...
 
-# 4. Vercel: set VITE_API_URL=https://<container-app-fqdn>/api, redeploy
+# 5. Vercel: set VITE_API_URL=https://<container-app-fqdn>/api, redeploy
 ```
 
 ### Continuous deployment

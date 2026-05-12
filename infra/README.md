@@ -49,7 +49,12 @@ az group create --name $RG --location swedencentral
 az deployment group create --resource-group $RG --template-file infra/main.bicep --parameters infra/main.parameters.prod.json --parameters postgresAdminPassword='<...>' footballApiKey='<...>'
 ```
 
-NB: Du må re-laste opp modeller til blob etter slett — kjør `scripts/upload-models.ps1` (se runbook).
+NB-er for fersk deploy:
+- Modeller må re-lastes opp til Blob etter slett (`scripts/upload-models.ps1`, se runbook)
+- `reload-token`-secret må settes manuelt i Key Vault før første Bicep-deploy (Bicep refererer den, men oppretter den ikke)
+- Container App-ens system-assigned managed identity må gis `AcrPull`, `Storage Blob Data Reader`,
+  og `Key Vault Secrets User` manuelt — Bicep kan ikke opprette role assignments med kun
+  Contributor-rettigheter (se `azure-runbook.md` steg 4.1)
 
 ## Outputs
 
