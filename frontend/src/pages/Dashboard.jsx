@@ -24,7 +24,7 @@ import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
-    calculateAccumulator, isTomorrow
+    calculateAccumulator
 } from '../utils/constants';
 
 function Dashboard() {
@@ -45,13 +45,13 @@ function Dashboard() {
     const [accumulator, setAccumulator] = useState([]);
     const [stake, setStake] = useState(100);
 
-    // Fetch all matches for the next 3 days on mount and tab change
+    // Fetch all matches for the next 3 days. Tab filtering happens client-side
+    // (see filteredMatches below), so the fetch itself doesn't depend on activeTab.
     const fetchPredictions = useCallback(async () => {
         setLoading(true);
         setError(null);
         try {
             const params = { days: 3, sort_by: 'date' };
-
             const data = await footballAPI.getUpcomingPredictions(params);
             setMatches(data.matches || []);
         } catch (err) {
@@ -60,7 +60,7 @@ function Dashboard() {
         } finally {
             setLoading(false);
         }
-    }, [activeTab]);
+    }, []);
 
     useEffect(() => { fetchPredictions(); }, [fetchPredictions]);
 
@@ -132,54 +132,61 @@ function Dashboard() {
         return a.localeCompare(b);
     });
 
-    // Accumulator helpers
-    const accMatchIds = new Set(accumulator.map(s => s.matchId));
+    // Accumulator helpers — one bet per match, but the user picks which one
+    // by clicking the + next to either Best or Safest. Clicking the currently
+    // selected bet removes it; clicking a different bet swaps it.
+    const accumulatorBetByMatchId = Object.fromEntries(
+        accumulator.map(s => [s.matchId, s.label])
+    );
 
     const toggleAccumulator = (match, bet) => {
-        if (accMatchIds.has(match.id)) {
+        const current = accumulatorBetByMatchId[match.id];
+        if (current === bet.label) {
             setAccumulator(prev => prev.filter(s => s.matchId !== match.id));
         } else {
-            setAccumulator(prev => [...prev, {
-                matchId: match.id,
-                homeTeam: match.home_team.short_name || match.home_team.name,
-                awayTeam: match.away_team.short_name || match.away_team.name,
-                label: bet.label,
-                prob: bet.prob,
-            }]);
+            setAccumulator(prev => [
+                ...prev.filter(s => s.matchId !== match.id),
+                {
+                    matchId: match.id,
+                    homeTeam: match.home_team.short_name || match.home_team.name,
+                    awayTeam: match.away_team.short_name || match.away_team.name,
+                    label: bet.label,
+                    prob: bet.prob,
+                },
+            ]);
         }
     };
 
     const accResult = calculateAccumulator(accumulator, stake);
 
     return (
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="max-w-6xl mx-auto px-6 lg:px-10 py-10 sm:py-14">
             {/* Hero */}
-            <div className="mb-6">
-                <div className="flex items-start justify-between gap-4">
-                    <div className="flex-1 min-w-0">
-                        <h1 className="text-2xl sm:text-3xl font-bold text-gray-100">Match Predictions</h1>
-                        <p className="text-gray-400 text-sm mt-1.5 max-w-2xl leading-relaxed">
-                            Powered by a <span className="text-gray-200">stacked-ensemble</span> model
-                            (XGBoost + RandomForest) trained on{' '}
-                            <span className="text-gray-200">40,000+ historical matches</span> across 9
-                            leagues. Retrained nightly on Azure with AUC validation against production.
-                        </p>
-                        <div className="flex items-center gap-3 mt-3 text-xs text-gray-500">
-                            <span>{filteredMatches.length} matches shown</span>
-                            <span className="text-gray-700">·</span>
-                            <button
-                                onClick={() => setShowAbout(true)}
-                                className="text-blue-400 hover:text-blue-300 transition-colors inline-flex items-center gap-1"
-                            >
-                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
-                                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
-                                </svg>
-                                How it works
-                            </button>
-                        </div>
-                    </div>
+            <section className="mb-10">
+                <div className="eyebrow mb-4">Today's slate</div>
+                <h1 className="display text-5xl sm:text-6xl font-light leading-[0.95] mb-5">
+                    Match
+                    <span className="display-italic"> predictions</span>
+                    <span className="text-accent">.</span>
+                </h1>
+                <p className="text-ink-soft text-base sm:text-lg max-w-2xl leading-relaxed font-light">
+                    Powered by a <span className="text-ink font-medium">stacked-ensemble</span> model
+                    (XGBoost + RandomForest) trained on{' '}
+                    <span className="text-ink font-medium">40,000+ historical matches</span> across nine
+                    leagues. Retrained nightly on Azure with AUC validation against production.
+                </p>
+                <div className="flex items-center gap-3 mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
+                    <span>{filteredMatches.length} shown</span>
+                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                    <button
+                        onClick={() => setShowAbout(true)}
+                        className="text-accent hover:text-accent-soft transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                        <span className="border-b border-accent/40 hover:border-accent-soft">How it works</span>
+                        <span aria-hidden="true">→</span>
+                    </button>
                 </div>
-            </div>
+            </section>
 
             {/* Tabs */}
             <CategoryTabs activeTab={activeTab} onTabChange={setActiveTab} matchCounts={matchCounts} />
@@ -189,58 +196,62 @@ function Dashboard() {
 
             {/* Accumulator Bar */}
             {accumulator.length > 0 && (
-                <div className="bg-gray-800/60 border border-gray-700/40 rounded-xl p-4 mb-6">
-                    <div className="flex items-center justify-between mb-3">
-                        <h3 className="text-sm font-semibold text-gray-200">
-                            Accumulator ({accumulator.length} selections)
-                        </h3>
+                <div className="bg-paper-tint border-l-2 border-accent p-5 mb-8">
+                    <div className="flex items-center justify-between mb-4">
+                        <div>
+                            <div className="eyebrow">Accumulator</div>
+                            <div className="display text-base text-ink mt-1">
+                                {accumulator.length} {accumulator.length === 1 ? 'selection' : 'selections'} stacked.
+                            </div>
+                        </div>
                         <button
                             onClick={() => setAccumulator([])}
-                            className="text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+                            className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted hover:text-accent transition-colors cursor-pointer"
                         >
-                            Clear All
+                            Clear all
                         </button>
                     </div>
 
                     {/* Selections */}
-                    <div className="space-y-1.5 mb-3">
+                    <div className="space-y-1.5 mb-4">
                         {accumulator.map(sel => (
-                            <div key={sel.matchId} className="flex items-center justify-between py-1.5 px-3 rounded-lg bg-gray-900/50">
-                                <div className="flex items-center gap-2">
+                            <div key={sel.matchId} className="flex items-center justify-between py-2 px-3 bg-paper border border-line">
+                                <div className="flex items-center gap-3">
                                     <button
                                         onClick={() => setAccumulator(prev => prev.filter(s => s.matchId !== sel.matchId))}
-                                        className="text-gray-600 hover:text-red-400 text-xs transition-colors"
-                                    >&times;</button>
-                                    <span className="text-xs text-gray-400">{sel.homeTeam} vs {sel.awayTeam}</span>
+                                        className="text-ink-muted hover:text-accent text-base leading-none transition-colors cursor-pointer"
+                                        aria-label="Remove selection"
+                                    >×</button>
+                                    <span className="text-sm text-ink-soft">{sel.homeTeam} <span className="text-ink-muted">vs</span> {sel.awayTeam}</span>
                                 </div>
-                                <div className="flex items-center gap-2">
-                                    <span className="text-xs text-blue-300 font-medium">{sel.label}</span>
-                                    <span className="text-[10px] text-gray-600">@ {formatOdds(sel.prob)}</span>
+                                <div className="flex items-center gap-3">
+                                    <span className="text-sm text-ink font-medium">{sel.label}</span>
+                                    <span className="mono text-xs text-ink-muted">@ {formatOdds(sel.prob)}</span>
                                 </div>
                             </div>
                         ))}
                     </div>
 
                     {/* Stake + Returns */}
-                    <div className="flex items-center gap-3 pt-3 border-t border-gray-700/30">
-                        <div className="flex items-center gap-1.5">
-                            <span className="text-xs text-gray-500">Stake:</span>
+                    <div className="flex items-center gap-3 pt-4 border-t border-line">
+                        <div className="flex items-center gap-2">
+                            <span className="eyebrow">Stake</span>
                             <input
                                 type="number"
                                 value={stake}
                                 onChange={(e) => setStake(Math.max(0, Number(e.target.value)))}
-                                className="w-20 bg-gray-900 border border-gray-700/50 rounded px-2 py-1 text-xs text-gray-200 focus:outline-none focus:border-blue-500/50"
+                                className="w-24 bg-paper border border-line px-2 py-1 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                             />
-                            <span className="text-xs text-gray-600">NOK</span>
+                            <span className="mono text-xs text-ink-muted">NOK</span>
                         </div>
                         <div className="flex-1" />
                         <div className="text-right">
-                            <div className="text-[10px] text-gray-500">
-                                Combined odds: <span className="text-gray-400 font-mono">{accResult.totalOdds}</span>
+                            <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
+                                Combined odds: <span className="text-ink">{accResult.totalOdds}</span>
                             </div>
-                            <div className="text-sm font-bold text-emerald-400">
-                                Return: {accResult.potentialReturn.toLocaleString()} NOK
-                                <span className="text-xs text-emerald-500/60 ml-1">(+{accResult.profit.toLocaleString()})</span>
+                            <div className="display text-lg text-accent mt-0.5">
+                                {accResult.potentialReturn.toLocaleString()} NOK
+                                <span className="mono text-xs text-accent-soft ml-2">+{accResult.profit.toLocaleString()}</span>
                             </div>
                         </div>
                     </div>
@@ -249,79 +260,89 @@ function Dashboard() {
 
             {/* Content */}
             {loading && (
-                <div className="text-center py-16">
-                    <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-500 mx-auto mb-4" />
-                    <p className="text-gray-500 text-sm">Loading predictions...</p>
+                <div className="text-center py-20">
+                    <div className="inline-block w-3 h-3 bg-accent animate-pulse-soft rounded-full mb-4" />
+                    <p className="mono text-[0.7rem] uppercase tracking-[0.15em] text-ink-muted">Fetching matches</p>
                 </div>
             )}
 
             {error && (
-                <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-6 text-center">
-                    <p className="text-red-400 text-sm">{error}</p>
-                    <button onClick={fetchPredictions} className="mt-3 text-xs text-red-300 hover:text-red-200 underline">
-                        Try again
+                <div className="bg-paper-tint border-l-2 border-danger p-6">
+                    <div className="eyebrow text-danger mb-1">Connection error</div>
+                    <p className="text-ink-soft">{error}</p>
+                    <button
+                        onClick={fetchPredictions}
+                        className="mt-3 mono text-[0.7rem] uppercase tracking-[0.12em] text-accent hover:text-accent-soft border-b border-accent/40 transition-colors cursor-pointer"
+                    >
+                        Try again →
                     </button>
                 </div>
             )}
 
             {!loading && !error && filteredMatches.length === 0 && (
-                <div className="text-center py-16">
-                    <div className="text-4xl mb-3 opacity-50">⚽</div>
+                <div className="text-center py-20 max-w-md mx-auto">
                     {activeCategories.length > 0 ? (
                         <>
-                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches match your filters</h3>
-                            <p className="text-gray-500 text-sm mb-4">
+                            <div className="eyebrow mb-3">Empty</div>
+                            <h3 className="display text-2xl text-ink mb-3">No matches match your filters.</h3>
+                            <p className="text-ink-soft text-sm">
                                 Try removing a category filter, or switch tabs to see more matches.
                             </p>
                         </>
                     ) : activeTab === 'today' && matchCounts.upcoming > 0 ? (
                         <>
-                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches scheduled for today</h3>
+                            <div className="eyebrow mb-3">Quiet day</div>
+                            <h3 className="display text-2xl text-ink mb-4">
+                                No matches scheduled for today<span className="text-accent">.</span>
+                            </h3>
                             <button
                                 onClick={() => setActiveTab('upcoming')}
-                                className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors inline-flex items-center gap-1"
+                                className="mono text-[0.7rem] uppercase tracking-[0.12em] text-accent hover:text-accent-soft border-b border-accent/40 transition-colors cursor-pointer"
                             >
-                                See {matchCounts.upcoming} upcoming match{matchCounts.upcoming === 1 ? '' : 'es'}
-                                <span aria-hidden="true">→</span>
+                                See {matchCounts.upcoming} upcoming match{matchCounts.upcoming === 1 ? '' : 'es'} →
                             </button>
                         </>
                     ) : activeTab === 'today' ? (
                         <>
-                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches scheduled for today</h3>
-                            <p className="text-gray-500 text-sm mb-4">
-                                New fixtures sync automatically every night.
-                            </p>
+                            <div className="eyebrow mb-3">Quiet day</div>
+                            <h3 className="display text-2xl text-ink mb-3">
+                                No matches scheduled for today<span className="text-accent">.</span>
+                            </h3>
+                            <p className="text-ink-soft text-sm">New fixtures sync automatically every night.</p>
                         </>
                     ) : (
                         <>
-                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No upcoming matches</h3>
-                            <p className="text-gray-500 text-sm mb-4">
-                                New fixtures sync automatically every night.
-                            </p>
+                            <div className="eyebrow mb-3">Empty</div>
+                            <h3 className="display text-2xl text-ink mb-3">
+                                No upcoming matches<span className="text-accent">.</span>
+                            </h3>
+                            <p className="text-ink-soft text-sm">New fixtures sync automatically every night.</p>
                         </>
                     )}
                 </div>
             )}
 
             {!loading && !error && filteredMatches.length > 0 && (
-                <div className="space-y-7">
+                <div className="space-y-10">
                     {sortedLeagues.map(league => ({ league, leagueMatches: groupedMatches[league] })).map(({ league, leagueMatches }) => (
                         <div key={league}>
-                            <div className="flex items-center gap-3 mb-3">
-                                <h2 className="text-sm font-semibold text-gray-300">
+                            <div className="flex items-baseline gap-3 mb-4 pb-2 border-b border-line">
+                                <h2 className="display text-xl text-ink">
                                     {COMPETITION_LABELS[league] || league}
                                 </h2>
-                                <span className="text-xs text-gray-600">{leagueMatches.length}</span>
-                                <div className="flex-1 border-t border-gray-800" />
+                                <span className="mono text-xs text-ink-muted">{leagueMatches.length}</span>
                             </div>
 
-                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                            <div
+                                className="grid gap-4"
+                                style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 360px))' }}
+                            >
                                 {leagueMatches.map(match => (
                                     <MatchCard
                                         key={match.id}
                                         match={match}
                                         onClick={setSelectedMatch}
-                                        isSelected={accMatchIds.has(match.id)}
+                                        selectedBet={accumulatorBetByMatchId[match.id]}
                                         onToggleAccumulator={toggleAccumulator}
                                     />
                                 ))}

@@ -1,7 +1,9 @@
 /*
-Filter Bar Component
+Filter bar — small caps mono chips
 
-Category tag filters (multi-select): High Confidence, Upset Pick, Banker, Top League.
+Tight uppercase tags rather than candy pill buttons. Active state inverts to ink-on-paper
+with a thin border. Mirrors how a sports section flags article tags ("Premier League",
+"Match of the day") inline.
 */
 
 import { TAG_CONFIG } from '../utils/constants';
@@ -16,18 +18,19 @@ function FilterBar({ filters, onFilterChange }) {
     };
 
     return (
-        <div className="flex gap-1.5 flex-wrap mb-6">
+        <div className="flex gap-2 flex-wrap mb-8">
             {Object.entries(TAG_CONFIG).map(([key, config]) => {
                 const isActive = activeCategories.includes(key);
                 return (
                     <button
                         key={key}
                         onClick={() => toggleCategory(key)}
-                        className={`text-sm px-5 py-2 rounded-full border font-medium transition-all duration-150
-                            ${isActive
-                                ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
-                                : 'bg-gray-800/50 text-gray-500 border-gray-700/40 hover:text-gray-400 hover:bg-gray-800'
-                            }`}
+                        className={
+                            "mono text-[0.65rem] uppercase tracking-[0.12em] px-3 py-1.5 border transition-all duration-150 cursor-pointer " +
+                            (isActive
+                                ? "bg-ink text-paper border-ink"
+                                : "bg-transparent text-ink-muted border-line hover:border-ink hover:text-ink-soft")
+                        }
                     >
                         {config.label}
                     </button>
@@ -37,10 +40,11 @@ function FilterBar({ filters, onFilterChange }) {
             {activeCategories.length > 0 && (
                 <button
                     onClick={() => onFilterChange({ ...filters, categories: [] })}
-                    className="text-sm px-5 py-2 rounded-full border border-gray-700/40 text-gray-600
-                             hover:text-gray-400 transition-all duration-150"
+                    className="mono text-[0.65rem] uppercase tracking-[0.12em] px-3 py-1.5 text-accent
+                               hover:text-accent-soft border-b border-accent/30 hover:border-accent-soft
+                               transition-colors cursor-pointer"
                 >
-                    Clear
+                    Clear ×
                 </button>
             )}
         </div>

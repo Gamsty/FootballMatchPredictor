@@ -84,17 +84,14 @@ export const getConfidenceLabel = (confidence) => {
     return 'Low';
 };
 
+// Thresholds must match getConfidenceLabel — otherwise a match in the 0.45-0.5
+// range gets labelled "Low" but coloured amber, breaking the traffic-light read.
 export const getConfidenceColor = (confidence) => {
     if (confidence >= 0.6) return 'bg-green-500';
-    if (confidence >= 0.45) return 'bg-amber-500';
+    if (confidence >= 0.5) return 'bg-amber-500';
     return 'bg-red-500';
 };
 
-export const getConfidenceTextColor = (confidence) => {
-    if (confidence >= 0.6) return 'text-green-400';
-    if (confidence >= 0.45) return 'text-amber-400';
-    return 'text-red-400';
-};
 
 // Market labels for display
 export const MARKET_LABELS = {
@@ -117,56 +114,53 @@ export const MARKET_LABELS = {
     total_cards_over_5_5: 'Over/Under 5.5 Cards',
 };
 
-// Market categories for grouping in the detail view
+// Market categories for grouping in the detail view.
+// Labels only — section headers in MatchDetail render plain serif titles,
+// not iconed pills.
 export const MARKET_CATEGORIES = {
     goals: {
         label: 'Goals',
-        icon: '⚽',
         markets: ['btts', 'over_1_5', 'over_2_5', 'over_3_5', 'over_4_5'],
     },
     halftime: {
-        label: 'Half-Time',
-        icon: '⏱️',
+        label: 'Half-time',
         markets: ['ht_result', 'home_wins_at_least_one_half', 'away_wins_at_least_one_half', 'home_wins_both_halves', 'away_wins_both_halves'],
     },
     corners: {
         label: 'Corners',
-        icon: '🚩',
         markets: ['corners_result', 'total_corners_over_8_5', 'total_corners_over_9_5', 'total_corners_over_10_5'],
     },
     cards: {
         label: 'Cards',
-        icon: '🟨',
         markets: ['total_cards_over_3_5', 'total_cards_over_4_5', 'total_cards_over_5_5'],
     },
 };
 
-// Competition display names with flags
+// Plain editorial league names. Previously prefixed with country-flag emojis,
+// but those render inconsistently across Windows/Mac/Linux (the England-flag
+// tag sequence in particular often falls back to a generic black flag), and
+// emoji-laden labels read as AI-template output.
 export const COMPETITION_LABELS = {
-    'Premier League': '🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League',
-    'La Liga': '🇪🇸 La Liga',
-    'Bundesliga': '🇩🇪 Bundesliga',
-    'Serie A': '🇮🇹 Serie A',
-    'Ligue 1': '🇫🇷 Ligue 1',
-    'Primeira Liga': '🇵🇹 Primeira Liga',
-    'Championship': '🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship',
-    'Eredivisie': '🇳🇱 Eredivisie',
-    'UEFA Champions League': '🏆 Champions League',
-    'Eliteserien': '🇳🇴 Eliteserien',
+    'Premier League': 'Premier League',
+    'La Liga': 'La Liga',
+    'Bundesliga': 'Bundesliga',
+    'Serie A': 'Serie A',
+    'Ligue 1': 'Ligue 1',
+    'Primeira Liga': 'Primeira Liga',
+    'Championship': 'Championship',
+    'Eredivisie': 'Eredivisie',
+    'UEFA Champions League': 'Champions League',
+    'Eliteserien': 'Eliteserien',
 };
 
-// Tag display config
+// Filter tag labels. The previous version carried Tailwind dark-theme colour
+// classes; FilterBar styles its own chips from the paper palette now, so the
+// colour field has been dropped.
 export const TAG_CONFIG = {
-    high_confidence: { label: 'High Confidence', color: 'bg-green-500/20 text-green-400 border-green-500/30' },
-    upset: { label: 'Upset Pick', color: 'bg-purple-500/20 text-purple-400 border-purple-500/30' },
-    banker: { label: 'Banker', color: 'bg-blue-500/20 text-blue-400 border-blue-500/30' },
+    high_confidence: { label: 'High Confidence' },
+    upset:           { label: 'Upset Pick' },
+    banker:          { label: 'Banker' },
 };
-
-// Date range options (kept for reference, not used in UI)
-export const DATE_RANGE_OPTIONS = [
-    { value: 1, label: 'Today' },
-    { value: 3, label: '3 Days' },
-];
 
 // Format implied odds from probability
 export const formatOdds = (probability) => {
@@ -633,12 +627,6 @@ export const getRecommendedBets = (match) => {
     }
 
     return result.length > 0 ? result : null;
-};
-
-// Legacy single-bet helper (used by accumulator)
-export const getRecommendedBet = (match) => {
-    const bets = getRecommendedBets(match);
-    return bets ? bets[0] : null;
 };
 
 // Calculate accumulator returns

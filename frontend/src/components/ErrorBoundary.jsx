@@ -1,10 +1,11 @@
-/**
- * Error Boundary Component
- *
- * Class component that catches JavaScript errors in its child component tree
- * and displays a fallback UI instead of crashing the entire app.
- * Uses React's getDerivedStateFromError and componentDidCatch lifecycle methods.
- */
+/*
+Error Boundary — paper-aesthetic fallback
+
+Catches JavaScript errors in its child component tree and renders a calm,
+editorial fallback rather than letting the app blank-screen. Uses the same
+paper palette as the rest of the dashboard so errors don't look like a
+different application appeared.
+*/
 
 import React from 'react';
 
@@ -14,41 +15,43 @@ class ErrorBoundary extends React.Component {
         this.state = { hasError: false, error: null };
     }
 
-    // Update state so the next render shows the fallback UI
     static getDerivedStateFromError(error) {
         return { hasError: true, error };
     }
 
-    // Log error details for debugging
     componentDidCatch(error, errorInfo) {
+        // Log to the browser console for local debugging; in production this
+        // is also surfaced via Application Insights' browser SDK if wired up.
         console.error('Error caught by boundary:', error, errorInfo);
     }
 
     render() {
-        // Show fallback UI when an error is caught
         if (this.state.hasError) {
             return (
-                <div className="flex items-center justify-center min-h-screen bg-gray-900">
-                    <div className="text-center p-8 bg-gray-800 rounded-2xl shadow-lg max-w-md mx-4">
-                        <h1 className="text-2xl font-bold text-gray-100 mb-3">
-                            Oops! Something went wrong
+                <div className="flex items-center justify-center min-h-screen bg-paper px-6">
+                    <div className="max-w-md w-full text-center">
+                        <div className="mono text-[0.7rem] uppercase tracking-[0.15em] text-accent mb-4">
+                            Unexpected error
+                        </div>
+                        <h1 className="display text-4xl text-ink mb-4">
+                            Something broke<span className="text-accent">.</span>
                         </h1>
-                        <p className="text-gray-400 mb-6">
-                            We're sorry for the inconvenience. Please try refreshing the page.
+                        <p className="text-ink-soft mb-8 leading-relaxed">
+                            The dashboard hit an error it didn't know how to handle. A
+                            refresh usually clears it.
                         </p>
                         <button
                             onClick={() => window.location.reload()}
-                            className="px-6 py-2.5 bg-primary-600 text-white font-semibold rounded-lg
-                                       hover:bg-primary-700 transition-colors cursor-pointer"
+                            className="mono text-[0.72rem] uppercase tracking-[0.12em] px-5 py-3
+                                       bg-ink text-paper hover:bg-accent transition-colors cursor-pointer"
                         >
-                            Refresh Page
+                            Refresh page →
                         </button>
                     </div>
                 </div>
             );
         }
 
-        // No error — render children normally
         return this.props.children;
     }
 }

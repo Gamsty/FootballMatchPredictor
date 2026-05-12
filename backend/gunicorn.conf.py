@@ -7,9 +7,9 @@ import os
 # Bind to PORT env var (Azure Container Apps sets it via targetPort), default 5000
 bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
 
-# Worker count: respect WEB_CONCURRENCY (Heroku/Render/Azure standard).
-# Default to 2 — each worker loads ~500MB of XGBoost models, so cpu_count*2+1
-# OOMs anything smaller than ~16GB of container RAM.
+# Worker count: respect the standard WEB_CONCURRENCY env var (set by the
+# Container App env). Default to 2 — each worker loads ~500MB of model
+# artifacts, so cpu_count*2+1 OOMs anything smaller than ~16GB of RAM.
 workers = int(os.environ.get('WEB_CONCURRENCY', '2'))
 worker_class = "sync"
 worker_connections = 1000

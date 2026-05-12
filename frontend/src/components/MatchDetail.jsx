@@ -21,7 +21,7 @@ import { useState, useEffect, useRef } from 'react';
 import { footballAPI } from '../services/api';
 import {
     formatPercentage, formatTime, formatMatchDate, formatOdds,
-    getConfidenceColor, getConfidenceLabel, getRecommendedBets,
+    getRecommendedBets,
     MARKET_LABELS, MARKET_CATEGORIES, COMPETITION_LABELS
 } from '../utils/constants';
 
@@ -79,24 +79,28 @@ function MatchDetail({ match, onClose }) {
 
     return (
         <div
-            className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm overflow-y-auto p-4"
+            className="fixed inset-0 z-50 flex items-start justify-center bg-ink/40 backdrop-blur-sm overflow-y-auto p-4 animate-fade-in"
             onClick={handleBackdropClick}
         >
-            <div ref={panelRef} className="bg-gray-900 rounded-2xl shadow-2xl w-full max-w-2xl my-8 border border-gray-800">
+            <div
+                ref={panelRef}
+                className="bg-paper border border-line w-full max-w-2xl my-8
+                           shadow-[0_24px_60px_-20px_rgba(21,17,13,0.35)] animate-slide-in"
+            >
                 {/* Header */}
-                <div className="bg-gray-800 rounded-t-2xl p-5 border-b border-gray-700/50">
-                    <div className="flex justify-between items-start">
+                <div className="bg-paper-tint p-6 border-b border-line">
+                    <div className="flex justify-between items-start gap-4">
                         <div>
-                            <div className="text-gray-400 text-xs mb-2">
-                                {compLabel} &middot; {formatMatchDate(match.date)} {formatTime(match.date)}
+                            <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted mb-3">
+                                {compLabel} <span className="text-line">·</span> {formatMatchDate(match.date)} <span className="text-line">·</span> {formatTime(match.date)}
                             </div>
-                            <div className="flex items-center gap-3 text-white">
+                            <div className="flex items-center gap-3 flex-wrap">
                                 {match.home_team.crest && (
                                     <img src={match.home_team.crest} alt="" className="w-7 h-7 object-contain" />
                                 )}
-                                <span className="text-lg font-bold">{match.home_team.name}</span>
-                                <span className="text-sm text-gray-500">vs</span>
-                                <span className="text-lg font-bold">{match.away_team.name}</span>
+                                <span className="display text-xl text-ink">{match.home_team.name}</span>
+                                <span className="mono text-xs text-ink-muted uppercase tracking-[0.12em]">vs</span>
+                                <span className="display text-xl text-ink-soft">{match.away_team.name}</span>
                                 {match.away_team.crest && (
                                     <img src={match.away_team.crest} alt="" className="w-7 h-7 object-contain" />
                                 )}
@@ -104,7 +108,8 @@ function MatchDetail({ match, onClose }) {
                         </div>
                         <button
                             onClick={onClose}
-                            className="text-gray-500 hover:text-gray-300 text-xl font-bold p-1 transition-colors"
+                            className="text-ink-muted hover:text-accent text-2xl leading-none p-1 transition-colors cursor-pointer"
+                            aria-label="Close"
                         >
                             &times;
                         </button>
@@ -112,59 +117,59 @@ function MatchDetail({ match, onClose }) {
                 </div>
 
                 {/* Body */}
-                <div className="p-5 space-y-4">
+                <div className="p-6 space-y-5">
                     {loading && (
                         <div className="text-center py-12">
-                            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mx-auto mb-3" />
-                            <p className="text-gray-500 text-sm">Loading predictions...</p>
+                            <div className="inline-block w-3 h-3 bg-accent animate-pulse-soft rounded-full mb-3" />
+                            <p className="mono text-[0.7rem] uppercase tracking-[0.15em] text-ink-muted">Fetching markets</p>
                         </div>
                     )}
 
-                    {error && <div className="text-center py-8 text-red-400 text-sm">{error}</div>}
+                    {error && (
+                        <div className="bg-danger/5 border-l-2 border-danger p-4">
+                            <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-danger mb-1">Error</div>
+                            <p className="text-ink-soft text-sm">{error}</p>
+                        </div>
+                    )}
 
                     {marketData && (
                         <>
-                            {/* Recommended Bets - Three options */}
+                            {/* Recommended bets */}
                             {recommendedBets && recommendedBets.length > 0 && (
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                     {recommendedBets.map((bet) => {
-                                        const colors = {
-                                            best:    { bg: 'bg-blue-500/10', border: 'border-blue-500/20', label: 'text-blue-400/70', text: 'text-blue-200', prob: 'text-blue-300' },
-                                            safest:  { bg: 'bg-emerald-500/10', border: 'border-emerald-500/20', label: 'text-emerald-400/70', text: 'text-emerald-200', prob: 'text-emerald-300' },
-                                        };
-                                        const typeLabels = { best: 'Best Bet', safest: 'Safest Bet' };
-                                        const c = colors[bet.type] || colors.best;
+                                        const typeLabels = { best: 'Best bet', safest: 'Safest bet' };
                                         return (
-                                            <div key={bet.type}>
-                                                <div className={`${c.bg} border ${c.border} rounded-xl p-3`}>
-                                                    <div className={`text-[10px] ${c.label} uppercase font-semibold tracking-wider mb-1.5`}>
-                                                        {typeLabels[bet.type]}
-                                                    </div>
-                                                    <div className={`text-sm font-bold ${c.text} mb-1`}>{bet.label}</div>
-                                                    <div className="flex items-center justify-between">
-                                                        <span className={`text-sm font-bold ${c.prob} font-mono`}>{formatPercentage(bet.prob)}</span>
-                                                        <span className="text-xs text-gray-500">@ {formatOdds(bet.prob)}</span>
-                                                    </div>
-                                                    {bet.reason && (
+                                            <div key={bet.type} className="border border-line p-4">
+                                                <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">
+                                                    {typeLabels[bet.type] || bet.type}
+                                                </div>
+                                                <div className="display text-lg text-ink mb-2">{bet.label}</div>
+                                                <div className="flex items-baseline justify-between">
+                                                    <span className="mono text-sm text-ink font-medium">{formatPercentage(bet.prob)}</span>
+                                                    <span className="mono text-[0.65rem] uppercase tracking-[0.1em] text-ink-muted">
+                                                        @ {formatOdds(bet.prob)}
+                                                    </span>
+                                                </div>
+                                                {bet.reason && (
+                                                    <>
                                                         <button
                                                             onClick={() => setExpandedReason(expandedReason === bet.type ? null : bet.type)}
-                                                            className={`text-[11px] mt-2 font-medium transition-colors ${c.label} hover:underline`}
+                                                            className="mono text-[0.62rem] uppercase tracking-[0.12em] text-ink-muted hover:text-accent mt-3 transition-colors cursor-pointer"
                                                         >
-                                                            {expandedReason === bet.type ? 'Hide reason' : 'Why this bet?'}
+                                                            {expandedReason === bet.type ? '— hide reasoning' : '+ why this bet'}
                                                         </button>
-                                                    )}
-                                                </div>
-                                                {expandedReason === bet.type && bet.reason && (
-                                                    <div className={`${c.bg} border ${c.border} border-t-0 rounded-b-xl px-3 py-3 -mt-1`}>
-                                                        <ul className="space-y-2">
-                                                            {bet.reason.map((line, i) => (
-                                                                <li key={i} className="flex gap-2 text-[11px] text-gray-400 leading-snug">
-                                                                    <span className={`${c.prob} mt-0.5 shrink-0`}>&#8226;</span>
-                                                                    <span>{line}</span>
-                                                                </li>
-                                                            ))}
-                                                        </ul>
-                                                    </div>
+                                                        {expandedReason === bet.type && (
+                                                            <ul className="mt-2 space-y-1 pt-2 border-t border-line">
+                                                                {bet.reason.map((line, i) => (
+                                                                    <li key={i} className="flex gap-2 text-xs text-ink-soft leading-snug">
+                                                                        <span className="text-accent mt-0.5 shrink-0">·</span>
+                                                                        <span>{line}</span>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                    </>
                                                 )}
                                             </div>
                                         );
@@ -172,33 +177,30 @@ function MatchDetail({ match, onClose }) {
                                 </div>
                             )}
 
-                            {/* Match Result */}
-                            <Section title="Match Result" defaultOpen>
+                            <Section title="Match result" defaultOpen>
                                 <ResultBar prediction={marketData.match_result} match={match} />
                             </Section>
 
-                            {/* Double Chance */}
                             {marketData.double_chance && (
-                                <Section title="Double Chance">
-                                    <div className="grid grid-cols-3 gap-2">
+                                <Section title="Double chance">
+                                    <div className="grid grid-cols-3 gap-3">
                                         {Object.entries(marketData.double_chance).map(([key, dc]) => (
-                                            <div key={key} className="bg-gray-800/60 rounded-lg p-3 text-center border border-gray-700/30">
-                                                <div className="text-sm font-bold text-gray-200 mb-0.5">{key}</div>
-                                                <div className="text-[10px] text-gray-500 mb-1.5">{dc.description}</div>
-                                                <div className="text-sm font-semibold text-blue-300 font-mono">{formatPercentage(dc.probability)}</div>
-                                                <div className="text-[10px] text-gray-600">@ {dc.odds}</div>
+                                            <div key={key} className="border border-line p-3 text-center">
+                                                <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-accent mb-1">{key}</div>
+                                                <div className="display text-sm text-ink mb-1">{dc.description}</div>
+                                                <div className="mono text-sm text-ink font-medium">{formatPercentage(dc.probability)}</div>
+                                                <div className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-0.5">@ {dc.odds}</div>
                                             </div>
                                         ))}
                                     </div>
                                 </Section>
                             )}
 
-                            {/* Market Categories */}
                             {Object.entries(MARKET_CATEGORIES).map(([catKey, cat]) => {
                                 const availableMarkets = cat.markets.filter(m => marketData.markets?.[m]);
                                 if (availableMarkets.length === 0) return null;
                                 return (
-                                    <Section key={catKey} title={`${cat.icon} ${cat.label}`}>
+                                    <Section key={catKey} title={cat.label}>
                                         <div className="space-y-1.5">
                                             {availableMarkets.map(marketKey => (
                                                 <MarketRow
@@ -212,9 +214,8 @@ function MatchDetail({ match, onClose }) {
                                 );
                             })}
 
-                            {/* Combo Bets */}
                             {marketData.combos && Object.keys(marketData.combos).length > 0 && (
-                                <Section title="Combo Bets">
+                                <Section title="Combo bets">
                                     <ComboTable combos={marketData.combos} />
                                 </Section>
                             )}
@@ -227,20 +228,22 @@ function MatchDetail({ match, onClose }) {
 }
 
 
-/* Sub-components */
+/* Sub-components — paper aesthetic */
 
 function Section({ title, children, defaultOpen = false }) {
     const [open, setOpen] = useState(defaultOpen);
     return (
-        <div className="rounded-xl border border-gray-800 overflow-hidden">
+        <div className="border border-line">
             <button
                 onClick={() => setOpen(!open)}
-                className="w-full flex items-center justify-between px-4 py-3 text-left bg-gray-800/40 hover:bg-gray-800/60 transition-colors"
+                className="w-full flex items-baseline justify-between px-4 py-3 text-left bg-paper hover:bg-paper-tint transition-colors cursor-pointer"
             >
-                <h3 className="text-sm font-semibold text-gray-300">{title}</h3>
-                <span className="text-gray-600 text-xs">{open ? '▲' : '▼'}</span>
+                <h3 className="display text-base text-ink">{title}</h3>
+                <span className="mono text-[0.6rem] uppercase tracking-[0.12em] text-ink-muted">
+                    {open ? '— hide' : '+ show'}
+                </span>
             </button>
-            {open && <div className="px-4 py-3 bg-gray-900/50">{children}</div>}
+            {open && <div className="px-4 py-4 bg-paper-tint border-t border-line">{children}</div>}
         </div>
     );
 }
@@ -250,13 +253,13 @@ function ResultBar({ prediction, match }) {
     const { home_win, draw, away_win } = prediction.probabilities;
 
     return (
-        <div className="space-y-2.5">
-            <ProbBar label={match.home_team.short_name || match.home_team.name} prob={home_win} color="bg-emerald-500" />
-            <ProbBar label="Draw" prob={draw} color="bg-gray-400" />
-            <ProbBar label={match.away_team.short_name || match.away_team.name} prob={away_win} color="bg-sky-500" />
+        <div className="space-y-3">
+            <ProbBar label={match.home_team.short_name || match.home_team.name} prob={home_win} accent="ink" />
+            <ProbBar label="Draw" prob={draw} accent="muted" />
+            <ProbBar label={match.away_team.short_name || match.away_team.name} prob={away_win} accent="accent" />
 
             {prediction.odds && (
-                <div className="flex gap-4 pt-1 text-[10px] text-gray-600">
+                <div className="flex gap-4 pt-2 mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted border-t border-line mt-2">
                     <span>H @ {prediction.odds.home_win || '-'}</span>
                     <span>D @ {prediction.odds.draw || '-'}</span>
                     <span>A @ {prediction.odds.away_win || '-'}</span>
@@ -266,14 +269,20 @@ function ResultBar({ prediction, match }) {
     );
 }
 
-function ProbBar({ label, prob, color }) {
+function ProbBar({ label, prob, accent }) {
+    // accent: 'ink' (home), 'muted' (draw), 'accent' (away)
+    const barColor = {
+        ink: 'bg-ink',
+        muted: 'bg-ink-muted/40',
+        accent: 'bg-accent-soft',
+    }[accent];
     return (
         <div className="flex items-center gap-3">
-            <span className="text-xs text-gray-400 w-24 truncate">{label}</span>
-            <div className="flex-1 bg-gray-800 rounded-full h-2.5 overflow-hidden">
-                <div className={`${color} h-full rounded-full transition-all duration-500`} style={{ width: `${prob * 100}%` }} />
+            <span className="text-xs text-ink-soft w-28 truncate">{label}</span>
+            <div className="flex-1 bg-line h-[3px]">
+                <div className={`${barColor} h-full transition-all duration-500`} style={{ width: `${prob * 100}%` }} />
             </div>
-            <span className="text-xs text-gray-300 w-12 text-right font-mono">{formatPercentage(prob)}</span>
+            <span className="mono text-xs text-ink w-12 text-right font-medium">{formatPercentage(prob)}</span>
         </div>
     );
 }
@@ -281,21 +290,22 @@ function ProbBar({ label, prob, color }) {
 function MarketRow({ label, data }) {
     if (!data || data.error) return null;
 
-    // Find the predicted (highest probability) outcome
     const probs = data.probabilities || {};
     const entries = Object.entries(probs);
     const best = entries.length > 0 ? entries.reduce((a, b) => b[1] > a[1] ? b : a) : null;
 
     return (
-        <div className="flex items-center justify-between py-2 px-3 rounded-lg bg-gray-800/40 border border-gray-800/60">
-            <span className="text-xs text-gray-400">{label}</span>
+        <div className="flex items-center justify-between py-2 px-3 bg-paper border border-line">
+            <span className="text-xs text-ink-soft">{label}</span>
             <div className="flex items-center gap-3">
                 {entries.map(([outcomeLabel, prob]) => {
                     const isBest = best && outcomeLabel === best[0];
                     return (
                         <div key={outcomeLabel} className="flex items-center gap-1">
-                            <span className={`text-[10px] ${isBest ? 'text-blue-300' : 'text-gray-600'}`}>{outcomeLabel}</span>
-                            <span className={`text-xs font-mono ${isBest ? 'text-blue-200 font-semibold' : 'text-gray-500'}`}>
+                            <span className={`mono text-[0.6rem] uppercase tracking-[0.1em] ${isBest ? 'text-accent' : 'text-ink-muted'}`}>
+                                {outcomeLabel}
+                            </span>
+                            <span className={`mono text-xs ${isBest ? 'text-ink font-medium' : 'text-ink-muted'}`}>
                                 {formatPercentage(prob)}
                             </span>
                         </div>
@@ -324,23 +334,22 @@ function ComboTable({ combos }) {
     });
 
     return (
-        <div className="space-y-4">
+        <div className="space-y-5">
             {Object.entries(groups).map(([title, items]) => {
                 if (items.length === 0) return null;
-                // Sort by probability descending
                 items.sort((a, b) => b.probability - a.probability);
                 return (
                     <div key={title}>
-                        <div className="text-[10px] text-gray-500 uppercase font-semibold tracking-wider mb-2">{title}</div>
-                        <div className="grid grid-cols-2 gap-1.5">
+                        <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">{title}</div>
+                        <div className="grid grid-cols-2 gap-2">
                             {items.map(combo => (
                                 <div key={combo.key}
-                                    className="flex items-center justify-between py-1.5 px-2.5 rounded-lg bg-gray-800/40 border border-gray-800/60"
+                                    className="flex items-center justify-between py-2 px-3 bg-paper border border-line"
                                 >
-                                    <span className="text-[11px] text-gray-400 truncate mr-2">{combo.description}</span>
+                                    <span className="text-xs text-ink-soft truncate mr-2">{combo.description}</span>
                                     <div className="flex items-center gap-2 shrink-0">
-                                        <span className="text-xs font-mono text-gray-300">{formatPercentage(combo.probability)}</span>
-                                        <span className="text-[10px] text-gray-600">@ {combo.odds || '-'}</span>
+                                        <span className="mono text-xs text-ink font-medium">{formatPercentage(combo.probability)}</span>
+                                        <span className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted">@ {combo.odds || '-'}</span>
                                     </div>
                                 </div>
                             ))}

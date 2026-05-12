@@ -39,9 +39,9 @@ import os
 import tempfile
 
 # matplotlib + seaborn are heavy and only needed when running model_training.py
-# directly (CLI). The retrain job (train_xgboost) imports model_training but never
-# triggers plotting, so we lazy-import inside _plot_confusion_matrix / feature_importance
-# instead of at module level.
+# directly (CLI). The retrain job (train_production_model) imports this module
+# but never triggers plotting, so we lazy-import inside _plot_confusion_matrix /
+# feature_importance instead of at module level.
 try:
     import matplotlib.pyplot as plt  # noqa: F401
     import seaborn as sns  # noqa: F401
@@ -1228,6 +1228,9 @@ def train_market_model(market_name, market_def, df, feature_cols, elo_ratings=No
     try:
         logloss = log_loss(y_test, y_pred_proba)
     except Exception:
+        # sklearn raises when y_test is missing a class that the model predicts
+        # (common on small CLI test splits). Fall through with None so the
+        # rest of the metrics print and the run continues.
         logloss = None
 
     labels = market_def['labels']
@@ -1511,121 +1514,6 @@ def _build_xy_from_csv(csv_path, include_odds=False, binary_mode=False):
         y = df_filtered['target'].map({'HOME_TEAM': 2, 'DRAW': 1, 'AWAY_TEAM': 0})
 
     return X, y, df_filtered, feature_names, elo_ratings
-
-
-def train_xgboost(db, holdout_days=90, include_odds=False):
-    """
-    Train an XGBoost 3-class model from the database. Time-based holdout split
-    so the validation reflects future performance rather than random sampling.
-
-    Pipeline:
-        1. Compute features for all FINISHED matches in DB (idempotent — skips already-done)
-        2. Export to a temp CSV
-        3. Time-based split: rows with date < (today - holdout_days) -> train, rest -> holdout
-        4. Compute Elo on the FULL chronological data (no leakage), build features
-        5. Fit StandardScaler on train, transform both
-        6. Train XGBoost with sane defaults (no tuning — fast for nightly runs)
-        7. Return model_data dict + scaled holdout for the caller's validation gate
-
-    Args:
-        db: DatabaseManager instance
-        holdout_days: Last N days of finished matches reserved for AUC evaluation
-        include_odds: Include odds features (False for live API; True only if odds in DB)
-
-    Returns:
-        dict with keys:
-            'model_data': dict (model, scaler, feature_names, model_type, elo_ratings, created_at)
-            'X_holdout': scaled holdout features as DataFrame (preserves feature_names ordering)
-            'y_holdout': holdout targets (Series of 0/1/2)
-            'holdout_size': int
-            'train_size': int
-    """
-    # Local imports — feature_engineering pulls in DB, we want this lazy when imported
-    from feature_engineering import FeatureEngineer
-
-    fe = FeatureEngineer()
-    try:
-        print("[train_xgboost] Computing features for all matches in DB...")
-        fe.create_features_for_all_matches(save_to_db=True)
-
-        # Export to a temp CSV that _build_xy_from_csv consumes
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp:
-            tmp_csv = tmp.name
-        try:
-            print(f"[train_xgboost] Exporting features to {tmp_csv}...")
-            fe.export_features_to_csv(output_path=tmp_csv)
-
-            X, y, df, feature_names, elo_ratings = _build_xy_from_csv(
-                tmp_csv, include_odds=include_odds, binary_mode=False
-            )
-
-            # Time-based split (uses df['date'] which load_data preserves)
-            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
-            # pd.Timestamp.utcnow() is deprecated in pandas 3.x — use tz-aware now('UTC')
-            cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=holdout_days)
-            train_mask = df['date'] < cutoff
-            hold_mask = df['date'] >= cutoff
-
-            X_train = X[train_mask].copy()
-            y_train = y[train_mask].copy()
-            X_hold = X[hold_mask].copy()
-            y_hold = y[hold_mask].copy()
-
-            print(f"[train_xgboost] Train: {len(X_train)}, Holdout: {len(X_hold)} (last {holdout_days}d)")
-            if len(X_train) < 100:
-                raise RuntimeError(f"Training set too small ({len(X_train)} < 100)")
-
-            # Scale
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_hold_scaled_arr = scaler.transform(X_hold) if len(X_hold) else np.empty((0, X_train.shape[1]))
-
-            # Train (no CV, no tuning — fast)
-            model = xgb.XGBClassifier(
-                n_estimators=300,
-                max_depth=5,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                eval_metric='mlogloss',
-                objective='multi:softprob',
-            )
-            print("[train_xgboost] Fitting XGBoost...")
-            start = datetime.now()
-            model.fit(X_train_scaled, y_train)
-            print(f"[train_xgboost] Trained in {(datetime.now() - start).total_seconds():.1f}s")
-
-            model_data = {
-                'model': model,
-                'scaler': scaler,
-                'feature_names': feature_names,
-                'model_type': 'xgboost',
-                'elo_ratings': elo_ratings,
-                'created_at': datetime.now().isoformat(),
-            }
-
-            # Wrap holdout back into a DataFrame so callers can index by feature_names
-            X_hold_scaled = pd.DataFrame(X_hold_scaled_arr, columns=feature_names) if len(X_hold) else pd.DataFrame(columns=feature_names)
-
-            return {
-                'model_data': model_data,
-                'X_holdout': X_hold_scaled,
-                'y_holdout': y_hold.reset_index(drop=True),
-                'holdout_size': len(X_hold),
-                'train_size': len(X_train),
-                # Pass the exact cutoff so a follow-up production-model eval can
-                # reproduce the same holdout window (no drift from calling
-                # pd.Timestamp.now() seconds later).
-                'cutoff': cutoff,
-            }
-        finally:
-            try:
-                os.unlink(tmp_csv)
-            except OSError:
-                pass
-    finally:
-        fe.close()
 
 
 def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5):

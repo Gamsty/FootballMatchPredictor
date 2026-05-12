@@ -1,11 +1,22 @@
 /*
-About Model Modal — Explains the prediction pipeline to portfolio visitors.
+About Model — paper-aesthetic modal
 
-Covers: architecture, training data, retraining cadence, data source.
-Built so a non-technical visitor can grasp it in 30 seconds.
+Five-section explainer for portfolio visitors who want to know how the predictions
+work. Editorial framing rather than tooltip-style help text.
 */
 
 import { useEffect, useRef } from 'react';
+
+function Section({ label, children }) {
+    return (
+        <div>
+            <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">
+                {label}
+            </div>
+            <p className="text-ink-soft leading-relaxed">{children}</p>
+        </div>
+    );
+}
 
 function AboutModel({ onClose }) {
     const panelRef = useRef(null);
@@ -24,89 +35,73 @@ function AboutModel({ onClose }) {
     }, [onClose]);
 
     return (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-ink/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in">
             <div
                 ref={panelRef}
-                className="bg-gray-900 border border-gray-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl"
+                className="bg-paper border border-line max-w-lg w-full shadow-[0_24px_60px_-20px_rgba(21,17,13,0.35)]
+                           animate-slide-in"
             >
-                <div className="flex items-start justify-between mb-4">
-                    <h2 className="text-lg font-bold text-gray-100">About the model</h2>
+                <div className="flex items-baseline justify-between p-6 border-b border-line">
+                    <div>
+                        <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-ink-muted">
+                            Method note
+                        </div>
+                        <h2 className="display text-2xl text-ink mt-1">
+                            How it works<span className="text-accent">.</span>
+                        </h2>
+                    </div>
                     <button
                         onClick={onClose}
-                        className="text-gray-500 hover:text-gray-200 transition-colors text-xl leading-none"
+                        className="text-ink-muted hover:text-accent transition-colors text-2xl leading-none cursor-pointer"
                         aria-label="Close"
                     >
-                        &times;
+                        ×
                     </button>
                 </div>
 
-                <div className="space-y-4 text-sm text-gray-400 leading-relaxed">
-                    <div>
-                        <div className="text-[10px] uppercase tracking-wider text-emerald-400 mb-1">
-                            Architecture
-                        </div>
-                        <p>
-                            Stacked ensemble — <span className="text-gray-200">XGBoost + RandomForest</span> base
-                            learners feeding a logistic-regression meta-learner. Out-of-fold predictions
-                            generated via TimeSeriesSplit so the meta-learner never sees future data.
-                        </p>
-                    </div>
+                <div className="p-6 space-y-5 text-sm">
+                    <Section label="Architecture">
+                        Stacked ensemble — <span className="text-ink font-medium">XGBoost + RandomForest</span> base
+                        learners feeding a logistic-regression meta-learner. Out-of-fold predictions
+                        generated via TimeSeriesSplit so the meta-learner never sees future data.
+                    </Section>
 
-                    <div>
-                        <div className="text-[10px] uppercase tracking-wider text-emerald-400 mb-1">
-                            Features
-                        </div>
-                        <p>
-                            ~50 features per match: Elo ratings (computed chronologically, no leakage),
-                            form over last 5 matches, head-to-head record, league position, rest days,
-                            shots/corners/cards averages, season progress.
-                        </p>
-                    </div>
+                    <Section label="Features">
+                        ~50 features per match: Elo ratings (computed chronologically, no leakage),
+                        form over last 5 matches, head-to-head record, league position, rest days,
+                        shots/corners/cards averages, season progress.
+                    </Section>
 
-                    <div>
-                        <div className="text-[10px] uppercase tracking-wider text-emerald-400 mb-1">
-                            Training data
-                        </div>
-                        <p>
-                            <span className="text-gray-200">40,000+ historical matches</span> across 9
-                            European leagues (Premier League, Championship, La Liga, Bundesliga, Serie A,
-                            Ligue 1, Eredivisie, Primeira Liga, Champions League). Time-based holdout split
-                            so validation reflects future performance.
-                        </p>
-                    </div>
+                    <Section label="Training data">
+                        <span className="text-ink font-medium">40,000+ historical matches</span> across 9
+                        European leagues. Time-based holdout split so validation reflects future
+                        performance rather than random sampling.
+                    </Section>
 
-                    <div>
-                        <div className="text-[10px] uppercase tracking-wider text-emerald-400 mb-1">
-                            Retraining
-                        </div>
-                        <p>
-                            Azure Container Apps Job runs nightly at 03:00 UTC. New model is promoted only
-                            if its AUC beats production (within tolerance) on the holdout window. Failed
-                            candidates are archived in Blob Storage for inspection.
-                        </p>
-                    </div>
+                    <Section label="Retraining">
+                        Azure Container Apps Job runs nightly at 03:00 UTC. New model is promoted only
+                        if its AUC beats production (within tolerance) on the holdout window. Failed
+                        candidates are archived in Blob Storage for inspection.
+                    </Section>
 
-                    <div>
-                        <div className="text-[10px] uppercase tracking-wider text-emerald-400 mb-1">
-                            Data source
-                        </div>
-                        <p>
-                            Fixtures and results from{' '}
-                            <a
-                                href="https://www.football-data.org/"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-blue-400 hover:text-blue-300 underline"
-                            >
-                                football-data.org
-                            </a>
-                            . Synced nightly into PostgreSQL on Azure.
-                        </p>
-                    </div>
+                    <Section label="Data source">
+                        Fixtures and results from{' '}
+                        <a
+                            href="https://www.football-data.org/"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-accent hover:text-accent-soft border-b border-accent/40 transition-colors"
+                        >
+                            football-data.org
+                        </a>
+                        . Synced nightly into PostgreSQL on Azure.
+                    </Section>
                 </div>
 
-                <div className="mt-5 pt-4 border-t border-gray-800 text-xs text-gray-500 text-center">
-                    Predictions are informational only. Match outcomes are inherently uncertain.
+                <div className="px-6 py-4 border-t border-line bg-paper-tint">
+                    <p className="mono text-[0.62rem] uppercase tracking-[0.12em] text-ink-muted text-center">
+                        Predictions are informational. Match outcomes are inherently uncertain.
+                    </p>
                 </div>
             </div>
         </div>

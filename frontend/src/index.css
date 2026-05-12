@@ -1,93 +1,122 @@
 @import "tailwindcss";
 
-/* Theme customization using CSS variables */
-:root {
-  /* Colors */
-  --color-primary-50: #f5f7ff;
-  --color-primary-100: #ebf0ff;
-  --color-primary-200: #d6e0ff;
-  --color-primary-300: #b3c7ff;
-  --color-primary-400: #8099ff;
-  --color-primary-500: #667eea;
-  --color-primary-600: #5568d3;
-  --color-primary-700: #4653b8;
-  --color-primary-800: #3a4394;
-  --color-primary-900: #2e3470;
+/*
+  Design tokens — kept in sync with the portfolio (adrianklogamst.no) so the
+  dashboard reads as the same designer's work. Warm cream paper feel rather
+  than the generic Tailwind dark theme.
 
-  --color-secondary-50: #faf5ff;
-  --color-secondary-100: #f3e8ff;
-  --color-secondary-200: #e9d5ff;
-  --color-secondary-300: #d8b4fe;
-  --color-secondary-400: #c084fc;
-  --color-secondary-500: #764ba2;
-  --color-secondary-600: #6b3f8f;
-  --color-secondary-700: #5d357a;
-  --color-secondary-800: #4f2c66;
-  --color-secondary-900: #412452;
+  Color names are deliberately semantic (ink, line, accent) instead of
+  numeric scales so the intent is visible in every className.
+*/
+@theme {
+  --color-paper: #F4EEDF;
+  --color-paper-tint: #EFE8D6;
+  --color-paper-edge: #E6DDC2;
+  --color-ink: #15110D;
+  --color-ink-soft: #2A241D;
+  --color-ink-muted: #6B6457;
+  --color-line: #D8CFB8;
+  --color-line-soft: #E2DAC4;
+  --color-accent: #C0410B;
+  --color-accent-soft: #DD5828;
 
-  /* Fonts */
-  --font-family-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  /* Status palette — confidence chips and similar.
+     Tuned for clear traffic-light hierarchy even at small chip size against
+     the cream paper background: a brighter green, a saffron amber distinct
+     from the accent, and a saturated terracotta red that doesn't read as
+     brown. All three carry white text. */
+  --color-positive: #2D7A3F;
+  --color-warning:  #C18A1F;
+  --color-danger:   #B73232;
 
-  /* Animations */
-  --animate-slide-in: slide-in 0.4s ease-out;
-  --animate-fade-in: fade-in 0.3s ease-out;
-  --animate-spin-slow: spin 1s linear infinite;
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+  --font-sans: "Instrument Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
-/* Keyframes */
+/* Body baseline — paper background, ink text, antialiasing on. The subtle
+   noise overlay matches the portfolio and breaks up flat color planes
+   (otherwise the cream can read as banked-up beige on large screens). */
+html, body {
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.35;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.05 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
+/* App content sits above the grain overlay */
+#root {
+  position: relative;
+  z-index: 2;
+}
+
+/* Display utility — headlines. Optical size + soft variation axis for
+   the slightly less mechanical look Fraunces is known for. */
+.display {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 144, "SOFT" 50;
+  letter-spacing: -0.02em;
+}
+
+.display-italic {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-variation-settings: "opsz" 144, "SOFT" 50;
+  letter-spacing: -0.02em;
+}
+
+/* Mono utility — numbers, codes, league tags */
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum" 1;
+}
+
+/* Section label — small caps mono with leading rule, matches portfolio */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+}
+
+/* Animations */
 @keyframes slide-in {
-  from {
-    opacity: 0;
-    transform: translateY(20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
-/* Custom utilities */
+@keyframes pulse-soft {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(45, 122, 63, 0.5); }
+  50%      { box-shadow: 0 0 0 5px rgba(45, 122, 63, 0); }
+}
+
 @layer utilities {
-  .gradient-text {
-    background: linear-gradient(135deg, var(--color-primary-500) 0%, var(--color-secondary-500) 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-  }
-
-  .animate-slide-in {
-    animation: slide-in 0.4s ease-out;
-  }
-
-  .animate-fade-in {
-    animation: fade-in 0.3s ease-out;
-  }
+  .animate-slide-in { animation: slide-in 0.4s ease-out; }
+  .animate-fade-in  { animation: fade-in 0.3s ease-out; }
+  .animate-pulse-soft { animation: pulse-soft 4.5s infinite; }
 }
 
-/* Scrollbar styling */
-.scrollbar-thin::-webkit-scrollbar {
-  width: 8px;
-}
-
-.scrollbar-thin::-webkit-scrollbar-track {
-  background: #1f2937;
-  border-radius: 4px;
-}
-
-.scrollbar-thin::-webkit-scrollbar-thumb {
-  background: #4b5563;
-  border-radius: 4px;
-}
-
-.scrollbar-thin::-webkit-scrollbar-thumb:hover {
-  background: #6b7280;
-}
+/* Scrollbar — match paper aesthetic, not generic Tailwind gray */
+.scrollbar-thin::-webkit-scrollbar         { width: 8px; }
+.scrollbar-thin::-webkit-scrollbar-track   { background: var(--color-paper-tint); border-radius: 4px; }
+.scrollbar-thin::-webkit-scrollbar-thumb   { background: var(--color-line); border-radius: 4px; }
+.scrollbar-thin::-webkit-scrollbar-thumb:hover { background: var(--color-ink-muted); }

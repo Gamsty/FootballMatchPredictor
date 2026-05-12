@@ -99,12 +99,6 @@ export const footballAPI = {
         return response.data;
     },
 
-    // Refresh fixtures from football-data.org
-    refreshFixtures: async (days = 14) => {
-        const response = await api.post('/fixtures/refresh', null, { params: { days } });
-        return response.data;
-    },
-
     // Statistics — league-wide match/goal stats and model accuracy
     getStatisticsOverview: async () => {
         const response = await api.get('/statistics/overview');

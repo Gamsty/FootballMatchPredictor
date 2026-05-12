@@ -140,12 +140,11 @@ def main() -> int:
         new_auc = model_training.evaluate_auc(new_model_data, X_hold, y_hold)
         logger.info(f"New model AUC (holdout): {new_auc:.4f}")
 
-        # Production model must be evaluated on the SAME (already-scaled) holdout.
-        # We have two scalers (new and prod) — use each model's own scaler on raw features.
-        # X_hold here is already scaled by new model's scaler. We need raw features for prod.
-        # Easiest workaround: re-evaluate using each model's scaler, not the cached scaled X.
-        # train_xgboost only returns the scaled holdout, not the raw one. So we add a separate
-        # path: load production model and re-build holdout with ITS scaler.
+        # Production model must be evaluated on the SAME holdout. We have two scalers
+        # (new and prod) — each model needs its own scaler applied to raw features.
+        # train_production_model returns the holdout already scaled by the NEW model's
+        # scaler, not the raw features, so to evaluate the production model we rebuild
+        # the holdout from raw features and apply the prod scaler.
         try:
             prod_bytes = load_model_bytes("best_model.pkl", prefix="production")
             prod_model_data = joblib.load(io.BytesIO(prod_bytes))
@@ -215,8 +214,8 @@ def _isnan(x) -> bool:
 def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected, cutoff):
     """
     Re-build the same time-based holdout using PRODUCTION model's feature pipeline,
-    then evaluate. Necessary because train_xgboost only returns the new model's scaled
-    holdout — the production model has its own scaler.
+    then evaluate. Necessary because train_production_model only returns the new
+    model's scaled holdout — the production model has its own scaler.
 
     Strategy: rebuild raw features with model_training._build_xy_from_csv (deterministic),
     apply prod's scaler (column-aligned to prod's feature_names), evaluate AUC.
