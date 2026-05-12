@@ -14,7 +14,7 @@ Flow: compute_features() → predict_all_markets() → classify_match()
 """
 
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # Top leagues for tagging
@@ -30,7 +30,10 @@ class TempMatch:
         self.id = None
         self.home_team_id = home_id
         self.away_team_id = away_id
-        self.date = date or datetime.utcnow()
+        # datetime.utcnow() is deprecated in Python 3.12+; use tz-aware UTC.
+        # The downstream feature pipeline only reads year/month/day so naive vs tz-aware
+        # doesn't matter here, but using the recommended API silences warnings.
+        self.date = date or datetime.now(timezone.utc)
         self.season = self.date.year if self.date.month >= 8 else self.date.year - 1
         self.competition = competition
         self.stage = 'REGULAR_SEASON'

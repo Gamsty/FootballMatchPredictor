@@ -134,6 +134,11 @@ class MatchPredictor:
         df = pd.read_csv(csv_path)
         print(f"Loaded {len(df)} records")
 
+        # Elo only makes sense chronologically — ensure rows are date-ordered.
+        # Without this, an unsorted CSV would produce garbage Elo features.
+        if 'date' in df.columns:
+            df = df.sort_values('date').reset_index(drop=True)
+
         # --- Compute Elo ratings ---
         if 'home_team' in df.columns and 'away_team' in df.columns:
             print("Computing Elo ratings...")
@@ -160,9 +165,10 @@ class MatchPredictor:
 
         X = df[base_cols].copy()
 
-        # Fill missing rest days with median
+        # Rest-days imputation: fixed 7-day default. Median over the full dataset
+        # would leak holdout/test statistics into train (see _build_xy_from_csv).
         for col in ['days_since_home_last_match', 'days_since_away_last_match']:
-            X[col] = X[col].fillna(X[col].median())
+            X[col] = X[col].fillna(7)
         X = X.fillna(0)
 
         # --- Derived features ---
@@ -259,13 +265,31 @@ class MatchPredictor:
 
         return X, y, df
 
-    def split_data(self, X, y, test_size=0.2, random_state=42):
-        """Split data into train and test sets"""
-        print(f"\nSplitting data: {int((1-test_size)*100)}% train, {int(test_size*100)}% test")
+    def split_data(self, X, y, test_size=0.2, random_state=42, time_based=True):
+        """Split data into train and test sets.
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
+        Defaults to a chronological (time-based) split: last `test_size` of rows by date
+        are held out. This matches the production retrain pipeline and avoids the
+        leakage that random splits cause on time-series features (Elo, form, league
+        position all use the chronological history available at match time).
+
+        Set time_based=False for a random stratified split (legacy/benchmark use only —
+        the resulting accuracy will be optimistic).
+        """
+        if time_based:
+            # X is already date-ordered by load_data (we sort in load_data after
+            # reading the CSV). Take the trailing slice as test.
+            split_idx = int(len(X) * (1 - test_size))
+            X_train = X.iloc[:split_idx]
+            X_test = X.iloc[split_idx:]
+            y_train = y.iloc[:split_idx]
+            y_test = y.iloc[split_idx:]
+            print(f"\nSplitting data (time-based): {int((1-test_size)*100)}% train, {int(test_size*100)}% test")
+        else:
+            print(f"\nSplitting data (random stratified): {int((1-test_size)*100)}% train, {int(test_size*100)}% test")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state, stratify=y
+            )
 
         print(f"Training set: {len(X_train)} samples")
         print(f"Test set: {len(X_test)} samples")
@@ -1413,8 +1437,11 @@ def _build_xy_from_csv(csv_path, include_odds=False, binary_mode=False):
     ]
     X = df[base_cols].copy()
 
+    # Rest-days imputation: fixed 7-day default. Computing median over the full
+    # dataset would leak holdout statistics into the train set (a holdout match's
+    # rest-days distribution would influence the imputation seen at train time).
     for col in ['days_since_home_last_match', 'days_since_away_last_match']:
-        X[col] = X[col].fillna(X[col].median())
+        X[col] = X[col].fillna(7)
     X = X.fillna(0)
 
     # Derived features (must match MatchPredictor.load_data exactly)
@@ -1534,7 +1561,8 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
 
             # Time-based split (uses df['date'] which load_data preserves)
             df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=holdout_days)
+            # pd.Timestamp.utcnow() is deprecated in pandas 3.x — use tz-aware now('UTC')
+            cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=holdout_days)
             train_mask = df['date'] < cutoff
             hold_mask = df['date'] >= cutoff
 
@@ -1586,6 +1614,10 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
                 'y_holdout': y_hold.reset_index(drop=True),
                 'holdout_size': len(X_hold),
                 'train_size': len(X_train),
+                # Pass the exact cutoff so a follow-up production-model eval can
+                # reproduce the same holdout window (no drift from calling
+                # pd.Timestamp.now() seconds later).
+                'cutoff': cutoff,
             }
         finally:
             try:

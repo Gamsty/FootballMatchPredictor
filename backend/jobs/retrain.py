@@ -110,6 +110,7 @@ def main() -> int:
     new_model_data = result['model_data']
     X_hold = result['X_holdout']
     y_hold = result['y_holdout']
+    cutoff = result['cutoff']
     logger.info(f"Train: {result['train_size']}, Holdout: {result['holdout_size']}")
 
     # 3. Validation gate
@@ -138,8 +139,11 @@ def main() -> int:
         try:
             prod_bytes = load_model_bytes("best_model.pkl", prefix="production")
             prod_model_data = joblib.load(io.BytesIO(prod_bytes))
-            # Rebuild RAW holdout using same time split, then scale with prod's scaler
-            prod_auc = _eval_prod_on_same_holdout(db, prod_model_data, y_hold)
+            # Rebuild RAW holdout using same time split, then scale with prod's scaler.
+            # Pass the exact cutoff used during training so the two evaluations look at
+            # identical match sets (otherwise calling now() seconds apart can shift the
+            # boundary and produce a one-match length mismatch).
+            prod_auc = _eval_prod_on_same_holdout(db, prod_model_data, y_hold, cutoff)
             logger.info(f"Production AUC (same holdout): {prod_auc:.4f}")
         except Exception as e:
             logger.warning(f"Could not evaluate production model: {e} — defaulting to PASS")
@@ -198,7 +202,7 @@ def _isnan(x) -> bool:
         return False
 
 
-def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected):
+def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected, cutoff):
     """
     Re-build the same time-based holdout using PRODUCTION model's feature pipeline,
     then evaluate. Necessary because train_xgboost only returns the new model's scaled
@@ -206,6 +210,9 @@ def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected):
 
     Strategy: rebuild raw features with model_training._build_xy_from_csv (deterministic),
     apply prod's scaler (column-aligned to prod's feature_names), evaluate AUC.
+
+    `cutoff` is the same Timestamp used during training — passed in to guarantee both
+    models are evaluated on the exact same matches.
     """
     from feature_engineering import FeatureEngineer
     import pandas as pd
@@ -219,7 +226,6 @@ def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected):
             X, y, df, _, _ = model_training._build_xy_from_csv(tmp_csv, include_odds=False, binary_mode=False)
 
             df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=HOLDOUT_DAYS)
             hold_mask = df['date'] >= cutoff
 
             X_hold_raw = X[hold_mask].copy()
