@@ -21,6 +21,7 @@ import MatchCard from '../components/MatchCard';
 import FilterBar from '../components/FilterBar';
 import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
+import AboutModel from '../components/AboutModel';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
     calculateAccumulator, isTomorrow
@@ -35,6 +36,7 @@ function Dashboard() {
     // UI state
     const [activeTab, setActiveTab] = useState('today');
     const [selectedMatch, setSelectedMatch] = useState(null);
+    const [showAbout, setShowAbout] = useState(false);
     const [filters, setFilters] = useState({
         categories: [],
     });
@@ -151,13 +153,31 @@ function Dashboard() {
 
     return (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-            {/* Header */}
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-5">
-                <div>
-                    <h1 className="text-2xl font-bold text-gray-100">Match Predictions</h1>
-                    <p className="text-gray-500 text-sm mt-0.5">
-                        {filteredMatches.length} matches
-                    </p>
+            {/* Hero */}
+            <div className="mb-6">
+                <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                        <h1 className="text-2xl sm:text-3xl font-bold text-gray-100">Match Predictions</h1>
+                        <p className="text-gray-400 text-sm mt-1.5 max-w-2xl leading-relaxed">
+                            Powered by a <span className="text-gray-200">stacked-ensemble</span> model
+                            (XGBoost + RandomForest) trained on{' '}
+                            <span className="text-gray-200">40,000+ historical matches</span> across 9
+                            leagues. Retrained nightly on Azure with AUC validation against production.
+                        </p>
+                        <div className="flex items-center gap-3 mt-3 text-xs text-gray-500">
+                            <span>{filteredMatches.length} matches shown</span>
+                            <span className="text-gray-700">·</span>
+                            <button
+                                onClick={() => setShowAbout(true)}
+                                className="text-blue-400 hover:text-blue-300 transition-colors inline-flex items-center gap-1"
+                            >
+                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+                                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                                </svg>
+                                How it works
+                            </button>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -247,10 +267,39 @@ function Dashboard() {
             {!loading && !error && filteredMatches.length === 0 && (
                 <div className="text-center py-16">
                     <div className="text-4xl mb-3 opacity-50">⚽</div>
-                    <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches found</h3>
-                    <p className="text-gray-500 text-sm mb-4">
-                        Try adjusting your filters. New fixtures sync automatically every night.
-                    </p>
+                    {activeCategories.length > 0 ? (
+                        <>
+                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches match your filters</h3>
+                            <p className="text-gray-500 text-sm mb-4">
+                                Try removing a category filter, or switch tabs to see more matches.
+                            </p>
+                        </>
+                    ) : activeTab === 'today' && matchCounts.upcoming > 0 ? (
+                        <>
+                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches scheduled for today</h3>
+                            <button
+                                onClick={() => setActiveTab('upcoming')}
+                                className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors inline-flex items-center gap-1"
+                            >
+                                See {matchCounts.upcoming} upcoming match{matchCounts.upcoming === 1 ? '' : 'es'}
+                                <span aria-hidden="true">→</span>
+                            </button>
+                        </>
+                    ) : activeTab === 'today' ? (
+                        <>
+                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No matches scheduled for today</h3>
+                            <p className="text-gray-500 text-sm mb-4">
+                                New fixtures sync automatically every night.
+                            </p>
+                        </>
+                    ) : (
+                        <>
+                            <h3 className="text-lg font-semibold text-gray-400 mb-2">No upcoming matches</h3>
+                            <p className="text-gray-500 text-sm mb-4">
+                                New fixtures sync automatically every night.
+                            </p>
+                        </>
+                    )}
                 </div>
             )}
 
@@ -289,6 +338,9 @@ function Dashboard() {
                     onClose={() => setSelectedMatch(null)}
                 />
             )}
+
+            {/* About Model Modal */}
+            {showAbout && <AboutModel onClose={() => setShowAbout(false)} />}
         </div>
     );
 }
