@@ -21,7 +21,6 @@ Endpoints:
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, timezone
-import pandas as pd
 import joblib
 from dotenv import load_dotenv
 import hmac
@@ -529,6 +528,12 @@ def get_upcoming_predictions():
                 if category and category not in tags:
                     continue
 
+                # Apply min_confidence filter (documented query param)
+                if min_confidence > 0:
+                    pred_confidence = prediction_data.get('match_result', {}).get('confidence', 0)
+                    if pred_confidence < min_confidence:
+                        continue
+
                 results.append({
                     'id': match.id,
                     'date': match.date.isoformat(),
@@ -1016,7 +1021,7 @@ if __name__ == '__main__':
     print("=" * 70)
     print(f"Model: {model_data['model_type'] if model_data else 'NOT_LOADED'}")
     print(f"Multi-market: {'Loaded' if multi_market_models else 'NOT_LOADED'}")
-    print(f"Database: Connected")
+    print("Database: Connected")
     print(f"CORS: Enabled for {FRONTEND_URL}")
     print("=" * 70 + "\n")
 

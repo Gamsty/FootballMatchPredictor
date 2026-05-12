@@ -10,7 +10,7 @@ then matches are inserted with references to team IDs.
 import pandas as pd
 import json
 import os
-from database import DatabaseManager, Team, Match, Standing
+from database import DatabaseManager, Team, Match
 
 def load_csv_to_database(csv_path):
     """

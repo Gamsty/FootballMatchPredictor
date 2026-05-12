@@ -18,7 +18,6 @@ Pipeline: database (matches table) → compute features → match_features table
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-from datetime import datetime
 from database import DatabaseManager, Match, Team, MatchFeatures, Standing
 from sqlalchemy import and_, or_
 
@@ -657,11 +656,15 @@ class FeatureEngineer:
             pts = 0
             for m in matches:
                 if m.home_team_id == team_id:
-                    if m.winner == 'HOME_TEAM': pts += 3
-                    elif m.winner == 'DRAW': pts += 1
+                    if m.winner == 'HOME_TEAM':
+                        pts += 3
+                    elif m.winner == 'DRAW':
+                        pts += 1
                 else:
-                    if m.winner == 'AWAY_TEAM': pts += 3
-                    elif m.winner == 'DRAW': pts += 1
+                    if m.winner == 'AWAY_TEAM':
+                        pts += 3
+                    elif m.winner == 'DRAW':
+                        pts += 1
             return float(pts)
 
         # Goals scored/conceded avg (last 5 home/away matches)
@@ -684,13 +687,19 @@ class FeatureEngineer:
         h2h_home_wins = h2h_draws = h2h_away_wins = 0
         for m in h2h_matches:
             if m.home_team_id == home_id:
-                if m.winner == 'HOME_TEAM': h2h_home_wins += 1
-                elif m.winner == 'AWAY_TEAM': h2h_away_wins += 1
-                else: h2h_draws += 1
+                if m.winner == 'HOME_TEAM':
+                    h2h_home_wins += 1
+                elif m.winner == 'AWAY_TEAM':
+                    h2h_away_wins += 1
+                else:
+                    h2h_draws += 1
             else:
-                if m.winner == 'AWAY_TEAM': h2h_home_wins += 1
-                elif m.winner == 'HOME_TEAM': h2h_away_wins += 1
-                else: h2h_draws += 1
+                if m.winner == 'AWAY_TEAM':
+                    h2h_home_wins += 1
+                elif m.winner == 'HOME_TEAM':
+                    h2h_away_wins += 1
+                else:
+                    h2h_draws += 1
 
         # Rest days
         home_all = self._get_before(self._team_all_matches[home_id], match_date, 1)

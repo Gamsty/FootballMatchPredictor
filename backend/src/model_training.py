@@ -249,7 +249,7 @@ class MatchPredictor:
             y = df['target'].map({'HOME_TEAM': 2, 'DRAW': 1, 'AWAY_TEAM': 0})
 
         print(f"\nFeatures shape: {X.shape}")
-        print(f"Target distribution:")
+        print("Target distribution:")
         if binary_mode:
             target_map = {0: 'AWAY_TEAM', 1: 'HOME_TEAM'}
         else:
@@ -403,11 +403,11 @@ class MatchPredictor:
         print(f"\nOverall Accuracy: {accuracy:.4f}")
         if logloss is not None:
             print(f"Log Loss: {logloss:.4f}")
-        print(f"\nMacro Averages:")
+        print("\nMacro Averages:")
         print(f"    Precision: {precision_macro:.4f}")
         print(f"    Recall: {recall_macro:.4f}")
         print(f"    F1 Score: {f1_macro:.4f}")
-        print(f"\nWeighted Averages:")
+        print("\nWeighted Averages:")
         print(f"    Precision: {precision_weighted:.4f}")
         print(f"    Recall: {recall_weighted:.4f}")
         print(f"    F1 Score: {f1_weighted:.4f}")
@@ -884,14 +884,14 @@ def compare_models(tune=True, n_iter=50):
     # If stacked 3-class is better than best individual, save it as best_model
     if stack_metrics['accuracy'] > best_acc_no_odds:
         stack_predictor.save_model(filename='../models/best_model.pkl')
-        print(f"\nStacked ensemble beat individual models! Saved as best_model.pkl")
+        print("\nStacked ensemble beat individual models! Saved as best_model.pkl")
         best_acc_no_odds = stack_metrics['accuracy']
         best_type_no_odds = 'stacked_ensemble'
 
     # If stacked binary is better than best binary, save it
     if stack_binary_metrics['accuracy'] > best_acc_binary:
         stack_binary_predictor.save_model(filename='../models/best_binary_model.pkl')
-        print(f"\nStacked binary beat individual models! Saved as best_binary_model.pkl")
+        print("\nStacked binary beat individual models! Saved as best_binary_model.pkl")
         best_acc_binary = stack_binary_metrics['accuracy']
         best_type_binary = 'stacked_ensemble'
 
@@ -914,7 +914,7 @@ def compare_models(tune=True, n_iter=50):
     if cal_ll is not None:
         print(f"\n  Calibrated model log loss: {cal_ll:.4f}")
 
-    print(f"\n  Elo ratings: Computed for all teams (stored in model pickle)")
+    print("\n  Elo ratings: Computed for all teams (stored in model pickle)")
     print(f"  Odds boost: +{(best_acc_with_odds - best_acc_no_odds)*100:.1f}%")
     print(f"  Binary boost over 3-class: +{(best_acc_binary - best_acc_no_odds)*100:.1f}%")
 
@@ -1210,7 +1210,7 @@ def train_market_model(market_name, market_def, df, feature_cols, elo_ratings=No
     print(f"\n  Accuracy: {accuracy:.4f}")
     if logloss:
         print(f"  Log Loss: {logloss:.4f}")
-    print(f"\n  Classification Report:")
+    print("\n  Classification Report:")
     print(classification_report(y_test, y_pred, target_names=labels, digits=4))
 
     return {
@@ -1374,7 +1374,7 @@ def train_all_markets(csv_path='../data/processed/match_features.csv',
 
     # Save results CSV
     pd.DataFrame(market_results).T.to_csv('../data/multi_market_results.csv')
-    print(f"\nResults saved to ../data/multi_market_results.csv")
+    print("\nResults saved to ../data/multi_market_results.csv")
 
     return all_market_models
 
@@ -1515,7 +1515,6 @@ def train_xgboost(db, holdout_days=90, include_odds=False):
     """
     # Local imports — feature_engineering pulls in DB, we want this lazy when imported
     from feature_engineering import FeatureEngineer
-    import io as _io
 
     fe = FeatureEngineer()
     try:
