@@ -159,6 +159,7 @@ function CalibrationView({ onClose }) {
                                 <>
                                     <CalibrationPlot buckets={data.buckets} />
                                     <Summary summary={data.summary} />
+                                    <CalibratorBanner calibrator={data.summary?.calibrator} />
                                 </>
                             )}
                         </>
@@ -282,6 +283,38 @@ function Summary({ summary }) {
                     {summary.brier_score?.toFixed(3) ?? '—'}
                 </div>
             </div>
+        </div>
+    );
+}
+
+function CalibratorBanner({ calibrator }) {
+    if (!calibrator) {
+        return (
+            <div className="bg-paper-tint border-l-2 border-ink-muted/30 px-4 py-3">
+                <div className="eyebrow mb-1">Calibrator</div>
+                <p className="text-ink-soft text-sm">
+                    No temperature calibrator is loaded. Predictions reflect the model's raw output —
+                    expect ECE to drift up at the extremes. Run{' '}
+                    <span className="mono text-xs bg-paper px-1.5 py-0.5 border border-line">jobs/fit_calibration.py</span>{' '}
+                    or POST to{' '}
+                    <span className="mono text-xs bg-paper px-1.5 py-0.5 border border-line">/api/admin/refit-calibration</span>{' '}
+                    to learn T from current data.
+                </p>
+            </div>
+        );
+    }
+    const t = calibrator.temperature;
+    const direction = t < 0.95 ? 'sharpening' : t > 1.05 ? 'softening' : 'identity (no-op)';
+    return (
+        <div className="bg-paper-tint border-l-2 border-accent px-4 py-3">
+            <div className="eyebrow mb-1">Calibrator applied</div>
+            <p className="text-ink-soft text-sm">
+                Temperature{' '}
+                <span className="mono text-ink">T = {t.toFixed(3)}</span>{' '}
+                ({direction}), fitted on{' '}
+                <span className="mono text-ink">{calibrator.fit_samples?.toLocaleString() ?? '?'}</span>{' '}
+                samples. Probabilities shown above are post-calibration. Re-fit after retraining the model.
+            </p>
         </div>
     );
 }

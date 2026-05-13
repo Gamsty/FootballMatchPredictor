@@ -598,7 +598,6 @@ class OddsAPIClient:
             outcome_prices: dict[tuple[str, str], list[tuple[float, str]]] = {}
             for bookmaker in event.get('bookmakers', []):
                 key = bookmaker.get('key', '').lower()
-                title = bookmaker.get('title', '?')
                 for market in bookmaker.get('markets', []):
                     mkey = market.get('key', '')
                     for outcome in market.get('outcomes', []):

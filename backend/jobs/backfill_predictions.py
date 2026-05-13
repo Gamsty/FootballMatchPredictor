@@ -99,6 +99,10 @@ def main() -> int:
     parser.add_argument('--overwrite', action='store_true',
                         help='Re-predict matches that already have a prediction. '
                              'Default: skip them (idempotent).')
+    parser.add_argument('--no-calibration', action='store_true',
+                        help='Skip the calibrator even if present. Useful for '
+                             'reproducing the raw model output, e.g. to A/B '
+                             'compare calibrated vs uncalibrated.')
     args = parser.parse_args()
 
     # Default cutoff: last 365 days. This trades coverage for leakage safety —
@@ -113,6 +117,26 @@ def main() -> int:
                 since.date(), args.limit, args.dry_run, args.overwrite)
 
     model_data = load_model()
+
+    # Optionally attach the calibrator so persisted probs are calibrated.
+    # When --no-calibration is set we deliberately strip it — useful for
+    # producing the raw-model baseline that fit_calibration trains against.
+    if args.no_calibration:
+        model_data.pop('calibrator', None)
+        logger.info("Calibration disabled — using raw model output")
+    else:
+        try:
+            cal_path = Path(__file__).parent.parent / 'models' / 'calibrator.json'
+            if cal_path.exists():
+                from calibrator import TemperatureCalibrator
+                cal = TemperatureCalibrator.load(cal_path)
+                model_data['calibrator'] = cal
+                logger.info("Calibration enabled (T=%.4f)", cal.temperature)
+            else:
+                logger.info("No calibrator found at %s — using raw output", cal_path)
+        except Exception as e:
+            logger.warning("Failed to load calibrator (using raw): %s", e)
+
     model_version = str(model_data.get('model_version') or 'unversioned')
     model_type = model_data.get('model_type')
 

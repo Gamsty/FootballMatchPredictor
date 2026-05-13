@@ -12,6 +12,7 @@ Endpoints:
     - /api/predictions/calibration — Bucket predictions vs actual outcomes (model calibration)
     - /api/value-bets              — +EV picks: model probabilities vs bookmaker odds
     - /api/admin/odds-status       — Odds-API quota + per-bookmaker divergence stats
+    - /api/admin/refit-calibration — Re-fit temperature scaling on historical data
     - /api/matches                 — List matches with optional filters
     - /api/matches/<id>            — Single match detail
     - /api/matches/upcoming        — Raw upcoming matches with basic predictions
@@ -38,6 +39,7 @@ from prediction_service import (
     compute_features, predict_match_result, predict_all_markets, classify_match
 )
 from cache import PredictionCache
+from calibrator import TemperatureCalibrator
 from model_storage import load_model_bytes
 from odds_api import OddsAPIClient
 from telemetry import setup_telemetry
@@ -121,6 +123,23 @@ def load_model():
     except Exception as e:
         logger.warning(f"Multi-market models not found (optional): {e}")
         multi_market_models = None
+
+    # Load optional calibrator (TemperatureCalibrator). When present, attached
+    # to model_data so predict_match_result picks it up. Absence is fine —
+    # predictions just stay uncalibrated until fit_calibration runs.
+    if model_data:
+        try:
+            cal_bytes = load_model_bytes("calibrator.json")
+            import json as _json
+            cal = TemperatureCalibrator.from_dict(_json.loads(cal_bytes.decode('utf-8')))
+            model_data['calibrator'] = cal
+            logger.info(
+                "Calibrator loaded",
+                extra={"temperature": cal.temperature, "fit_samples": cal.fit_samples},
+            )
+        except Exception as e:
+            logger.info(f"No calibrator available — predictions stay uncalibrated: {e}")
+            model_data['calibrator'] = None
 
 # Load models on startup
 load_model()
@@ -256,6 +275,118 @@ def reload_model():
         "model_type": model_data["model_type"] if model_data else None,
         "odds_cache_entries_dropped": odds_dropped,
     }), 200
+
+
+@app.route('/api/admin/refit-calibration', methods=['POST'])
+def refit_calibration():
+    """
+    Re-fit the temperature calibrator using raw model output on finished matches.
+
+    Body (optional):
+        { "since": "2024-08-01", "max": 5000, "upload": true }
+
+    Side effects:
+      - Writes backend/models/calibrator.json
+      - Uploads to blob storage if `upload=true` AND USE_BLOB_STORAGE=true
+      - Hot-attaches the new calibrator to the running model_data (no restart)
+
+    Auth: X-Reload-Token header (same as model reload).
+    """
+    if not _require_admin_token():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not model_data:
+        return jsonify({"error": "Model not loaded"}), 503
+
+    try:
+        import numpy as np
+        from datetime import timedelta
+
+        body = request.get_json(silent=True) or {}
+        max_n = max(100, min(int(body.get('max', 5000)), 20000))
+        if body.get('since'):
+            since = datetime.strptime(body['since'], '%Y-%m-%d')
+        else:
+            since = (datetime.now(timezone.utc) - timedelta(days=365)).replace(tzinfo=None)
+        upload = bool(body.get('upload', True))
+
+        # Pull finished matches with known winners
+        LABEL_MAP = {'AWAY_TEAM': 0, 'DRAW': 1, 'HOME_TEAM': 2}
+        matches = (
+            db.session.query(Match)
+            .filter(and_(
+                Match.status == 'FINISHED',
+                Match.date >= since,
+                Match.winner.in_(LABEL_MAP.keys()),
+            ))
+            .order_by(Match.date.asc())
+            .limit(max_n)
+            .all()
+        )
+        if len(matches) < 100:
+            return jsonify({
+                "error": f"Not enough evaluated data ({len(matches)} matches, need ≥100)",
+            }), 400
+
+        # Predict with apply_calibration=False to get raw probs
+        probs: list[list[float]] = []
+        labels: list[int] = []
+        for m in matches:
+            try:
+                features = compute_features(
+                    m.home_team, m.away_team, feature_engineer, model_data,
+                    competition=m.competition, match_date=m.date,
+                )
+                res = predict_match_result(features, model_data, apply_calibration=False)
+                p = res.get('raw_probabilities') or res.get('probabilities') or {}
+                row = [p.get('away_win'), p.get('draw'), p.get('home_win')]
+                if any(v is None for v in row):
+                    continue
+                probs.append(row)
+                labels.append(LABEL_MAP[m.winner])
+            except Exception:
+                continue
+
+        if len(probs) < 100:
+            return jsonify({"error": f"Only {len(probs)} valid samples after feature computation"}), 400
+
+        from calibrator import expected_calibration_error
+        probs_arr = np.array(probs, dtype=float)
+        labels_arr = np.array(labels, dtype=int)
+        ece_before = expected_calibration_error(probs_arr, labels_arr, bins=10)
+
+        cal = TemperatureCalibrator().fit(probs_arr, labels_arr)
+        ece_after = expected_calibration_error(cal.transform(probs_arr), labels_arr, bins=10)
+
+        # Persist locally
+        from pathlib import Path
+        local_path = Path(__file__).parent.parent / 'models' / 'calibrator.json'
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        cal.save(local_path)
+
+        # Optionally upload to blob
+        uploaded = False
+        if upload and os.getenv('USE_BLOB_STORAGE', '').lower() == 'true':
+            from model_storage import upload_model
+            upload_model(local_path, 'calibrator.json')
+            uploaded = True
+
+        # Hot-attach so subsequent predictions use it immediately, no restart needed
+        model_data['calibrator'] = cal
+        prediction_cache.clear()  # discard any cached uncalibrated predictions
+
+        return jsonify({
+            "fitted": True,
+            "temperature": round(cal.temperature, 4),
+            "samples": len(probs_arr),
+            "ece_before": round(ece_before, 4),
+            "ece_after": round(ece_after, 4),
+            "nll_before": round(cal.fit_nll_before, 4),
+            "nll_after": round(cal.fit_nll_after, 4),
+            "uploaded_to_blob": uploaded,
+        }), 200
+
+    except Exception as e:
+        return _error_response("Calibration fit failed", 500, e, endpoint="refit_calibration")
 
 
 @app.route('/api/admin/odds-status', methods=['GET'])
@@ -1025,6 +1156,19 @@ def get_prediction_calibration():
                         .filter(Prediction.actual_winner.isnot(None))
                         .all() if v[0]]
 
+        # Surface the calibrator state so the UI can label the plot honestly.
+        # Note: stored predictions reflect whatever calibrator was active when
+        # they were written. The T shown here is the CURRENT loaded calibrator;
+        # if you re-fit, old predictions don't update automatically — re-run
+        # backfill to align them.
+        calibrator = model_data.get('calibrator') if model_data else None
+        cal_summary = None
+        if calibrator is not None:
+            cal_summary = {
+                'temperature': round(calibrator.temperature, 4),
+                'fit_samples': calibrator.fit_samples,
+            }
+
         return jsonify({
             'outcome': outcome,
             'buckets': buckets,
@@ -1034,6 +1178,7 @@ def get_prediction_calibration():
                 'brier_score': round(brier, 4),
                 'model_version': model_version,
                 'model_versions_available': sorted(all_versions),
+                'calibrator': cal_summary,
             },
         }), 200
 

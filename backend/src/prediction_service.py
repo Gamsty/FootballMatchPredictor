@@ -187,34 +187,69 @@ def _ensemble_agreement(model, X_scaled) -> float | None:
         return None
 
 
-def predict_match_result(features_dict, model_data):
+def predict_match_result(features_dict, model_data, apply_calibration: bool = True):
     """
     Predict H/D/A from features using the main model.
 
-    Returns:
-        dict with outcome, probabilities, confidence, ensemble_agreement, odds
+    Args:
+        apply_calibration: If True (default) and model_data has a fitted
+            TemperatureCalibrator under 'calibrator', apply it to the raw
+            softmax probabilities before returning. Set False for fit jobs
+            that need the model's uncalibrated output (otherwise fitting T
+            on already-calibrated probs trivially returns T=1).
+
+    Returns dict with:
+        outcome, probabilities, raw_probabilities, confidence,
+        ensemble_agreement, odds, calibrated (bool)
     """
+    import numpy as np
+
     fn = model_data['feature_names']
     X = pd.DataFrame([{f: features_dict.get(f, 0) for f in fn}])
     X_scaled = model_data['scaler'].transform(X)
 
     model = model_data['model']
-    pred = model.predict(X_scaled)[0]
     proba = model.predict_proba(X_scaled)[0]
 
+    # Class order from the trained model: [AWAY_WIN=0, DRAW=1, HOME_WIN=2]
+    raw_home = float(proba[2])
+    raw_draw = float(proba[1])
+    raw_away = float(proba[0])
+
+    # Apply calibration if available — single-T rescaling preserves argmax
+    calibrator = model_data.get('calibrator') if apply_calibration else None
+    if calibrator is not None:
+        # Calibrator expects same class order as `proba`
+        scaled = calibrator.transform(np.asarray(proba))
+        home_prob = float(scaled[2])
+        draw_prob = float(scaled[1])
+        away_prob = float(scaled[0])
+        is_calibrated = True
+    else:
+        home_prob, draw_prob, away_prob = raw_home, raw_draw, raw_away
+        is_calibrated = False
+
+    # Argmax doesn't change under temperature scaling — compute from either
+    pred_idx = int(np.argmax([away_prob, draw_prob, home_prob]))
     outcome_map = {0: 'AWAY_WIN', 1: 'DRAW', 2: 'HOME_WIN'}
-    home_prob = float(proba[2])
-    draw_prob = float(proba[1])
-    away_prob = float(proba[0])
 
     return {
-        'outcome': outcome_map.get(int(pred), 'UNKNOWN'),
+        'outcome': outcome_map.get(pred_idx, 'UNKNOWN'),
         'probabilities': {
             'home_win': round(home_prob, 4),
             'draw': round(draw_prob, 4),
             'away_win': round(away_prob, 4),
         },
-        'confidence': round(float(max(proba)), 4),
+        # Always surface the raw (pre-calibration) probs alongside so consumers
+        # that want to compare calibrated vs raw (e.g. /api/predictions/calibration
+        # in 'raw' mode) can do so without re-running inference.
+        'raw_probabilities': {
+            'home_win': round(raw_home, 4),
+            'draw': round(raw_draw, 4),
+            'away_win': round(raw_away, 4),
+        },
+        'calibrated': is_calibrated,
+        'confidence': round(max(home_prob, draw_prob, away_prob), 4),
         # Ensemble agreement is a proxy for prediction stability. High agreement
         # (>0.85) means XGBoost and RandomForest produced near-identical
         # distributions; low agreement (<0.7) means they materially disagree
