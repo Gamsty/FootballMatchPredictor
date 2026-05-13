@@ -24,6 +24,7 @@ import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
 import ValueBets from '../components/ValueBets';
 import CalibrationView from '../components/CalibrationView';
+import BetsView from '../components/BetsView';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
     calculateAccumulator
@@ -40,6 +41,7 @@ function Dashboard() {
     const [selectedMatch, setSelectedMatch] = useState(null);
     const [showAbout, setShowAbout] = useState(false);
     const [showCalibration, setShowCalibration] = useState(false);
+    const [showBets, setShowBets] = useState(false);
     const [filters, setFilters] = useState({
         categories: [],
     });
@@ -195,6 +197,15 @@ function Dashboard() {
                         title="Empirical check on whether model probabilities match actual win rates."
                     >
                         <span className="border-b border-ink-muted/40 hover:border-ink">Calibration</span>
+                        <span aria-hidden="true">→</span>
+                    </button>
+                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                    <button
+                        onClick={() => setShowBets(true)}
+                        className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                        title="Paper bet log + ROI / CLV tracking."
+                    >
+                        <span className="border-b border-ink-muted/40 hover:border-ink">Bets</span>
                         <span aria-hidden="true">→</span>
                     </button>
                 </div>
@@ -387,6 +398,9 @@ function Dashboard() {
 
             {/* Calibration Modal */}
             {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
+
+            {/* Bets Modal */}
+            {showBets && <BetsView onClose={() => setShowBets(false)} />}
         </div>
     );
 }

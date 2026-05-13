@@ -41,6 +41,8 @@ function ValueBets({ onSelectMatch }) {
     const [error, setError] = useState(null);
     const [minEdge, setMinEdge] = useState(0.03);
     const [books, setBooks] = useState('sharp');
+    const [pickToLog, setPickToLog] = useState(null);  // null or {pick, defaultStake}
+    const [logStatus, setLogStatus] = useState({});    // {matchId-marketKey: 'logged' | 'error'}
     const [bankroll, setBankroll] = useState(() => {
         const stored = Number(localStorage.getItem(BANKROLL_STORAGE_KEY));
         return Number.isFinite(stored) && stored > 0 ? stored : 1000;
@@ -382,7 +384,7 @@ function ValueBets({ onSelectMatch }) {
                                                 </div>
 
                                                 {/* Kelly stake — actual NOK + % of roll */}
-                                                <div className="min-w-[110px] ml-auto text-right">
+                                                <div className="min-w-[110px] text-right">
                                                     <div className="eyebrow">¼-Kelly stake</div>
                                                     <div className="mono text-sm text-ink mt-0.5">
                                                         {bankroll > 0 ? (
@@ -396,6 +398,29 @@ function ValueBets({ onSelectMatch }) {
                                                             <span className="text-ink-muted text-xs">Set bankroll →</span>
                                                         )}
                                                     </div>
+                                                </div>
+
+                                                {/* Log Bet — opens modal pre-filled with this pick.
+                                                    Defaults stake to Kelly-suggested amount when bankroll is set. */}
+                                                <div className="ml-auto">
+                                                    {logStatus[`${pick.match_id}-${pick.market}-${pick.outcome_key}`] === 'logged' ? (
+                                                        <span className="mono text-[0.65rem] uppercase tracking-[0.12em] text-positive border-b border-positive/40">
+                                                            Logged ✓
+                                                        </span>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => setPickToLog({
+                                                                pick,
+                                                                defaultStake: bankroll > 0
+                                                                    ? Math.round(kellyStake)
+                                                                    : 100,
+                                                            })}
+                                                            className="mono text-[0.65rem] uppercase tracking-[0.12em] px-2 py-1 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
+                                                            title="Log this pick as a paper bet. Settled automatically when the match finishes."
+                                                        >
+                                                            Log bet
+                                                        </button>
+                                                    )}
                                                 </div>
                                             </div>
                                         );
@@ -414,6 +439,20 @@ function ValueBets({ onSelectMatch }) {
                 </div>
             )}
 
+            {/* Log Bet modal */}
+            {pickToLog && (
+                <LogBetModal
+                    pick={pickToLog.pick}
+                    defaultStake={pickToLog.defaultStake}
+                    onClose={() => setPickToLog(null)}
+                    onLogged={() => {
+                        const key = `${pickToLog.pick.match_id}-${pickToLog.pick.market}-${pickToLog.pick.outcome_key}`;
+                        setLogStatus(prev => ({ ...prev, [key]: 'logged' }));
+                        setPickToLog(null);
+                    }}
+                />
+            )}
+
             {/* Footnote */}
             {picks.length > 0 && (
                 <p className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted mt-6 leading-relaxed">
@@ -426,6 +465,180 @@ function ValueBets({ onSelectMatch }) {
                     not real value.
                 </p>
             )}
+        </div>
+    );
+}
+
+// ----------------------------------------------------------------------------
+// LogBetModal — confirms a picked bet before POSTing to /api/bets.
+// Pre-filled from the picked outcome; user can override stake + bookmaker.
+// ----------------------------------------------------------------------------
+
+function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
+    const [stake, setStake] = useState(defaultStake);
+    const [bookmaker, setBookmaker] = useState(pick.bookmaker || '');
+    const [notes, setNotes] = useState('');
+    const [submitting, setSubmitting] = useState(false);
+    const [error, setError] = useState(null);
+
+    const handleSubmit = async () => {
+        if (!stake || stake <= 0) {
+            setError('Stake must be > 0');
+            return;
+        }
+        setSubmitting(true);
+        setError(null);
+        try {
+            await footballAPI.createBet({
+                match_id: pick.match_id,
+                market: pick.market,
+                outcome_key: pick.outcome_key,
+                outcome_label: pick.outcome,
+                odds_at_bet: pick.odds,
+                stake: Number(stake),
+                bookmaker: bookmaker || pick.bookmaker || null,
+                model_prob_at_bet: pick.prob,
+                edge_at_bet: pick.edge_best ?? pick.edge,
+                notes: notes || null,
+                placed_via: 'frontend',
+            });
+            onLogged();
+        } catch (err) {
+            // Log to console too so devs can see the full axios error shape
+            console.error('Bet log error:', err);
+            let detail = err.response?.data?.error;
+            if (!detail) {
+                // No response body → likely network/CORS. Tell the user what's
+                // probably wrong instead of just "Network Error".
+                if (err.message?.includes('Network')) {
+                    detail = 'Could not reach the backend. If you are running ' +
+                             "frontend locally, check that VITE_API_URL in " +
+                             ".env.development points to the right URL " +
+                             "(localhost:5000/api for local backend).";
+                } else {
+                    detail = err.message || 'Failed to log bet';
+                }
+            }
+            setError(detail);
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    const potentialReturn = stake * pick.odds;
+    const potentialProfit = potentialReturn - stake;
+
+    return (
+        <div
+            className="fixed inset-0 z-50 bg-ink/60 flex items-center justify-center p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+            <div className="bg-paper w-full max-w-md border border-line">
+                <div className="flex items-start justify-between px-5 py-4 border-b border-line">
+                    <div>
+                        <div className="eyebrow mb-1">Log paper bet</div>
+                        <div className="display text-xl text-ink">
+                            {pick.outcome}<span className="text-accent">.</span>
+                        </div>
+                        <div className="mono text-[0.65rem] text-ink-muted mt-1">
+                            {pick.home_team?.name} vs {pick.away_team?.name}
+                        </div>
+                    </div>
+                    <button
+                        onClick={onClose}
+                        className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer"
+                        aria-label="Close"
+                    >×</button>
+                </div>
+
+                <div className="px-5 py-5 space-y-4">
+                    <div className="grid grid-cols-2 gap-3">
+                        <ReadOnlyField label="Odds" value={pick.odds.toFixed(2)} />
+                        <ReadOnlyField label="Model prob" value={pct(pick.prob)} />
+                        <ReadOnlyField label="Edge"
+                            value={`+${pct(pick.edge_best ?? pick.edge)}`}
+                            className={(pick.edge_best ?? pick.edge) >= SUSPICIOUS_EDGE ? 'text-warning' : 'text-positive'} />
+                        <ReadOnlyField label="Suggested book" value={pick.bookmaker || '—'} />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Stake (NOK)</label>
+                        <input
+                            type="number"
+                            min="1"
+                            step="10"
+                            value={stake}
+                            onChange={(e) => setStake(Number(e.target.value))}
+                            className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                            autoFocus
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Bookmaker (optional)</label>
+                        <input
+                            type="text"
+                            value={bookmaker}
+                            onChange={(e) => setBookmaker(e.target.value)}
+                            placeholder={pick.bookmaker || 'Where you placed the bet'}
+                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Notes (optional)</label>
+                        <input
+                            type="text"
+                            value={notes}
+                            onChange={(e) => setNotes(e.target.value)}
+                            placeholder="Why this pick, what you'd compare against, etc."
+                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div className="bg-paper-tint border-l-2 border-accent px-3 py-2.5">
+                        <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
+                            Potential return
+                        </div>
+                        <div className="display text-lg text-ink mt-0.5">
+                            {Math.round(potentialReturn).toLocaleString()} NOK
+                            <span className="mono text-xs text-positive ml-2">
+                                +{Math.round(potentialProfit).toLocaleString()}
+                            </span>
+                        </div>
+                    </div>
+
+                    {error && (
+                        <div className="text-danger text-sm">{error}</div>
+                    )}
+                </div>
+
+                <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-line bg-paper-tint">
+                    <button
+                        onClick={onClose}
+                        disabled={submitting}
+                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onClick={handleSubmit}
+                        disabled={submitting}
+                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                        {submitting ? 'Logging…' : 'Log bet'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function ReadOnlyField({ label, value, className = 'text-ink' }) {
+    return (
+        <div>
+            <div className="eyebrow">{label}</div>
+            <div className={'mono text-sm mt-0.5 ' + className}>{value}</div>
         </div>
     );
 }

@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "temperature": 0.783149651610781,
-  "fit_samples": 2000,
-  "fit_nll_before": 1794.4095803414345,
-  "fit_nll_after": 1778.320004034187
+  "temperature": 0.7994983432412344,
+  "fit_samples": 2569,
+  "fit_nll_before": 2320.922306235424,
+  "fit_nll_after": 2303.796625597572
 }

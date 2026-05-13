@@ -91,6 +91,24 @@ export const footballAPI = {
         return response.data;
     },
 
+    // Bet logging — paper or real bets, settled automatically when match finishes
+    listBets: async (params = {}, { signal } = {}) => {
+        const response = await api.get('/bets', { params, signal });
+        return response.data;
+    },
+    createBet: async (payload) => {
+        const response = await api.post('/bets', payload);
+        return response.data;
+    },
+    deleteBet: async (betId) => {
+        const response = await api.delete(`/bets/${betId}`);
+        return response.data;
+    },
+    getBetsPerformance: async (params = {}, { signal } = {}) => {
+        const response = await api.get('/bets/performance', { params, signal });
+        return response.data;
+    },
+
     // Matches — supports filters: { season, team_id, status, limit }
     getMatches: async (params = {}) => {
         const response = await api.get('/matches', { params });

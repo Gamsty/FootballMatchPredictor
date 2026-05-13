@@ -179,6 +179,64 @@ class TestSerialization:
 # ECE helper — sanity that fit actually improves it
 # ----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# IsotonicCalibrator — per-outcome flexibility
+# ----------------------------------------------------------------------------
+
+class TestIsotonic:
+    def _make_synthetic(self, n=1500, seed=0):
+        rng = np.random.default_rng(seed)
+        true_probs = rng.dirichlet([2, 2, 2], size=n)
+        labels = np.array([rng.choice(3, p=p) for p in true_probs])
+        return true_probs, labels
+
+    def test_isotonic_fit_and_transform_shape(self):
+        from calibrator import IsotonicCalibrator
+        probs, labels = self._make_synthetic(n=800)
+        cal = IsotonicCalibrator().fit(probs, labels,
+                                        class_names=['AWAY_WIN', 'DRAW', 'HOME_WIN'])
+        out = cal.transform(probs)
+        assert out.shape == probs.shape
+        # Each row sums to 1
+        np.testing.assert_allclose(out.sum(axis=1), 1.0, atol=1e-9)
+        # 3 per-class models stored
+        assert len(cal.models) == 3
+        assert cal.fit_samples == 800
+
+    def test_isotonic_reduces_nll(self):
+        from calibrator import IsotonicCalibrator
+        # Distort the true probs to create miscalibration
+        probs, labels = self._make_synthetic(n=2000)
+        distorted = TemperatureCalibrator._transform(probs, 1.7)
+        cal = IsotonicCalibrator().fit(distorted, labels)
+        assert cal.fit_nll_after < cal.fit_nll_before
+
+    def test_isotonic_1d_input(self):
+        from calibrator import IsotonicCalibrator
+        probs, labels = self._make_synthetic(n=500)
+        cal = IsotonicCalibrator().fit(probs, labels)
+        single = np.array([0.5, 0.3, 0.2])
+        out = cal.transform(single)
+        assert out.shape == (3,)
+        assert abs(out.sum() - 1.0) < 1e-9
+
+    def test_isotonic_save_and_load_roundtrip(self):
+        from calibrator import IsotonicCalibrator
+        probs, labels = self._make_synthetic(n=500)
+        cal = IsotonicCalibrator().fit(probs, labels)
+        out_before = cal.transform(probs[:5])
+
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            cal.save(f.name)
+        try:
+            loaded = IsotonicCalibrator.load(f.name)
+            out_after = loaded.transform(probs[:5])
+            np.testing.assert_allclose(out_before, out_after, atol=1e-9)
+            assert loaded.fit_samples == 500
+        finally:
+            Path(f.name).unlink()
+
+
 def test_fit_reduces_ece_on_miscalibrated_data():
     rng = np.random.default_rng(123)
     n = 3000

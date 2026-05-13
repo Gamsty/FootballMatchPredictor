@@ -13,6 +13,10 @@ Endpoints:
     - /api/value-bets              — +EV picks: model probabilities vs bookmaker odds
     - /api/admin/odds-status       — Odds-API quota + per-bookmaker divergence stats
     - /api/admin/refit-calibration — Re-fit temperature scaling on historical data
+    - /api/bets                    — List/create paper bets
+    - /api/bets/<id>               — Detail / delete a bet
+    - /api/bets/performance        — Aggregate ROI, win rate, CLV across all bets
+    - /api/bets/settle             — Settle all pending bets against finished matches
     - /api/matches                 — List matches with optional filters
     - /api/matches/<id>            — Single match detail
     - /api/matches/upcoming        — Raw upcoming matches with basic predictions
@@ -33,13 +37,17 @@ import logging
 import os
 import re
 
-from database import DatabaseManager, Match, Team, Prediction, PredictionSnapshot, MatchFeatures, init_db
+from database import (
+    DatabaseManager, Match, Team, Prediction, PredictionSnapshot, MatchFeatures,
+    Bet, init_db,
+)
 from feature_engineering import FeatureEngineer
 from prediction_service import (
     compute_features, predict_match_result, predict_all_markets, classify_match
 )
 from cache import PredictionCache
 from calibrator import TemperatureCalibrator
+from pathlib import Path
 from model_storage import load_model_bytes
 from odds_api import OddsAPIClient
 from telemetry import setup_telemetry
@@ -124,22 +132,40 @@ def load_model():
         logger.warning(f"Multi-market models not found (optional): {e}")
         multi_market_models = None
 
-    # Load optional calibrator (TemperatureCalibrator). When present, attached
-    # to model_data so predict_match_result picks it up. Absence is fine —
-    # predictions just stay uncalibrated until fit_calibration runs.
+    # Load optional calibrator. Two kinds supported:
+    #   - calibrator.json (TemperatureCalibrator — preferred for production)
+    #   - calibrator_isotonic.pkl (IsotonicCalibrator — more flexible, less
+    #     stable across retrains, may not preserve argmax)
+    # If both exist, isotonic wins (newer/explicitly-chosen). Absence is fine
+    # — predictions stay uncalibrated.
     if model_data:
+        model_data['calibrator'] = None
+        # Try isotonic first
         try:
-            cal_bytes = load_model_bytes("calibrator.json")
-            import json as _json
-            cal = TemperatureCalibrator.from_dict(_json.loads(cal_bytes.decode('utf-8')))
+            from calibrator import IsotonicCalibrator
+            iso_bytes = load_model_bytes("calibrator_isotonic.pkl")
+            iso_path = Path(__file__).parent.parent / 'models' / 'calibrator_isotonic.pkl'
+            iso_path.parent.mkdir(parents=True, exist_ok=True)
+            iso_path.write_bytes(iso_bytes)
+            cal = IsotonicCalibrator.load(iso_path)
             model_data['calibrator'] = cal
             logger.info(
-                "Calibrator loaded",
-                extra={"temperature": cal.temperature, "fit_samples": cal.fit_samples},
+                "IsotonicCalibrator loaded",
+                extra={"fit_samples": cal.fit_samples, "classes": len(cal.models)},
             )
-        except Exception as e:
-            logger.info(f"No calibrator available — predictions stay uncalibrated: {e}")
-            model_data['calibrator'] = None
+        except Exception:
+            # Fall through to temperature
+            try:
+                cal_bytes = load_model_bytes("calibrator.json")
+                import json as _json
+                cal = TemperatureCalibrator.from_dict(_json.loads(cal_bytes.decode('utf-8')))
+                model_data['calibrator'] = cal
+                logger.info(
+                    "TemperatureCalibrator loaded",
+                    extra={"temperature": cal.temperature, "fit_samples": cal.fit_samples},
+                )
+            except Exception as e:
+                logger.info(f"No calibrator available — predictions stay uncalibrated: {e}")
 
 # Load models on startup
 load_model()
@@ -1164,10 +1190,15 @@ def get_prediction_calibration():
         calibrator = model_data.get('calibrator') if model_data else None
         cal_summary = None
         if calibrator is not None:
+            # Both calibrator types expose fit_samples + has a different defining
+            # attribute. Probe to figure out which one's active.
             cal_summary = {
-                'temperature': round(calibrator.temperature, 4),
                 'fit_samples': calibrator.fit_samples,
+                'kind': 'isotonic' if hasattr(calibrator, 'models') and calibrator.models
+                        else 'temperature',
             }
+            if hasattr(calibrator, 'temperature'):
+                cal_summary['temperature'] = round(calibrator.temperature, 4)
 
         return jsonify({
             'outcome': outcome,
@@ -1184,6 +1215,319 @@ def get_prediction_calibration():
 
     except Exception as e:
         return _error_response("Failed to compute calibration", 500, e, endpoint="calibration")
+
+
+# ============================================================================
+# BETS — paper bet logging + ROI / CLV tracking
+# ============================================================================
+
+# Result mapping per market — which actual_winner / score outcomes constitute a win
+_BET_OUTCOME_RESOLVERS = {
+    'h2h': {
+        'home': lambda m: m.winner == 'HOME_TEAM',
+        'draw': lambda m: m.winner == 'DRAW',
+        'away': lambda m: m.winner == 'AWAY_TEAM',
+    },
+    'totals_2_5': {
+        'over':  lambda m: (m.home_score or 0) + (m.away_score or 0) > 2.5,
+        'under': lambda m: (m.home_score or 0) + (m.away_score or 0) < 2.5,
+    },
+    'btts': {
+        'yes': lambda m: (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
+        'no':  lambda m: (m.home_score or 0) == 0 or (m.away_score or 0) == 0,
+    },
+}
+
+
+def _settle_one_bet(bet: Bet, match: Match) -> bool:
+    """
+    Resolve a single bet against the finished match. Returns True if a change
+    was made (bet became won/lost/void). Idempotent: settled bets are skipped.
+    """
+    if bet.status != 'pending':
+        return False
+    if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
+        return False
+
+    resolver = _BET_OUTCOME_RESOLVERS.get(bet.market, {}).get(bet.outcome_key)
+    if resolver is None:
+        # Unknown market/outcome — mark void so it doesn't stay pending forever
+        bet.status = 'void'
+        bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        bet.profit_loss = 0.0
+        return True
+
+    won = bool(resolver(match))
+    bet.status = 'won' if won else 'lost'
+    bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    # P/L = stake * (odds - 1) on win; -stake on loss
+    bet.profit_loss = bet.stake * (bet.odds_at_bet - 1.0) if won else -bet.stake
+    return True
+
+
+def _settle_pending_bets(match_ids: list[int] | None = None) -> int:
+    """
+    Walk all pending bets, settle any whose match is finished. Returns count
+    settled. Called by /api/bets/settle and the load-data pipeline.
+
+    If match_ids is provided, restrict to those matches (efficient when called
+    after a fixture-refresh that only updated a subset).
+    """
+    q = db.session.query(Bet).filter(Bet.status == 'pending')
+    if match_ids:
+        q = q.filter(Bet.match_id.in_(match_ids))
+    pending = q.all()
+    settled = 0
+    for bet in pending:
+        match = db.session.query(Match).filter_by(id=bet.match_id).first()
+        if match and _settle_one_bet(bet, match):
+            settled += 1
+    if settled:
+        db.session.commit()
+    return settled
+
+
+def _bet_to_dict(bet: Bet) -> dict:
+    match = bet.match
+    return {
+        'id': bet.id,
+        'match_id': bet.match_id,
+        'match': {
+            'home': match.home_team.name if match and match.home_team else None,
+            'away': match.away_team.name if match and match.away_team else None,
+            'date': match.date.isoformat() if match and match.date else None,
+            'competition': match.competition if match else None,
+            'status': match.status if match else None,
+            'home_score': match.home_score if match else None,
+            'away_score': match.away_score if match else None,
+            'winner': match.winner if match else None,
+        },
+        'market': bet.market,
+        'outcome_key': bet.outcome_key,
+        'outcome_label': bet.outcome_label,
+        'odds_at_bet': bet.odds_at_bet,
+        'closing_odds': bet.closing_odds,
+        'stake': bet.stake,
+        'bookmaker': bet.bookmaker,
+        'model_prob_at_bet': bet.model_prob_at_bet,
+        'edge_at_bet': bet.edge_at_bet,
+        'model_version_at_bet': bet.model_version_at_bet,
+        'status': bet.status,
+        'placed_at': bet.placed_at.isoformat() if bet.placed_at else None,
+        'settled_at': bet.settled_at.isoformat() if bet.settled_at else None,
+        'profit_loss': bet.profit_loss,
+        'notes': bet.notes,
+    }
+
+
+@app.route('/api/bets', methods=['GET', 'POST'])
+def bets_collection():
+    """
+    GET — list bets, newest first. Query params:
+        status: 'pending' | 'won' | 'lost' | 'void' (optional)
+        limit:  int (default 100, max 500)
+
+    POST — log a new bet. JSON body:
+        {
+            "match_id":           int (required),
+            "market":             "h2h" | "totals_2_5" | "btts" (required),
+            "outcome_key":        "home"/"draw"/"away"/... (required),
+            "odds_at_bet":        float (required, > 1.0),
+            "stake":              float (required, > 0),
+            "bookmaker":          str (optional),
+            "outcome_label":      str (optional, free text e.g. "Home Win"),
+            "model_prob_at_bet":  float (optional),
+            "edge_at_bet":        float (optional),
+            "notes":              str (optional),
+        }
+        Response: created bet dict (201) or {error: ...} (400/404).
+    """
+    if request.method == 'GET':
+        try:
+            status = request.args.get('status')
+            limit = max(1, min(request.args.get('limit', 100, type=int) or 100, 500))
+            # Auto-settle any pending bets whose match has finished — keeps the
+            # list view honest without requiring a manual /settle call.
+            _settle_pending_bets()
+            q = db.session.query(Bet)
+            if status in ('pending', 'won', 'lost', 'void'):
+                q = q.filter(Bet.status == status)
+            bets = q.order_by(desc(Bet.placed_at)).limit(limit).all()
+            return jsonify({'bets': [_bet_to_dict(b) for b in bets], 'count': len(bets)}), 200
+        except Exception as e:
+            return _error_response("Failed to load bets", 500, e, endpoint="bets_list")
+
+    # POST
+    try:
+        data = request.get_json(silent=True) or {}
+        required = ['match_id', 'market', 'outcome_key', 'odds_at_bet', 'stake']
+        missing = [k for k in required if k not in data]
+        if missing:
+            return jsonify({'error': f'Missing fields: {", ".join(missing)}'}), 400
+
+        try:
+            match_id = int(data['match_id'])
+            odds = float(data['odds_at_bet'])
+            stake = float(data['stake'])
+        except (TypeError, ValueError):
+            return jsonify({'error': 'match_id must be int; odds_at_bet/stake numeric'}), 400
+
+        if odds <= 1.0:
+            return jsonify({'error': 'odds_at_bet must be > 1.0'}), 400
+        if stake <= 0:
+            return jsonify({'error': 'stake must be > 0'}), 400
+
+        market = data['market']
+        outcome_key = data['outcome_key']
+        if market not in _BET_OUTCOME_RESOLVERS:
+            return jsonify({'error': f'Unsupported market: {market}'}), 400
+        if outcome_key not in _BET_OUTCOME_RESOLVERS[market]:
+            return jsonify({'error': f'Unsupported outcome_key for {market}: {outcome_key}'}), 400
+
+        match = db.session.query(Match).filter_by(id=match_id).first()
+        if not match:
+            return jsonify({'error': 'Match not found'}), 404
+
+        bet = Bet(
+            match_id=match_id,
+            market=market,
+            outcome_key=outcome_key,
+            outcome_label=data.get('outcome_label'),
+            odds_at_bet=odds,
+            stake=stake,
+            bookmaker=data.get('bookmaker'),
+            model_prob_at_bet=data.get('model_prob_at_bet'),
+            edge_at_bet=data.get('edge_at_bet'),
+            model_version_at_bet=str((model_data or {}).get('model_version') or 'unversioned'),
+            notes=(data.get('notes') or None),
+            placed_via=data.get('placed_via', 'manual'),
+        )
+        db.session.add(bet)
+        db.session.commit()
+
+        # If the match is already finished (logging a historical bet), settle immediately
+        _settle_one_bet(bet, match)
+        db.session.commit()
+
+        return jsonify(_bet_to_dict(bet)), 201
+    except Exception as e:
+        db.session.rollback()
+        return _error_response("Failed to create bet", 500, e, endpoint="bets_create")
+
+
+@app.route('/api/bets/<int:bet_id>', methods=['GET', 'DELETE'])
+def bet_detail(bet_id):
+    """Get or delete a specific bet."""
+    bet = db.session.query(Bet).filter_by(id=bet_id).first()
+    if not bet:
+        return jsonify({'error': 'Bet not found'}), 404
+    if request.method == 'DELETE':
+        try:
+            db.session.delete(bet)
+            db.session.commit()
+            return jsonify({'deleted': True, 'id': bet_id}), 200
+        except Exception as e:
+            db.session.rollback()
+            return _error_response("Failed to delete bet", 500, e, endpoint="bet_delete")
+    return jsonify(_bet_to_dict(bet)), 200
+
+
+@app.route('/api/bets/settle', methods=['POST'])
+def bets_settle():
+    """Force-settle all pending bets against currently finished matches."""
+    try:
+        n = _settle_pending_bets()
+        return jsonify({'settled': n}), 200
+    except Exception as e:
+        return _error_response("Failed to settle bets", 500, e, endpoint="bets_settle")
+
+
+@app.route('/api/bets/performance', methods=['GET'])
+def bets_performance():
+    """
+    Aggregate ROI, win rate, edge realisation, CLV across all settled bets.
+
+    Query params:
+        market:  optional filter ('h2h', 'totals_2_5', 'btts')
+        since:   optional ISO date (only bets placed on/after)
+
+    Response includes per-market breakdown and a CLV summary when closing
+    odds are available.
+    """
+    try:
+        # Settle pending so stats are current
+        _settle_pending_bets()
+
+        q = db.session.query(Bet)
+        if (m := request.args.get('market')):
+            q = q.filter(Bet.market == m)
+        if (since := request.args.get('since')):
+            try:
+                since_dt = datetime.fromisoformat(since)
+                q = q.filter(Bet.placed_at >= since_dt)
+            except ValueError:
+                return jsonify({'error': 'since must be ISO date'}), 400
+
+        bets = q.all()
+        if not bets:
+            return jsonify({
+                'total_bets': 0,
+                'message': 'No bets logged yet. Log paper bets via the Value tab to populate this view.',
+            }), 200
+
+        settled = [b for b in bets if b.status in ('won', 'lost')]
+        pending = [b for b in bets if b.status == 'pending']
+        won = [b for b in settled if b.status == 'won']
+
+        total_stake = sum(b.stake for b in settled)
+        total_pl = sum(b.profit_loss or 0 for b in settled)
+        roi = (total_pl / total_stake) if total_stake > 0 else 0.0
+
+        # Edge realisation: average edge vs realised win rate
+        avg_edge = sum(b.edge_at_bet or 0 for b in settled) / len(settled) if settled else 0
+        avg_model_prob = sum(b.model_prob_at_bet or 0 for b in settled) / len(settled) if settled else 0
+        win_rate = len(won) / len(settled) if settled else 0
+
+        # CLV: avg of (placed_odds / closing_odds - 1). Positive = bet at better
+        # price than the eventual closing line. Only includes bets with closing.
+        clv_bets = [b for b in settled if b.closing_odds and b.closing_odds > 1.0]
+        avg_clv = (sum(b.odds_at_bet / b.closing_odds - 1 for b in clv_bets) / len(clv_bets)
+                   if clv_bets else None)
+
+        # Per-market breakdown
+        by_market: dict[str, dict] = {}
+        for b in settled:
+            m = b.market
+            agg = by_market.setdefault(m, {'count': 0, 'stake': 0.0, 'pl': 0.0, 'won': 0})
+            agg['count'] += 1
+            agg['stake'] += b.stake
+            agg['pl'] += b.profit_loss or 0
+            if b.status == 'won':
+                agg['won'] += 1
+        for m, agg in by_market.items():
+            agg['roi'] = round(agg['pl'] / agg['stake'], 4) if agg['stake'] > 0 else 0
+            agg['win_rate'] = round(agg['won'] / agg['count'], 4) if agg['count'] else 0
+            agg['stake'] = round(agg['stake'], 2)
+            agg['pl'] = round(agg['pl'], 2)
+
+        return jsonify({
+            'total_bets': len(bets),
+            'settled_count': len(settled),
+            'pending_count': len(pending),
+            'won_count': len(won),
+            'total_stake': round(total_stake, 2),
+            'total_profit_loss': round(total_pl, 2),
+            'roi': round(roi, 4),
+            'win_rate': round(win_rate, 4),
+            'avg_edge_at_bet': round(avg_edge, 4),
+            'avg_model_prob_at_bet': round(avg_model_prob, 4),
+            'expected_win_rate': round(avg_model_prob, 4),  # alias for clarity
+            'avg_clv': round(avg_clv, 4) if avg_clv is not None else None,
+            'clv_sample_size': len(clv_bets),
+            'by_market': by_market,
+        }), 200
+    except Exception as e:
+        return _error_response("Failed to compute performance", 500, e, endpoint="bets_performance")
 
 
 # ============================================================================

@@ -1,0 +1,47 @@
+{
+  "summary": {
+    "strategy": "flat",
+    "min_edge": 0.05,
+    "max_edge": 0.3,
+    "starting_bankroll": 10000.0,
+    "ending_bankroll": 10000.0,
+    "total_bets": 0,
+    "total_wins": 0,
+    "win_rate": 0,
+    "total_stake": 0.0,
+    "total_pl": 0.0,
+    "roi": 0,
+    "per_market": {
+      "home": {
+        "bets": 0,
+        "won": 0,
+        "stake": 0.0,
+        "pl": 0.0,
+        "roi": 0,
+        "win_rate": 0
+      },
+      "draw": {
+        "bets": 0,
+        "won": 0,
+        "stake": 0.0,
+        "pl": 0.0,
+        "roi": 0,
+        "win_rate": 0
+      },
+      "away": {
+        "bets": 0,
+        "won": 0,
+        "stake": 0.0,
+        "pl": 0.0,
+        "roi": 0,
+        "win_rate": 0
+      }
+    },
+    "skipped_no_odds": 0,
+    "skipped_low_edge": 0,
+    "skipped_too_high_edge": 0,
+    "matches_seen": 2012
+  },
+  "bets": [],
+  "equity_curve": []
+}

@@ -48,7 +48,7 @@ import joblib
 import numpy as np
 from sqlalchemy import and_
 
-from calibrator import TemperatureCalibrator, expected_calibration_error
+from calibrator import TemperatureCalibrator, IsotonicCalibrator, expected_calibration_error
 from database import DatabaseManager, Match
 from feature_engineering import FeatureEngineer
 from model_storage import load_model_bytes, upload_model
@@ -71,7 +71,11 @@ def main() -> int:
                         help='Cap on matches sampled for the fit (default 5000). '
                              'Larger samples reduce fit variance but take longer.')
     parser.add_argument('--no-upload', action='store_true',
-                        help='Write only to backend/models/calibrator.json, skip blob upload.')
+                        help='Write only locally, skip blob upload.')
+    parser.add_argument('--method', choices=['temperature', 'isotonic'], default='temperature',
+                        help='Calibration method. temperature (default) is one-parameter and '
+                             'preserves argmax. isotonic is per-outcome (more flexible) but '
+                             'can flip which class is predicted on borderline matches.')
     args = parser.parse_args()
 
     if args.since:
@@ -137,43 +141,58 @@ def main() -> int:
 
     probs_arr = np.array(probs, dtype=float)
     labels_arr = np.array(labels, dtype=int)
-    logger.info("Fitting temperature on %d samples (skipped %d)", len(probs_arr), skipped)
+    logger.info("Fitting %s on %d samples (skipped %d)", args.method, len(probs_arr), skipped)
 
     # Fit
-    cal = TemperatureCalibrator().fit(probs_arr, labels_arr)
+    if args.method == 'isotonic':
+        cal = IsotonicCalibrator().fit(probs_arr, labels_arr,
+                                        class_names=['AWAY_WIN', 'DRAW', 'HOME_WIN'])
+    else:
+        cal = TemperatureCalibrator().fit(probs_arr, labels_arr)
 
     # Diagnostics: ECE before and after
     ece_before = expected_calibration_error(probs_arr, labels_arr, bins=10)
-    ece_after = expected_calibration_error(cal.transform(probs_arr), labels_arr, bins=10)
-    nll_reduction = (cal.fit_nll_before - cal.fit_nll_after) / cal.fit_nll_before
-    accuracy = (probs_arr.argmax(axis=1) == labels_arr).mean()
+    scaled = cal.transform(probs_arr)
+    ece_after = expected_calibration_error(scaled, labels_arr, bins=10)
+    nll_reduction = (cal.fit_nll_before - cal.fit_nll_after) / cal.fit_nll_before if cal.fit_nll_before else 0
+    raw_acc = (probs_arr.argmax(axis=1) == labels_arr).mean()
+    cal_acc = (scaled.argmax(axis=1) == labels_arr).mean()
 
     logger.info("=" * 60)
-    logger.info("FIT RESULTS")
+    logger.info("FIT RESULTS — method=%s", args.method)
     logger.info("=" * 60)
-    logger.info("Optimal temperature: %.4f", cal.temperature)
-    if cal.temperature < 0.95:
-        logger.info("  (T < 1 → model was under-dispersed; rescaled probs are sharper)")
-    elif cal.temperature > 1.05:
-        logger.info("  (T > 1 → model was over-confident; rescaled probs are softer)")
-    else:
-        logger.info("  (T ≈ 1 → model was already well-calibrated)")
+    if args.method == 'temperature':
+        logger.info("Optimal temperature: %.4f", cal.temperature)
+        if cal.temperature < 0.95:
+            logger.info("  (T < 1 → model was under-dispersed; rescaled probs are sharper)")
+        elif cal.temperature > 1.05:
+            logger.info("  (T > 1 → model was over-confident; rescaled probs are softer)")
+        else:
+            logger.info("  (T ≈ 1 → model was already well-calibrated)")
     logger.info("ECE before: %.4f → after: %.4f (Δ %+.4f)",
                 ece_before, ece_after, ece_after - ece_before)
     logger.info("NLL  before: %.2f → after: %.2f  (improvement: %.2f%%)",
                 cal.fit_nll_before, cal.fit_nll_after, nll_reduction * 100)
-    logger.info("Argmax accuracy (unchanged by T scaling): %.4f", accuracy)
+    logger.info("Argmax accuracy: raw=%.4f, calibrated=%.4f%s",
+                raw_acc, cal_acc,
+                "  ← changed (isotonic can flip class)" if abs(raw_acc - cal_acc) > 1e-6 else "")
     logger.info("=" * 60)
 
-    # Persist
-    out_path = Path(__file__).parent.parent / 'models' / 'calibrator.json'
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Persist — different filename per method so both can coexist on disk
+    out_dir = Path(__file__).parent.parent / 'models'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.method == 'isotonic':
+        out_path = out_dir / 'calibrator_isotonic.pkl'
+        blob_name = 'calibrator_isotonic.pkl'
+    else:
+        out_path = out_dir / 'calibrator.json'
+        blob_name = 'calibrator.json'
     cal.save(out_path)
     logger.info("Saved locally to %s", out_path)
 
     if not args.no_upload and os.getenv('USE_BLOB_STORAGE', '').lower() == 'true':
-        upload_model(out_path, 'calibrator.json')
-        logger.info("Uploaded to blob storage")
+        upload_model(out_path, blob_name)
+        logger.info("Uploaded to blob storage as %s", blob_name)
     else:
         logger.info("Skipping blob upload (USE_BLOB_STORAGE != true, or --no-upload set)")
 

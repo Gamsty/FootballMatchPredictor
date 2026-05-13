@@ -139,6 +139,115 @@ class TemperatureCalibrator:
         return cls.from_dict(json.loads(Path(path).read_text()))
 
 
+class IsotonicCalibrator:
+    """
+    Per-outcome isotonic regression — more flexible than temperature scaling.
+
+    Where temperature scaling can only apply one global "sharpness" knob,
+    isotonic regression learns a separate monotonic transformation per class.
+    This fits asymmetric miscalibration shapes (e.g. our T=0.80 reduced ECE
+    by ~30% but high-confidence draws stayed broken at +13pp because a single
+    T can't bend the draw curve differently from home/away).
+
+    Trade-off: per-class fitting means the normalized output is NO LONGER
+    guaranteed to preserve argmax. A match where raw probs say HOME=0.45,
+    DRAW=0.35 could end up DRAW=0.42, HOME=0.40 after calibration. We
+    document this clearly so downstream code knows to recompute `outcome`
+    from the calibrated probs (which predict_match_result already does).
+
+    Fit requires sklearn's IsotonicRegression. Predicts return-normalised
+    probs that sum to 1.
+    """
+
+    def __init__(self, models: list | None = None, class_names: list[str] | None = None):
+        # `models` is a list of fitted IsotonicRegression instances, one per class.
+        # Wrapped this way so we can serialize via joblib's standard pkl path.
+        self.models = models or []
+        self.class_names = class_names or []
+        self.fit_samples: int | None = None
+        self.fit_nll_before: float | None = None
+        self.fit_nll_after: float | None = None
+
+    def fit(self, probs: np.ndarray, labels: np.ndarray,
+            class_names: list[str] | None = None) -> 'IsotonicCalibrator':
+        """
+        Args:
+            probs:  (N, K) raw model probabilities
+            labels: (N,)   integer class labels in [0, K)
+            class_names: optional human-readable class names (logged for clarity)
+        """
+        from sklearn.isotonic import IsotonicRegression
+
+        probs = np.asarray(probs, dtype=float)
+        labels = np.asarray(labels, dtype=int)
+        if probs.ndim != 2:
+            raise ValueError(f"probs must be 2-D, got shape {probs.shape}")
+        if len(probs) != len(labels):
+            raise ValueError(f"probs/labels length mismatch: {len(probs)} vs {len(labels)}")
+
+        n_classes = probs.shape[1]
+        self.class_names = class_names or [f"class_{i}" for i in range(n_classes)]
+        self.fit_samples = len(probs)
+
+        # Pre-fit NLL for diagnostics
+        row_idx = np.arange(len(probs))
+        clipped_before = np.clip(probs[row_idx, labels], 1e-12, 1.0)
+        self.fit_nll_before = float(-np.sum(np.log(clipped_before)))
+
+        # Fit one isotonic regression per class: P(actual=class | raw_prob_for_class)
+        self.models = []
+        for k in range(n_classes):
+            iso = IsotonicRegression(y_min=1e-6, y_max=1 - 1e-6, out_of_bounds='clip')
+            iso.fit(probs[:, k], (labels == k).astype(float))
+            self.models.append(iso)
+
+        # Post-fit NLL on the transformed probs
+        scaled = self.transform(probs)
+        clipped_after = np.clip(scaled[row_idx, labels], 1e-12, 1.0)
+        self.fit_nll_after = float(-np.sum(np.log(clipped_after)))
+        return self
+
+    def transform(self, probs: np.ndarray) -> np.ndarray:
+        """Apply per-class isotonic transform, then renormalise to sum=1."""
+        was_1d = probs.ndim == 1
+        if was_1d:
+            probs = probs.reshape(1, -1)
+        if not self.models:
+            return probs[0] if was_1d else probs
+        out = np.zeros_like(probs, dtype=float)
+        for k, model in enumerate(self.models):
+            out[:, k] = model.predict(probs[:, k])
+        # Normalize each row to 1
+        row_sums = out.sum(axis=1, keepdims=True)
+        # Avoid /0 if all classes mapped to ~0 (edge case)
+        row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        out = out / row_sums
+        return out[0] if was_1d else out
+
+    def save(self, path: str | Path) -> None:
+        """Joblib (pkl) save — IsotonicRegression doesn't json-serialize."""
+        import joblib
+        joblib.dump({
+            'version': 1,
+            'kind': 'isotonic',
+            'models': self.models,
+            'class_names': self.class_names,
+            'fit_samples': self.fit_samples,
+            'fit_nll_before': self.fit_nll_before,
+            'fit_nll_after': self.fit_nll_after,
+        }, path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> 'IsotonicCalibrator':
+        import joblib
+        d = joblib.load(path)
+        cal = cls(models=d['models'], class_names=d.get('class_names', []))
+        cal.fit_samples = d.get('fit_samples')
+        cal.fit_nll_before = d.get('fit_nll_before')
+        cal.fit_nll_after = d.get('fit_nll_after')
+        return cal
+
+
 def expected_calibration_error(probs: np.ndarray, labels: np.ndarray,
                                 bins: int = 10) -> float:
     """

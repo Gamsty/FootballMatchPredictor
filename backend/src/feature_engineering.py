@@ -525,6 +525,81 @@ class FeatureEngineer:
         else:  # Jan=0.5, May=0.9
             return round((month + 4) / 10, 3)
 
+    # ------------------------------------------------------------------
+    # v2 motivation features — used by next-retrained models.
+    # All take a `standing` dict shaped like {'league_position', 'points',
+    # 'points_from_top', 'points_from_relegation', ...} as produced by
+    # get_standing_features().
+    # ------------------------------------------------------------------
+
+    def _is_safe(self, standing: dict) -> int:
+        """
+        1 if the team is in 'mid-table no-stakes' zone — comfortably above the
+        relegation cutoff and comfortably below European places. The threshold
+        of 8 points is a heuristic (≈ 3 wins of cushion in top-5 leagues).
+
+        Returns 0 when either: in/near relegation, in/near European places,
+        or we lack standings data.
+        """
+        if not standing:
+            return 0
+        pos = standing.get('league_position') or 0
+        pts_from_rel = standing.get('points_from_relegation')
+        pts_from_top = standing.get('points_from_top')
+        if not pts_from_rel or not pts_from_top:
+            return 0
+        # Position 8-14 with > 8pts cushion both ways = "safe mid-table"
+        if 8 <= pos <= 14 and pts_from_rel >= 8 and pts_from_top >= 8:
+            return 1
+        return 0
+
+    def _dead_rubber_likelihood(self, home_standing: dict, away_standing: dict,
+                                 season_progress: float) -> float:
+        """
+        Heuristic 0-1 likelihood that the match is a dead rubber (both sides
+        have nothing to play for). Rises with season_progress: matches early
+        in the season are NEVER dead rubbers regardless of standings.
+
+        Composition:
+            P(home_safe) × P(away_safe) × season_progress
+
+        season_progress > 0.85 (last ~5 matchdays) is where this signal is
+        actually useful. Earlier in the season it stays near 0.
+        """
+        if not home_standing or not away_standing or season_progress < 0.7:
+            return 0.0
+        h_safe = self._is_safe(home_standing)
+        a_safe = self._is_safe(away_standing)
+        # Linear ramp from 0.7 (no effect) to 1.0 (full effect)
+        progress_weight = max(0.0, min(1.0, (season_progress - 0.7) / 0.3))
+        return round(h_safe * a_safe * progress_weight, 3)
+
+    def _motivation_asymmetry(self, home_standing: dict, away_standing: dict) -> float:
+        """
+        Signed difference in "stakes" between the two sides. Negative if away has
+        more stakes (relegation / Europa fight), positive if home has more.
+
+        Magnitude is in 'points of distance' — being 1pt from safety is high
+        stakes; being 15pts from anything is no stakes. Capped at ±10.
+        """
+        def stakes(standing: dict) -> float:
+            if not standing:
+                return 0.0
+            r = standing.get('points_from_relegation')
+            t = standing.get('points_from_top')
+            if r is None or t is None:
+                return 0.0
+            # Smaller of the two distances = how close to a meaningful boundary
+            # Negative = above (close to top); positive = below (close to relegation)
+            return min(abs(r), abs(t))
+
+        h = stakes(home_standing)
+        a = stakes(away_standing)
+        # If both close to a boundary (low stakes value), asymmetry is small.
+        # If one is close and the other comfortable, asymmetry is large.
+        diff = a - h  # positive if away has higher stakes value (more comfortable)
+        return max(-10.0, min(10.0, diff))
+
     def _calc_avg_position(self, team_id, current_season):
         """Calculate average league position over prior 3 seasons (squad strength proxy)."""
         positions = []
@@ -632,6 +707,29 @@ class FeatureEngineer:
             'home_points_from_relegation': self._calc_points_from_relegation(home_standing, season, getattr(match, 'competition', '')),
             'away_points_from_relegation': self._calc_points_from_relegation(away_standing, season, getattr(match, 'competition', '')),
             'season_progress': self._calc_season_progress(match),
+            # --- v2 motivation features (additive — get used after next retrain) ---
+            # `is_safe` = both far from relegation AND far from the European places.
+            # Threshold tuning is league-specific but 8pts is a reasonable default
+            # for top-5 leagues (≈ 3 wins of cushion).
+            'home_is_safe': self._is_safe(home_standing),
+            'away_is_safe': self._is_safe(away_standing),
+            # `dead_rubber_likelihood` rises late in the season when both sides are safe
+            # — proxy for "favourite may rest starters". Bookmakers heavily weight this
+            # signal; our model currently doesn't, which is the leading hypothesis
+            # for the favourite-overconfidence we see in /api/value-bets.
+            'dead_rubber_likelihood': self._dead_rubber_likelihood(
+                home_standing, away_standing, self._calc_season_progress(match)),
+            # Asymmetric motivation: one team has stakes (relegation fight / europa
+            # race) and the other doesn't. Negative = away is more motivated.
+            'motivation_asymmetry': self._motivation_asymmetry(home_standing, away_standing),
+            # Travel + fixture congestion proxies — already-existing days_since fields
+            # surface raw count, this normalises to "is congested" {0, 1}.
+            'home_congested_fixtures': 1 if (
+                self.calculate_days_since_last_match(home_team_id, match_date) or 99
+            ) <= 3 else 0,
+            'away_congested_fixtures': 1 if (
+                self.calculate_days_since_last_match(away_team_id, match_date) or 99
+            ) <= 3 else 0,
             # Squad strength proxy
             'home_avg_position_3yr': self._calc_avg_position(home_team_id, season),
             'away_avg_position_3yr': self._calc_avg_position(away_team_id, season),
@@ -800,6 +898,18 @@ class FeatureEngineer:
             'home_points_from_relegation': self._calc_points_from_relegation(home_standing, season, competition),
             'away_points_from_relegation': self._calc_points_from_relegation(away_standing, season, competition),
             'season_progress': self._calc_season_progress(match),
+            # v2 motivation (used after next retrain)
+            'home_is_safe': self._is_safe(home_standing),
+            'away_is_safe': self._is_safe(away_standing),
+            'dead_rubber_likelihood': self._dead_rubber_likelihood(
+                home_standing, away_standing, self._calc_season_progress(match)),
+            'motivation_asymmetry': self._motivation_asymmetry(home_standing, away_standing),
+            'home_congested_fixtures': 1 if (
+                self.calculate_days_since_last_match(home_id, match.date) or 99
+            ) <= 3 else 0,
+            'away_congested_fixtures': 1 if (
+                self.calculate_days_since_last_match(away_id, match.date) or 99
+            ) <= 3 else 0,
             # Squad strength proxy
             'home_avg_position_3yr': self._calc_avg_position(home_id, season),
             'away_avg_position_3yr': self._calc_avg_position(away_id, season),

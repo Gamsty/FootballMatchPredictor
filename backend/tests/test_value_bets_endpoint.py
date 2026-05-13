@@ -234,3 +234,56 @@ class TestCalibrationEndpoint:
         assert resp.status_code == 200
         body = resp.get_json()
         assert body['summary']['total'] == 0
+
+
+# ----------------------------------------------------------------------------
+# Bet endpoints — validation + market-coverage
+# ----------------------------------------------------------------------------
+
+class TestBetEndpoint:
+    def test_post_rejects_missing_fields(self, client):
+        c = client.app.test_client()
+        resp = c.post('/api/bets', json={'match_id': 1})
+        assert resp.status_code == 400
+        assert 'Missing fields' in resp.get_json()['error']
+
+    def test_post_rejects_unsupported_market(self, client):
+        c = client.app.test_client()
+        resp = c.post('/api/bets', json={
+            'match_id': 1, 'market': 'corner_kicks', 'outcome_key': 'home',
+            'odds_at_bet': 2.0, 'stake': 100,
+        })
+        assert resp.status_code == 400
+        assert 'Unsupported market' in resp.get_json()['error']
+
+    def test_post_rejects_invalid_outcome_key(self, client):
+        c = client.app.test_client()
+        resp = c.post('/api/bets', json={
+            'match_id': 1, 'market': 'h2h', 'outcome_key': 'over',
+            'odds_at_bet': 2.0, 'stake': 100,
+        })
+        assert resp.status_code == 400
+
+    def test_post_rejects_invalid_odds_or_stake(self, client):
+        c = client.app.test_client()
+        # Odds ≤ 1.0 are nonsensical
+        resp = c.post('/api/bets', json={
+            'match_id': 1, 'market': 'h2h', 'outcome_key': 'home',
+            'odds_at_bet': 0.99, 'stake': 100,
+        })
+        assert resp.status_code == 400
+        # Stake ≤ 0
+        resp = c.post('/api/bets', json={
+            'match_id': 1, 'market': 'h2h', 'outcome_key': 'home',
+            'odds_at_bet': 2.0, 'stake': 0,
+        })
+        assert resp.status_code == 400
+
+    def test_post_404_when_match_not_found(self, client):
+        client.db.session.query.return_value.filter_by.return_value.first.return_value = None
+        c = client.app.test_client()
+        resp = c.post('/api/bets', json={
+            'match_id': 99999, 'market': 'h2h', 'outcome_key': 'home',
+            'odds_at_bet': 2.0, 'stake': 100,
+        })
+        assert resp.status_code == 404

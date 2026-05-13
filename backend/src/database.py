@@ -275,6 +275,101 @@ class Prediction(Base):
     created_at = Column(DateTime, default=_utcnow_naive)
 
 
+class Bet(Base):
+    """
+    A user-placed bet on a market outcome (paper or real money).
+
+    Lifecycle:
+        placed (status='pending') → match plays → settle_bets() flips to won/lost/void
+        → profit_loss is recorded for ROI tracking
+
+    Why we record `model_prob_at_bet` and `edge_at_bet` separately from the
+    current value: those numbers tell us what the model SAID when the bet was
+    placed — that's what determines if the bet was justified by our analytical
+    framework. The current model state may have shifted since (retrain, new
+    calibrator). For honest backtest the bet-time snapshot is what we compare
+    to bookmaker prices and to actual outcomes.
+
+    `closing_odds` is filled by a later snapshot job (ideally an hour before
+    kickoff) so we can compute CLV = (placed_odds - closing_odds) / closing_odds.
+    Positive CLV over many bets is the only short-run +EV proof.
+    """
+    __tablename__ = 'bets'
+
+    id = Column(Integer, primary_key=True, index=True)
+    match_id = Column(Integer, ForeignKey('matches.id'), nullable=False, index=True)
+
+    # Market identification
+    market = Column(String(20), nullable=False)       # 'h2h' | 'totals_2_5' | 'btts'
+    outcome_key = Column(String(10), nullable=False)  # 'home'/'draw'/'away' | 'over'/'under' | 'yes'/'no'
+    outcome_label = Column(String(40))                # human-readable, e.g., 'Home Win'
+
+    # Bet placement
+    odds_at_bet = Column(Float, nullable=False)
+    stake = Column(Float, nullable=False)             # NOK
+    bookmaker = Column(String(60))
+    placed_at = Column(DateTime, default=_utcnow_naive, nullable=False, index=True)
+    placed_via = Column(String(20), default='manual') # 'manual' (frontend), 'api', etc.
+
+    # Model snapshot at placement — captures what we said at the moment
+    model_prob_at_bet = Column(Float)
+    edge_at_bet = Column(Float)
+    model_version_at_bet = Column(String(50))
+
+    # CLV — populated by jobs/snapshot_odds.py shortly before kickoff
+    closing_odds = Column(Float)
+    closing_snapshot_at = Column(DateTime)
+
+    # Settlement
+    status = Column(String(20), default='pending', nullable=False, index=True)
+    # status ∈ {pending, won, lost, void}
+    settled_at = Column(DateTime)
+    profit_loss = Column(Float)  # NOK; positive for wins, negative for losses, 0 for void
+
+    # Optional metadata
+    notes = Column(String(500))
+
+    match = relationship("Match")
+
+
+class OddsSnapshot(Base):
+    """
+    Append-only history of best/median bookmaker odds per (match, market, outcome).
+
+    Two snapshot types matter:
+      - 'realtime'  — taken at value-bet calculation time (whenever /api/value-bets
+                      runs). Useful for tracking price drift over the days before
+                      a match.
+      - 'closing'   — taken ~1h before kickoff. Used to compute CLV against
+                      `bets.placed_at` snapshots.
+
+    Index on (match_id, market, outcome_key, snapshot_at desc) so closing-line
+    lookups are O(log n).
+    """
+    __tablename__ = 'odds_snapshots'
+
+    id = Column(Integer, primary_key=True, index=True)
+    match_id = Column(Integer, ForeignKey('matches.id'), nullable=False, index=True)
+
+    market = Column(String(20), nullable=False)
+    outcome_key = Column(String(10), nullable=False)
+
+    best_odds = Column(Float, nullable=False)
+    best_bookmaker = Column(String(60))
+    median_odds = Column(Float)
+    book_count = Column(Integer)
+
+    snapshot_type = Column(String(20), default='realtime', nullable=False)  # 'realtime' | 'closing'
+    snapshot_at = Column(DateTime, default=_utcnow_naive, nullable=False, index=True)
+
+    match = relationship("Match")
+
+    __table_args__ = (
+        Index('ix_odds_snap_match_market_outcome_time',
+              'match_id', 'market', 'outcome_key', 'snapshot_at'),
+    )
+
+
 class PredictionSnapshot(Base):
     """
     Immutable time-series log of every prediction we compute.

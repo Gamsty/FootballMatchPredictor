@@ -256,6 +256,86 @@ class TestPersistPrediction:
         snaps = session.query(db_mod.PredictionSnapshot).filter_by(match_id=m.id).all()
         assert len(snaps) == 2
 
+    def test_bet_lifecycle_pending_then_won(self, db_session):
+        """A pending Bet should settle to 'won' against a HOME_TEAM-winner match."""
+        from datetime import datetime as dt
+        db_mod, session = db_session
+        h = _make_team(session, db_mod, 1, 'A FC')
+        a = _make_team(session, db_mod, 2, 'B FC')
+        m = _make_match(session, db_mod, 1, h, a, status='FINISHED', winner='HOME_TEAM')
+        m.home_score = 2
+        m.away_score = 0
+
+        bet = db_mod.Bet(
+            match_id=m.id, market='h2h', outcome_key='home', outcome_label='Home Win',
+            odds_at_bet=2.10, stake=100.0, status='pending',
+        )
+        session.add(bet)
+        session.commit()
+
+        # Simulate the settler logic (mirrors _settle_one_bet in app.py)
+        resolver = lambda match: match.winner == 'HOME_TEAM'
+        won = resolver(m)
+        bet.status = 'won' if won else 'lost'
+        bet.profit_loss = bet.stake * (bet.odds_at_bet - 1) if won else -bet.stake
+        bet.settled_at = dt(2026, 5, 21, 17, 0)
+        session.commit()
+
+        reloaded = session.query(db_mod.Bet).filter_by(id=bet.id).one()
+        assert reloaded.status == 'won'
+        assert reloaded.profit_loss == pytest.approx(110.0)
+
+    def test_bet_lifecycle_pending_then_lost(self, db_session):
+        from datetime import datetime as dt
+        db_mod, session = db_session
+        h = _make_team(session, db_mod, 1, 'A FC')
+        a = _make_team(session, db_mod, 2, 'B FC')
+        m = _make_match(session, db_mod, 1, h, a, status='FINISHED', winner='DRAW')
+        m.home_score = 1
+        m.away_score = 1
+
+        bet = db_mod.Bet(match_id=m.id, market='h2h', outcome_key='home',
+                          odds_at_bet=2.10, stake=100.0, status='pending')
+        session.add(bet)
+        session.commit()
+
+        # Settle
+        won = (m.winner == 'HOME_TEAM')
+        bet.status = 'won' if won else 'lost'
+        bet.profit_loss = bet.stake * (bet.odds_at_bet - 1) if won else -bet.stake
+        bet.settled_at = dt(2026, 5, 21, 17, 0)
+        session.commit()
+
+        reloaded = session.query(db_mod.Bet).filter_by(id=bet.id).one()
+        assert reloaded.status == 'lost'
+        assert reloaded.profit_loss == -100.0
+
+    def test_odds_snapshot_table_appendable(self, db_session):
+        db_mod, session = db_session
+        h = _make_team(session, db_mod, 1, 'A FC')
+        a = _make_team(session, db_mod, 2, 'B FC')
+        m = _make_match(session, db_mod, 1, h, a)
+
+        # Two snapshots at different times — both should persist
+        for i, t in enumerate(['realtime', 'closing']):
+            session.add(db_mod.OddsSnapshot(
+                match_id=m.id,
+                market='h2h',
+                outcome_key='home',
+                best_odds=2.10 - i * 0.05,
+                best_bookmaker='Pinnacle',
+                median_odds=2.05 - i * 0.05,
+                book_count=4,
+                snapshot_type=t,
+            ))
+        session.commit()
+
+        snaps = (session.query(db_mod.OddsSnapshot)
+                 .filter_by(match_id=m.id).all())
+        assert len(snaps) == 2
+        types = {s.snapshot_type for s in snaps}
+        assert types == {'realtime', 'closing'}
+
     def test_model_version_change_appends_new_snapshot(self, db_session):
         """Critical for CLV / version-comparison: same probs but different model
         version must produce a new snapshot."""
