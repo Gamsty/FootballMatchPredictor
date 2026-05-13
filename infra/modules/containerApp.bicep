@@ -48,6 +48,19 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
           // "not configured"), so the deploy doesn't hard-fail without it. Create
           // the KV secret before/after deploy via:
           //   az keyvault secret set --vault-name <kv> --name odds-api-key --value <key>
+          //
+          // FRAGILITY NOTE: Bicep doesn't validate that the KV secret exists at
+          // deploy time. If you DELETE the Key Vault secret later (e.g. during a
+          // key rotation), the Container App secret stays referenced but resolves
+          // to empty at runtime — the backend sees ODDS_API_KEY='' and silently
+          // degrades. Symptom: /api/value-bets returns enabled=false in prod
+          // even though Bicep looks healthy.
+          //
+          // Resolution checklist when value-bets goes dark:
+          //   1. az keyvault secret list --vault-name <kv> | grep odds-api-key
+          //   2. If missing/disabled: re-create with `az keyvault secret set`
+          //   3. Restart the Container App revision to re-resolve secrets:
+          //      az containerapp revision restart -g <rg> -n <ca> --revision <latest>
           name: 'odds-api-key'
           keyVaultUrl: 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/secrets/odds-api-key'
           identity: 'system'

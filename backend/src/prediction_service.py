@@ -141,19 +141,66 @@ def _compute_derived_features(features_dict, feature_names):
             features_dict[f] = 0
 
 
+def _ensemble_agreement(model, X_scaled) -> float | None:
+    """
+    Compute a confidence proxy from the disagreement between base learners
+    inside a StackingClassifier.
+
+    Each base estimator (XGBoost, RandomForest) outputs its own probability
+    distribution. We compute the total variation distance between each pair
+    of distributions, average them, and report 1 − that as "agreement". Range:
+      1.0 → all base models give exactly the same distribution → high confidence
+      0.0 → maximum possible disagreement → low confidence
+
+    Returns None when the model isn't a fitted StackingClassifier (e.g. legacy
+    plain XGBoost) — caller should treat as "confidence unknown" and not show
+    the indicator.
+
+    Why this instead of bootstrap CIs: full bootstrap would require N retrainings
+    of the stacked ensemble — minutes per prediction, not viable online. This
+    uses information that's already computed during the stacking fit and only
+    costs two extra predict_proba calls.
+    """
+    base = getattr(model, 'named_estimators_', None)
+    if not base or len(base) < 2:
+        return None
+    try:
+        dists = []
+        for est in base.values():
+            p = est.predict_proba(X_scaled)[0]
+            dists.append(p)
+        if len(dists) < 2:
+            return None
+        # Average total variation distance across all unique base-model pairs.
+        n_pairs = 0
+        total_tvd = 0.0
+        for i in range(len(dists)):
+            for j in range(i + 1, len(dists)):
+                # TVD = 0.5 * Σ |p_i − q_i|. Range [0, 1].
+                tvd = 0.5 * sum(abs(a - b) for a, b in zip(dists[i], dists[j]))
+                total_tvd += tvd
+                n_pairs += 1
+        avg_tvd = total_tvd / n_pairs if n_pairs else 0.0
+        return round(1.0 - avg_tvd, 4)
+    except Exception:
+        # Anything unexpected → don't crash inference, just hide the indicator
+        return None
+
+
 def predict_match_result(features_dict, model_data):
     """
     Predict H/D/A from features using the main model.
 
     Returns:
-        dict with outcome, probabilities, confidence, odds
+        dict with outcome, probabilities, confidence, ensemble_agreement, odds
     """
     fn = model_data['feature_names']
     X = pd.DataFrame([{f: features_dict.get(f, 0) for f in fn}])
     X_scaled = model_data['scaler'].transform(X)
 
-    pred = model_data['model'].predict(X_scaled)[0]
-    proba = model_data['model'].predict_proba(X_scaled)[0]
+    model = model_data['model']
+    pred = model.predict(X_scaled)[0]
+    proba = model.predict_proba(X_scaled)[0]
 
     outcome_map = {0: 'AWAY_WIN', 1: 'DRAW', 2: 'HOME_WIN'}
     home_prob = float(proba[2])
@@ -168,6 +215,11 @@ def predict_match_result(features_dict, model_data):
             'away_win': round(away_prob, 4),
         },
         'confidence': round(float(max(proba)), 4),
+        # Ensemble agreement is a proxy for prediction stability. High agreement
+        # (>0.85) means XGBoost and RandomForest produced near-identical
+        # distributions; low agreement (<0.7) means they materially disagree
+        # and the stacked prediction is averaging over uncertainty.
+        'ensemble_agreement': _ensemble_agreement(model, X_scaled),
         'odds': {
             'home_win': round(1 / home_prob, 2) if home_prob > 0.01 else None,
             'draw': round(1 / draw_prob, 2) if draw_prob > 0.01 else None,

@@ -23,6 +23,7 @@ import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
 import ValueBets from '../components/ValueBets';
+import CalibrationView from '../components/CalibrationView';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
     calculateAccumulator
@@ -38,6 +39,7 @@ function Dashboard() {
     const [activeTab, setActiveTab] = useState('today');
     const [selectedMatch, setSelectedMatch] = useState(null);
     const [showAbout, setShowAbout] = useState(false);
+    const [showCalibration, setShowCalibration] = useState(false);
     const [filters, setFilters] = useState({
         categories: [],
     });
@@ -184,6 +186,15 @@ function Dashboard() {
                         className="text-accent hover:text-accent-soft transition-colors inline-flex items-center gap-1.5 cursor-pointer"
                     >
                         <span className="border-b border-accent/40 hover:border-accent-soft">How it works</span>
+                        <span aria-hidden="true">→</span>
+                    </button>
+                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                    <button
+                        onClick={() => setShowCalibration(true)}
+                        className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                        title="Empirical check on whether model probabilities match actual win rates."
+                    >
+                        <span className="border-b border-ink-muted/40 hover:border-ink">Calibration</span>
                         <span aria-hidden="true">→</span>
                     </button>
                 </div>
@@ -373,6 +384,9 @@ function Dashboard() {
 
             {/* About Model Modal */}
             {showAbout && <AboutModel onClose={() => setShowAbout(false)} />}
+
+            {/* Calibration Modal */}
+            {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
         </div>
     );
 }

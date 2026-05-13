@@ -239,7 +239,16 @@ class MatchFeatures(Base):
     created_at = Column(DateTime, default=_utcnow_naive)
 
 class Prediction(Base):
-    """Stores ML model predictions. Evaluated after match is played (correct column)."""
+    """
+    Latest model prediction per match. Idempotent on match_id — every persist
+    overwrites the previous row, so this table always reflects what the model
+    currently says about each fixture.
+
+    Calibration uses this table: ECE / Brier are computed on the latest snapshot
+    against the actual outcome. For time-series analysis (CLV — how the
+    probability moved between bet placement and kickoff), use PredictionSnapshot
+    instead, which preserves history.
+    """
     __tablename__ = 'predictions'
 
     id = Column(Integer, primary_key=True, index=True)
@@ -264,6 +273,49 @@ class Prediction(Base):
     match = relationship("Match", back_populates="prediction")
 
     created_at = Column(DateTime, default=_utcnow_naive)
+
+
+class PredictionSnapshot(Base):
+    """
+    Immutable time-series log of every prediction we compute.
+
+    Why a separate table: Prediction is keyed on match_id (latest-state per match)
+    so we can't track how the probabilities moved over time on the same row.
+    PredictionSnapshot is append-only — one row per (match_id, prediction time),
+    so:
+        - CLV analysis: compare prob @ first-seen vs prob @ kickoff
+        - Model-version comparison: filter by model_version to compare e.g.
+          v1 vs v2 calibration on the same fixtures
+        - Audit trail: when did the model "change its mind" about a match
+
+    Bounded growth via the `model_version` field — when retrain promotes a
+    new model, downstream analysis can scope to "predictions from this
+    version onwards" without polluting averages across versions.
+
+    Index on (match_id, created_at desc) so CLV-style "give me the latest
+    snapshot per match" queries are fast.
+    """
+    __tablename__ = 'prediction_snapshots'
+
+    id = Column(Integer, primary_key=True, index=True)
+    match_id = Column(Integer, ForeignKey('matches.id'), nullable=False)
+
+    home_win_prob = Column(Float, nullable=False)
+    draw_prob = Column(Float, nullable=False)
+    away_win_prob = Column(Float, nullable=False)
+    confidence = Column(Float)
+
+    model_version = Column(String(50), nullable=False)
+    model_type = Column(String(50))
+
+    # Snapshot taken at this time — defaults to now, but the backfill job can
+    # set it explicitly to (match.date - 1 hour) so historical CLV analyses
+    # don't get clobbered to "all snapshots from today".
+    created_at = Column(DateTime, default=_utcnow_naive, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_pred_snap_match_created', 'match_id', 'created_at'),
+    )
 
 # ============================================================
 # Database utility functions

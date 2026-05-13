@@ -9,7 +9,9 @@ Endpoints:
     - /api/predict/markets         — Full multi-market prediction
     - /api/predictions/history     — Past predictions with accuracy stats
     - /api/predictions/upcoming    — Batch predictions for upcoming matches (dashboard)
+    - /api/predictions/calibration — Bucket predictions vs actual outcomes (model calibration)
     - /api/value-bets              — +EV picks: model probabilities vs bookmaker odds
+    - /api/admin/odds-status       — Odds-API quota + per-bookmaker divergence stats
     - /api/matches                 — List matches with optional filters
     - /api/matches/<id>            — Single match detail
     - /api/matches/upcoming        — Raw upcoming matches with basic predictions
@@ -30,7 +32,7 @@ import logging
 import os
 import re
 
-from database import DatabaseManager, Match, Team, Prediction, MatchFeatures, init_db
+from database import DatabaseManager, Match, Team, Prediction, PredictionSnapshot, MatchFeatures, init_db
 from feature_engineering import FeatureEngineer
 from prediction_service import (
     compute_features, predict_match_result, predict_all_markets, classify_match
@@ -234,16 +236,146 @@ def reload_model():
     """
     Hot-reload the ML model from blob storage without restarting the container.
     Called by the retraining job after a successful validation+promotion.
+
+    Side effects:
+      - Reloads model weights from blob
+      - Clears prediction cache (probs will differ under new weights)
+      - Clears odds cache (stale prices shouldn't shadow fresh model probs;
+        the next /api/value-bets call will refetch — costs one extra API credit
+        per league but keeps probabilities and odds time-aligned)
+
     Auth: shared secret in X-Reload-Token header.
     """
     if not _require_admin_token():
         return jsonify({"error": "Unauthorized"}), 401
     load_model()
     prediction_cache.clear()
+    odds_dropped = odds_client.clear_cache()
     return jsonify({
         "reloaded": True,
         "model_type": model_data["model_type"] if model_data else None,
+        "odds_cache_entries_dropped": odds_dropped,
     }), 200
+
+
+@app.route('/api/admin/odds-status', methods=['GET'])
+def odds_status():
+    """
+    Operational health for the Odds API integration.
+
+    Returns:
+      - enabled: bool — whether ODDS_API_KEY is configured
+      - quota: { remaining, used, low } — from the last response headers
+      - divergence_stats: per-bookmaker mean |log(price/median)| across the
+        most recent cached events. Used to validate TRUSTED_BOOKMAKERS empirically:
+        bookmakers with consistently high divergence (≥ 0.15) are likely
+        outlier-posters or palp-prone and should be reviewed.
+
+    Auth: shared secret (same X-Reload-Token as model reload). Quota info
+    isn't sensitive in itself but the divergence stats reveal which books
+    we're using, so we gate the whole thing.
+    """
+    if not _require_admin_token():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not odds_client.enabled:
+        return jsonify({"enabled": False, "message": "ODDS_API_KEY not set"}), 200
+
+    # Sample divergence stats from any league with cached data
+    stats: dict = {}
+    for comp_name, sport_key in [
+        ('Premier League', 'soccer_epl'),
+        ('La Liga', 'soccer_spain_la_liga'),
+        ('Bundesliga', 'soccer_germany_bundesliga'),
+    ]:
+        s = odds_client.bookmaker_divergence_stats(sport_key)
+        if s:
+            stats[comp_name] = s
+
+    return jsonify({
+        "enabled": True,
+        "quota": odds_client.quota_status(),
+        "divergence_stats": stats,
+    }), 200
+
+
+def _persist_prediction(match, prediction_data: dict) -> None:
+    """
+    Persist a prediction in two places:
+      1. `predictions` — upserts latest state (one row per match, used by calibration)
+      2. `prediction_snapshots` — appends an immutable history row (used by CLV
+         and version comparisons)
+
+    Best-effort: errors are logged but never raised — a DB blip must not
+    take down a read endpoint.
+    """
+    if not model_data or not match.id or not prediction_data:
+        return
+    try:
+        result = prediction_data.get('match_result') or {}
+        probs = result.get('probabilities') or {}
+        if not probs.get('home_win'):
+            return  # nothing useful to persist
+        winner_map = {
+            'HOME_WIN': 'HOME_TEAM',
+            'AWAY_WIN': 'AWAY_TEAM',
+            'DRAW':     'DRAW',
+        }
+        model_version = str(model_data.get('model_version') or 'unversioned')
+        model_type = model_data.get('model_type')
+
+        # 1. Upsert the canonical Prediction row
+        existing = db.session.query(Prediction).filter_by(match_id=match.id).first()
+        payload = dict(
+            predicted_winner=winner_map.get(result.get('outcome'), result.get('outcome')),
+            home_win_prob=probs.get('home_win'),
+            draw_prob=probs.get('draw'),
+            away_win_prob=probs.get('away_win'),
+            confidence=result.get('confidence'),
+            model_type=model_type,
+            model_version=model_version,
+        )
+        if existing:
+            for k, v in payload.items():
+                if v is not None:
+                    setattr(existing, k, v)
+        else:
+            db.session.add(Prediction(match_id=match.id, **payload))
+
+        # 2. Append an immutable snapshot. We dedupe by (match_id, model_version):
+        # if a snapshot already exists for THIS match under THIS model version
+        # with identical probabilities, skip (avoids spam on cache-warming).
+        latest_snap = (
+            db.session.query(PredictionSnapshot)
+            .filter_by(match_id=match.id, model_version=model_version)
+            .order_by(PredictionSnapshot.created_at.desc())
+            .first()
+        )
+        should_append = True
+        if latest_snap:
+            tol = 1e-4
+            same = (
+                abs((latest_snap.home_win_prob or 0) - (probs.get('home_win') or 0)) < tol
+                and abs((latest_snap.draw_prob or 0) - (probs.get('draw') or 0)) < tol
+                and abs((latest_snap.away_win_prob or 0) - (probs.get('away_win') or 0)) < tol
+            )
+            if same:
+                should_append = False
+
+        if should_append:
+            db.session.add(PredictionSnapshot(
+                match_id=match.id,
+                home_win_prob=probs.get('home_win'),
+                draw_prob=probs.get('draw'),
+                away_win_prob=probs.get('away_win'),
+                confidence=result.get('confidence'),
+                model_type=model_type,
+                model_version=model_version,
+            ))
+
+        db.session.commit()
+    except Exception as e:
+        logger.warning("Persist prediction failed match_id=%s: %s", match.id, e)
+        db.session.rollback()
 
 # ============================================================================
 # TEAMS
@@ -556,6 +688,10 @@ def get_upcoming_predictions():
                     prediction_cache.set(
                         match.home_team_id, match.away_team_id, prediction_data, date_str
                     )
+                    # Persist the snapshot so we can compute calibration + CLV
+                    # against actual outcomes later. Best-effort; failures logged
+                    # but don't disrupt the response.
+                    _persist_prediction(match, prediction_data)
 
                 # Classify match
                 tags, scores = classify_match(prediction_data)
@@ -641,16 +777,29 @@ def get_upcoming_predictions():
 def get_value_bets():
     """
     Find +EV bets across upcoming matches by comparing model probabilities to
-    the best available bookmaker odds (across all bookmakers covered by The
-    Odds API in the EU region).
+    bookmaker odds.
 
     Query params:
         days (int):       Days ahead to scan (default 7, max 14)
-        min_edge (float): Minimum edge threshold (default 0.03 = 3%)
+        min_edge (float): Minimum edge threshold (default 0.03 = 3%). Applied
+                          to whichever edge flavour `edge_ref` selects.
+        books (str):      'sharp' (default) — Pinnacle, exchanges, liquid soft
+                          majors. 'all' — every bookmaker (diagnostic; surfaces
+                          palp errors as fake 100%+ edges).
+        regions (str):    'eu' (default), 'uk', 'us', 'au', or comma-separated.
+                          Each extra region doubles The Odds API quota cost,
+                          so default stays single-region.
+        markets (str):    Comma-separated subset of {h2h, totals, btts}. Default
+                          'h2h' to keep quota low. 'h2h,totals,btts' costs 3×
+                          per league per fetch.
+        edge_ref (str):   'median' (default) — gate on edge vs median trusted
+                          price (honest). 'best' — gate on edge vs the single
+                          highest-priced book (looser, surfaces outliers).
 
     Response:
-        { enabled: bool, value_bets: [...], meta: { ... } }
-        enabled=false when ODDS_API_KEY is unset — UI hides the section in that case.
+        { enabled, value_bets: [...], meta: {...} }
+        Each value_bet has both edge_best and edge_median; the legacy `edge`
+        field equals edge_best for backward compat with the old client.
     """
     try:
         if not model_data:
@@ -658,6 +807,27 @@ def get_value_bets():
 
         days = max(1, min(request.args.get('days', 7, type=int) or 7, 14))
         min_edge = max(0.0, request.args.get('min_edge', 0.03, type=float))
+
+        books = request.args.get('books', 'sharp')
+        if books not in ('sharp', 'all'):
+            books = 'sharp'
+
+        regions = request.args.get('regions', 'eu')
+        # Validate regions — comma-separated subset of allowed values
+        allowed_regions = {'eu', 'uk', 'us', 'au'}
+        regions = ','.join(r for r in regions.split(',') if r in allowed_regions) or 'eu'
+
+        markets_raw = request.args.get('markets', 'h2h')
+        # btts is intentionally excluded: The Odds API only offers btts on the
+        # per-event endpoint, not the bulk one we use. Supporting it would mean
+        # one API request per fixture, which is 73x quota cost on a normal scan.
+        # See OddsAPIClient.BULK_SUPPORTED_MARKETS.
+        allowed_markets = {'h2h', 'totals'}
+        markets = tuple(m for m in markets_raw.split(',') if m in allowed_markets) or ('h2h',)
+
+        edge_ref = request.args.get('edge_ref', 'median')
+        if edge_ref not in ('median', 'best'):
+            edge_ref = 'median'
 
         if not odds_client.enabled:
             return jsonify({
@@ -678,8 +848,6 @@ def get_value_bets():
 
         for match in matches:
             try:
-                # Reuse the prediction cache — we already computed probabilities
-                # for the dashboard; no point re-running inference.
                 date_str = match.date.strftime('%Y-%m-%d') if match.date else None
                 cached = prediction_cache.get(match.home_team_id, match.away_team_id, date_str)
                 if cached:
@@ -693,32 +861,46 @@ def get_value_bets():
                     prediction_cache.set(
                         match.home_team_id, match.away_team_id, prediction_data, date_str
                     )
+                    _persist_prediction(match, prediction_data)
 
                 scanned += 1
-                best_odds = odds_client.best_odds_for_match(
-                    match.competition, match.home_team.name, match.away_team.name
+                odds = odds_client.odds_for_match(
+                    match.competition, match.home_team.name, match.away_team.name,
+                    books=books, regions=regions, markets=markets,
                 )
-                if not best_odds:
+                if not odds:
                     continue
                 matched += 1
 
                 picks = value_picks(
-                    prediction_data.get('match_result'), best_odds, min_edge=min_edge
+                    prediction_data, odds,
+                    min_edge=min_edge,
+                    use_median=(edge_ref == 'median'),
                 )
+                # Extract ensemble agreement + per-market overround once per match
+                # (same value applies to every pick within this match).
+                ensemble_agreement = (prediction_data.get('match_result') or {}).get('ensemble_agreement')
+                # pick['market'] uses our internal label ('totals_2_5') while the
+                # odds dict keys mirror the Odds API market keys ('totals'). Translate.
+                pick_market_to_odds_key = {'h2h': 'h2h', 'totals_2_5': 'totals', 'btts': 'btts'}
                 for pick in picks:
+                    market_odds = odds.get(pick_market_to_odds_key.get(pick.get('market'), pick.get('market')), {})
                     results.append({
                         'match_id': match.id,
                         'date': match.date.isoformat(),
                         'competition': match.competition,
                         'home_team': team_dict(match.home_team),
                         'away_team': team_dict(match.away_team),
+                        'ensemble_agreement': ensemble_agreement,
+                        'overround_best': market_odds.get('overround_best'),
+                        'overround_median': market_odds.get('overround_median'),
                         **pick,
                     })
             except Exception as e:
                 logger.warning("Value-bet calc failed match_id=%s: %s", match.id, e)
 
-        # Sort across all matches by edge — the headline number users care about
-        results.sort(key=lambda x: x['edge'], reverse=True)
+        sort_key = 'edge_median' if edge_ref == 'median' else 'edge_best'
+        results.sort(key=lambda x: x.get(sort_key, 0), reverse=True)
 
         return jsonify({
             'enabled': True,
@@ -726,14 +908,137 @@ def get_value_bets():
             'meta': {
                 'days': days,
                 'min_edge': min_edge,
+                'books': books,
+                'regions': regions,
+                'markets': list(markets),
+                'edge_ref': edge_ref,
                 'count': len(results),
                 'matches_scanned': scanned,
                 'matches_with_odds': matched,
+                'quota': odds_client.quota_status(),
             },
         }), 200
 
     except Exception as e:
         return _error_response("Failed to load value bets", 500, e, endpoint="value_bets")
+
+
+@app.route('/api/predictions/calibration', methods=['GET'])
+def get_prediction_calibration():
+    """
+    Bucket all evaluated predictions by predicted probability and report the
+    actual win rate in each bucket. Used to diagnose model overconfidence —
+    perfect calibration is the diagonal y = x.
+
+    Query params:
+        outcome (str):       'home_win' | 'draw' | 'away_win' | 'predicted' (default).
+                             'predicted' uses the confidence on the predicted outcome.
+        bins (int):          Number of buckets (default 10, max 20).
+        model_version (str): Optional. Restrict to predictions made by a specific
+                             model version. Without this, retrained models pollute
+                             the average — v1 + v2 predictions get bucketed together
+                             and the plot stops being meaningful per-version.
+
+    Response:
+        { buckets: [{lower, upper, count, mean_predicted, actual_rate}, ...],
+          summary: { total, brier_score, ece, model_versions: [...] } }
+
+        ECE (Expected Calibration Error): bucket-weighted |actual_rate − mean_pred|.
+        Lower is better. Models perfectly calibrated have ECE = 0.
+        Brier score: mean squared error between predicted prob and 0/1 outcome.
+    """
+    try:
+        outcome = request.args.get('outcome', 'predicted')
+        if outcome not in ('home_win', 'draw', 'away_win', 'predicted'):
+            outcome = 'predicted'
+        bins = max(2, min(request.args.get('bins', 10, type=int) or 10, 20))
+        model_version = request.args.get('model_version', '').strip() or None
+
+        query = db.session.query(Prediction).filter(Prediction.actual_winner.isnot(None))
+        if model_version:
+            query = query.filter(Prediction.model_version == model_version)
+        preds = query.all()
+        if not preds:
+            return jsonify({
+                'buckets': [],
+                'summary': {'total': 0, 'note': 'No evaluated predictions yet'},
+            }), 200
+
+        # Build (prob, hit) pairs
+        pairs: list[tuple[float, int]] = []
+        for p in preds:
+            if outcome == 'home_win':
+                prob = p.home_win_prob
+                hit = 1 if p.actual_winner == 'HOME_TEAM' else 0
+            elif outcome == 'draw':
+                prob = p.draw_prob
+                hit = 1 if p.actual_winner == 'DRAW' else 0
+            elif outcome == 'away_win':
+                prob = p.away_win_prob
+                hit = 1 if p.actual_winner == 'AWAY_TEAM' else 0
+            else:  # 'predicted' — the probability on the side the model picked
+                if p.predicted_winner == 'HOME_TEAM':
+                    prob, hit = p.home_win_prob, 1 if p.actual_winner == 'HOME_TEAM' else 0
+                elif p.predicted_winner == 'AWAY_TEAM':
+                    prob, hit = p.away_win_prob, 1 if p.actual_winner == 'AWAY_TEAM' else 0
+                else:
+                    prob, hit = p.draw_prob, 1 if p.actual_winner == 'DRAW' else 0
+            if prob is not None:
+                pairs.append((float(prob), int(hit)))
+
+        # Bucket
+        buckets = []
+        ece_terms = []
+        total = len(pairs)
+        for i in range(bins):
+            lo = i / bins
+            hi = (i + 1) / bins
+            # Last bucket inclusive on the upper bound
+            in_bucket = [
+                (prob, hit) for prob, hit in pairs
+                if (lo <= prob < hi) or (i == bins - 1 and prob == 1.0)
+            ]
+            count = len(in_bucket)
+            if count == 0:
+                buckets.append({
+                    'lower': round(lo, 2), 'upper': round(hi, 2),
+                    'count': 0, 'mean_predicted': None, 'actual_rate': None,
+                })
+                continue
+            mean_pred = sum(p for p, _ in in_bucket) / count
+            actual = sum(h for _, h in in_bucket) / count
+            buckets.append({
+                'lower': round(lo, 2), 'upper': round(hi, 2),
+                'count': count,
+                'mean_predicted': round(mean_pred, 4),
+                'actual_rate': round(actual, 4),
+            })
+            ece_terms.append((count / total) * abs(actual - mean_pred))
+
+        ece = sum(ece_terms)
+        brier = sum((prob - hit) ** 2 for prob, hit in pairs) / total
+
+        # Surface distinct model versions in the dataset so the UI can populate
+        # a version dropdown without a second roundtrip.
+        all_versions = [v[0] for v in
+                        db.session.query(distinct(Prediction.model_version))
+                        .filter(Prediction.actual_winner.isnot(None))
+                        .all() if v[0]]
+
+        return jsonify({
+            'outcome': outcome,
+            'buckets': buckets,
+            'summary': {
+                'total': total,
+                'ece': round(ece, 4),
+                'brier_score': round(brier, 4),
+                'model_version': model_version,
+                'model_versions_available': sorted(all_versions),
+            },
+        }), 200
+
+    except Exception as e:
+        return _error_response("Failed to compute calibration", 500, e, endpoint="calibration")
 
 
 # ============================================================================

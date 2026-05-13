@@ -77,8 +77,17 @@ export const footballAPI = {
     },
 
     // Value bets: model probabilities × bookmaker odds → +EV picks
-    getValueBets: async (params = {}) => {
-        const response = await api.get('/value-bets', { params });
+    // Optional AbortSignal — pass from caller to cancel in-flight when filters
+    // change rapidly. Without this, switching books=sharp ↔ all 3x fires 3
+    // parallel requests; we want only the latest to land.
+    getValueBets: async (params = {}, { signal } = {}) => {
+        const response = await api.get('/value-bets', { params, signal });
+        return response.data;
+    },
+
+    // Model calibration — bucketed prediction probability vs actual outcome rate
+    getCalibration: async (params = {}, { signal } = {}) => {
+        const response = await api.get('/predictions/calibration', { params, signal });
         return response.data;
     },
 
