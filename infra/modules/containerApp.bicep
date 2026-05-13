@@ -42,6 +42,16 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/secrets/reload-token'
           identity: 'system'
         }
+        {
+          // The Odds API key — powers /api/value-bets. When this secret doesn't
+          // exist in Key Vault the backend gracefully degrades (Value tab shows
+          // "not configured"), so the deploy doesn't hard-fail without it. Create
+          // the KV secret before/after deploy via:
+          //   az keyvault secret set --vault-name <kv> --name odds-api-key --value <key>
+          name: 'odds-api-key'
+          keyVaultUrl: 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/secrets/odds-api-key'
+          identity: 'system'
+        }
       ]
     }
     template: {
@@ -57,6 +67,7 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'FOOTBALL_API_KEY', secretRef: 'football-api-key' }
             { name: 'RELOAD_TOKEN', secretRef: 'reload-token' }
+            { name: 'ODDS_API_KEY', secretRef: 'odds-api-key' }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
           ]
           probes: [

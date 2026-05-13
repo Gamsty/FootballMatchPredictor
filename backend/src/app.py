@@ -9,6 +9,7 @@ Endpoints:
     - /api/predict/markets         — Full multi-market prediction
     - /api/predictions/history     — Past predictions with accuracy stats
     - /api/predictions/upcoming    — Batch predictions for upcoming matches (dashboard)
+    - /api/value-bets              — +EV picks: model probabilities vs bookmaker odds
     - /api/matches                 — List matches with optional filters
     - /api/matches/<id>            — Single match detail
     - /api/matches/upcoming        — Raw upcoming matches with basic predictions
@@ -36,7 +37,9 @@ from prediction_service import (
 )
 from cache import PredictionCache
 from model_storage import load_model_bytes
+from odds_api import OddsAPIClient
 from telemetry import setup_telemetry
+from value_bets import value_picks
 from sqlalchemy import and_, desc, distinct
 
 # Load environment variables. Only read a local .env file in development; in
@@ -133,6 +136,10 @@ feature_engineer = FeatureEngineer()
 
 # Prediction cache (2 hour TTL)
 prediction_cache = PredictionCache(default_ttl=7200)
+
+# Bookmaker odds client — no-op when ODDS_API_KEY is unset.
+# Used by /api/value-bets to compute edge = model_prob × decimal_odds − 1.
+odds_client = OddsAPIClient()
 
 
 def warm_cache():
@@ -624,6 +631,109 @@ def get_upcoming_predictions():
 
     except Exception as e:
         return _error_response("Failed to load upcoming predictions", 500, e, endpoint="upcoming_predictions")
+
+
+# ============================================================================
+# VALUE BETS — model probabilities vs bookmaker odds
+# ============================================================================
+
+@app.route('/api/value-bets', methods=['GET'])
+def get_value_bets():
+    """
+    Find +EV bets across upcoming matches by comparing model probabilities to
+    the best available bookmaker odds (across all bookmakers covered by The
+    Odds API in the EU region).
+
+    Query params:
+        days (int):       Days ahead to scan (default 7, max 14)
+        min_edge (float): Minimum edge threshold (default 0.03 = 3%)
+
+    Response:
+        { enabled: bool, value_bets: [...], meta: { ... } }
+        enabled=false when ODDS_API_KEY is unset — UI hides the section in that case.
+    """
+    try:
+        if not model_data:
+            return jsonify({'error': 'Model not loaded'}), 503
+
+        days = max(1, min(request.args.get('days', 7, type=int) or 7, 14))
+        min_edge = max(0.0, request.args.get('min_edge', 0.03, type=float))
+
+        if not odds_client.enabled:
+            return jsonify({
+                'enabled': False,
+                'value_bets': [],
+                'meta': {
+                    'days': days,
+                    'min_edge': min_edge,
+                    'count': 0,
+                    'message': 'Odds integration not configured. Set ODDS_API_KEY to enable.',
+                },
+            }), 200
+
+        matches = db.get_upcoming_matches(days)
+        results = []
+        scanned = 0
+        matched = 0
+
+        for match in matches:
+            try:
+                # Reuse the prediction cache — we already computed probabilities
+                # for the dashboard; no point re-running inference.
+                date_str = match.date.strftime('%Y-%m-%d') if match.date else None
+                cached = prediction_cache.get(match.home_team_id, match.away_team_id, date_str)
+                if cached:
+                    prediction_data = cached
+                else:
+                    features = compute_features(
+                        match.home_team, match.away_team, feature_engineer, model_data,
+                        competition=match.competition, match_date=match.date
+                    )
+                    prediction_data = predict_all_markets(features, model_data, multi_market_models)
+                    prediction_cache.set(
+                        match.home_team_id, match.away_team_id, prediction_data, date_str
+                    )
+
+                scanned += 1
+                best_odds = odds_client.best_odds_for_match(
+                    match.competition, match.home_team.name, match.away_team.name
+                )
+                if not best_odds:
+                    continue
+                matched += 1
+
+                picks = value_picks(
+                    prediction_data.get('match_result'), best_odds, min_edge=min_edge
+                )
+                for pick in picks:
+                    results.append({
+                        'match_id': match.id,
+                        'date': match.date.isoformat(),
+                        'competition': match.competition,
+                        'home_team': team_dict(match.home_team),
+                        'away_team': team_dict(match.away_team),
+                        **pick,
+                    })
+            except Exception as e:
+                logger.warning("Value-bet calc failed match_id=%s: %s", match.id, e)
+
+        # Sort across all matches by edge — the headline number users care about
+        results.sort(key=lambda x: x['edge'], reverse=True)
+
+        return jsonify({
+            'enabled': True,
+            'value_bets': results,
+            'meta': {
+                'days': days,
+                'min_edge': min_edge,
+                'count': len(results),
+                'matches_scanned': scanned,
+                'matches_with_odds': matched,
+            },
+        }), 200
+
+    except Exception as e:
+        return _error_response("Failed to load value bets", 500, e, endpoint="value_bets")
 
 
 # ============================================================================

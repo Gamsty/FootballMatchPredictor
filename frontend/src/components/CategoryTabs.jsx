@@ -10,6 +10,8 @@ function CategoryTabs({ activeTab, onTabChange, matchCounts }) {
     const tabs = [
         { id: 'today',    label: 'Today',    count: matchCounts.today },
         { id: 'upcoming', label: 'Upcoming', count: matchCounts.upcoming },
+        // Value tab — count is hidden until value-bets resolve, hence undefined-safe
+        { id: 'value',    label: 'Value',    count: matchCounts.value, accent: true },
     ];
 
     return (
@@ -28,7 +30,12 @@ function CategoryTabs({ activeTab, onTabChange, matchCounts }) {
                         }
                     >
                         <span className="display text-lg">{tab.label}</span>
-                        <span className="mono text-xs text-ink-muted">{tab.count}</span>
+                        {tab.count !== undefined && (
+                            <span className="mono text-xs text-ink-muted">{tab.count}</span>
+                        )}
+                        {tab.accent && !isActive && (
+                            <span className="w-1.5 h-1.5 bg-accent rounded-full ml-0.5" aria-hidden="true" />
+                        )}
                         {isActive && (
                             <span
                                 className="absolute left-0 right-0 bottom-[-1px] h-[2px] bg-accent"

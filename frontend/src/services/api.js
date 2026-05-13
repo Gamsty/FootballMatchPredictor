@@ -76,6 +76,12 @@ export const footballAPI = {
         return response.data;
     },
 
+    // Value bets: model probabilities × bookmaker odds → +EV picks
+    getValueBets: async (params = {}) => {
+        const response = await api.get('/value-bets', { params });
+        return response.data;
+    },
+
     // Matches — supports filters: { season, team_id, status, limit }
     getMatches: async (params = {}) => {
         const response = await api.get('/matches', { params });

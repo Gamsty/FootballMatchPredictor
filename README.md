@@ -130,7 +130,7 @@ cd backend
 python -m venv venv
 source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env        # fill in DATABASE_URL + FOOTBALL_API_KEY
+cp .env.example .env        # fill in DATABASE_URL + FOOTBALL_API_KEY (and optional ODDS_API_KEY for value bets)
 python wsgi.py              # auto-creates schema if missing
 
 # Frontend (new terminal)
@@ -170,6 +170,7 @@ python src/model_training.py       # train models (optional — pre-trained .pkl
 | POST | `/api/predict/markets` | Full multi-market prediction |
 | GET | `/api/predictions/upcoming` | Dashboard — batch predictions for next 3 days |
 | GET | `/api/predictions/history` | Past predictions with accuracy |
+| GET | `/api/value-bets` | +EV picks: model probabilities × bookmaker odds (requires `ODDS_API_KEY`, gracefully no-ops without one) |
 
 ### Matches
 | Method | Endpoint | Description |

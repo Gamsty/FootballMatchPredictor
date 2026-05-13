@@ -22,6 +22,7 @@ import FilterBar from '../components/FilterBar';
 import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
+import ValueBets from '../components/ValueBets';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
     calculateAccumulator
@@ -191,6 +192,14 @@ function Dashboard() {
             {/* Tabs */}
             <CategoryTabs activeTab={activeTab} onTabChange={setActiveTab} matchCounts={matchCounts} />
 
+            {/* Value tab — completely separate render path (odds-driven, not match-grid) */}
+            {activeTab === 'value' && (
+                <ValueBets onSelectMatch={setSelectedMatch} />
+            )}
+
+            {/* Match-grid view (today + upcoming tabs) */}
+            {activeTab !== 'value' && (
+            <>
             {/* Filters */}
             <FilterBar filters={filters} onFilterChange={setFilters} />
 
@@ -350,6 +359,8 @@ function Dashboard() {
                         </div>
                     ))}
                 </div>
+            )}
+            </>
             )}
 
             {/* Match Detail Modal */}
