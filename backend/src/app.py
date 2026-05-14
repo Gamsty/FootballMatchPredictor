@@ -356,10 +356,23 @@ def reload_model():
 @app.route('/api/admin/refit-calibration', methods=['POST'])
 def refit_calibration():
     """
-    Re-fit the temperature calibrator using raw model output on finished matches.
+    Re-fit the temperature calibrator using already-backfilled predictions.
 
     Body (optional):
         { "since": "2024-08-01", "max": 5000, "upload": true }
+
+    Implementation: pulls stored Predictions rows (which carry actual_winner)
+    instead of re-running model inference on each match. This makes the
+    endpoint finish in <1s for thousands of samples — the prior version
+    re-predicted every match end-to-end, took minutes, and timed out the
+    gunicorn worker at scale.
+
+    Caveat: predictions written before a calibrator was loaded are RAW model
+    output → safe to fit T from them. If predictions were written WHILE a
+    calibrator was active, you'd be fitting T on already-calibrated probs,
+    producing a near-identity calibrator. Run /api/admin/backfill-predictions
+    with --overwrite (POST {"overwrite": true}) after refit to keep stored
+    predictions aligned with the active calibrator.
 
     Side effects:
       - Writes backend/models/calibrator.json
@@ -385,45 +398,41 @@ def refit_calibration():
             since = (datetime.now(timezone.utc) - timedelta(days=365)).replace(tzinfo=None)
         upload = bool(body.get('upload', True))
 
-        # Pull finished matches with known winners
+        # Pull stored predictions joined to their matches (for the date filter
+        # and the winner ground truth). Bounded by max_n so we don't OOM on
+        # huge histories. Newest-first so periodic refits weight recent form.
         LABEL_MAP = {'AWAY_TEAM': 0, 'DRAW': 1, 'HOME_TEAM': 2}
-        matches = (
-            db.session.query(Match)
+        preds_q = (
+            db.session.query(Prediction, Match)
+            .join(Match, Match.id == Prediction.match_id)
             .filter(and_(
-                Match.status == 'FINISHED',
                 Match.date >= since,
                 Match.winner.in_(LABEL_MAP.keys()),
+                Prediction.actual_winner.isnot(None),
+                Prediction.home_win_prob.isnot(None),
+                Prediction.draw_prob.isnot(None),
+                Prediction.away_win_prob.isnot(None),
             ))
-            .order_by(Match.date.asc())
+            .order_by(Match.date.desc())
             .limit(max_n)
-            .all()
         )
-        if len(matches) < 100:
+        rows = preds_q.all()
+        if len(rows) < 100:
             return jsonify({
-                "error": f"Not enough evaluated data ({len(matches)} matches, need ≥100)",
+                "error": f"Not enough evaluated predictions ({len(rows)} found, need ≥100). "
+                         "Run /api/admin/backfill-predictions first.",
             }), 400
 
-        # Predict with apply_calibration=False to get raw probs
+        # Build (probs, label) pairs. Column order matches calibrator's
+        # convention: [away, draw, home].
         probs: list[list[float]] = []
         labels: list[int] = []
-        for m in matches:
-            try:
-                features = compute_features(
-                    m.home_team, m.away_team, feature_engineer, model_data,
-                    competition=m.competition, match_date=m.date,
-                )
-                res = predict_match_result(features, model_data, apply_calibration=False)
-                p = res.get('raw_probabilities') or res.get('probabilities') or {}
-                row = [p.get('away_win'), p.get('draw'), p.get('home_win')]
-                if any(v is None for v in row):
-                    continue
-                probs.append(row)
-                labels.append(LABEL_MAP[m.winner])
-            except Exception:
-                continue
+        for pred, match in rows:
+            probs.append([pred.away_win_prob, pred.draw_prob, pred.home_win_prob])
+            labels.append(LABEL_MAP[match.winner])
 
         if len(probs) < 100:
-            return jsonify({"error": f"Only {len(probs)} valid samples after feature computation"}), 400
+            return jsonify({"error": f"Only {len(probs)} valid samples"}), 400
 
         from calibrator import expected_calibration_error
         probs_arr = np.array(probs, dtype=float)
