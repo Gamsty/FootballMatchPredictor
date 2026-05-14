@@ -497,13 +497,23 @@ def backfill_predictions():
 
     JSON body (all optional):
         {
-            "since":     "YYYY-MM-DD"  default: 365 days ago,
-            "limit":     int           default 500 (max 2000),
-            "overwrite": bool          default false,
+            "since":           "YYYY-MM-DD"  default: 365 days ago,
+            "limit":           int           default 500 (max 2000),
+            "overwrite":       bool          default false,
+            "after_match_id":  int           cursor for overwrite mode; pass
+                                              the `last_match_id` from the
+                                              previous response to paginate.
         }
 
-    Run repeatedly until `remaining_estimate == 0`. Capped at 500 matches per
-    request so a single call doesn't hold a gunicorn worker for minutes.
+    Two run modes:
+      - overwrite=false (default): pulls matches that don't have a prediction
+        yet. Repeat until `remaining_estimate == 0`.
+      - overwrite=true: re-predicts existing rows. Repeat passing
+        `after_match_id` from the previous response — without it the same
+        oldest batch comes back every call.
+
+    Capped at 500 matches per request so a single call doesn't hold a gunicorn
+    worker for minutes.
 
     Auth: X-Reload-Token header (same shared secret as other admin endpoints).
     Response: summary dict with processed/written/skipped/remaining.
@@ -525,6 +535,12 @@ def backfill_predictions():
                 return jsonify({'error': 'since must be YYYY-MM-DD'}), 400
         limit = max(1, min(int(body.get('limit', 500)), 2000))
         overwrite = bool(body.get('overwrite', False))
+        after_match_id = body.get('after_match_id')
+        if after_match_id is not None:
+            try:
+                after_match_id = int(after_match_id)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'after_match_id must be int'}), 400
 
         summary = run_backfill(
             db=db,
@@ -533,6 +549,7 @@ def backfill_predictions():
             since=since,
             limit=limit,
             overwrite=overwrite,
+            after_match_id=after_match_id,
         )
         return jsonify(summary), 200
     except Exception as e:

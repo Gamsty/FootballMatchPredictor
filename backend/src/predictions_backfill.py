@@ -56,6 +56,7 @@ def run_backfill(
     since: datetime | None = None,
     limit: int = 500,
     overwrite: bool = False,
+    after_match_id: int | None = None,
     commit_every: int = 50,
 ) -> dict:
     """
@@ -99,19 +100,23 @@ def run_backfill(
             db.session.query(Match)
             .filter(base_filter)
             .filter(~Match.id.in_(predicted_subq))
-            .order_by(Match.date.asc())
+            .order_by(Match.id.asc())
             .limit(limit)
         )
     else:
-        matches_q = (
-            db.session.query(Match)
-            .filter(base_filter)
-            .order_by(Match.date.asc())
-            .limit(limit)
-        )
+        # Overwrite mode: re-predict matches we already have rows for. Caller
+        # paginates by passing `after_match_id` = max(match_id) from the
+        # previous batch — without it, the query would return the same oldest
+        # 500 matches every call and loop forever.
+        overwrite_q = db.session.query(Match).filter(base_filter)
+        if after_match_id is not None:
+            overwrite_q = overwrite_q.filter(Match.id > after_match_id)
+        matches_q = overwrite_q.order_by(Match.id.asc()).limit(limit)
 
     matches = matches_q.all()
     total = len(matches)
+    # Track max match_id we touched so caller can paginate via after_match_id.
+    last_match_id = max((m.id for m in matches), default=after_match_id)
     if total == 0:
         # Even when this batch is empty, compute the honest remaining count.
         # Caller's loop uses this to decide whether to stop. The previous
@@ -129,6 +134,7 @@ def run_backfill(
         return {
             'processed': 0, 'written': 0, 'skipped': 0,
             'remaining_estimate': remaining_now,
+            'last_match_id': last_match_id,
             'message': 'No matches to backfill in window',
             'since': since.isoformat(),
         }
@@ -220,6 +226,7 @@ def run_backfill(
         'skipped': skipped,
         'elapsed_seconds': round(elapsed, 1),
         'remaining_estimate': remaining,
+        'last_match_id': last_match_id,
         'since': since.isoformat(),
         'limit': limit,
     }
