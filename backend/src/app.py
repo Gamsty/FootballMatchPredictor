@@ -463,22 +463,17 @@ def snapshot_closing_odds():
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        # Lazy-import the job-script module so its sys.path manipulation doesn't
-        # run on every app startup. The job module already inserts src/ into
-        # sys.path at import time, which is harmless but adds one entry.
-        import sys
-        from pathlib import Path
-        jobs_path = str(Path(__file__).parent.parent / "jobs")
-        if jobs_path not in sys.path:
-            sys.path.insert(0, jobs_path)
-        import snapshot_odds as snap_mod
+        # Snapshot logic lives in src/odds_snapshot.py so it ships with the
+        # production container (which doesn't copy backend/jobs/). The CLI
+        # job script imports the same function.
+        from odds_snapshot import run_snapshot
 
         body = request.get_json(silent=True) or {}
         closing = bool(body.get('closing', True))
         markets_raw = body.get('markets', 'h2h')
         markets = tuple(m.strip() for m in markets_raw.split(',') if m.strip())
 
-        summary = snap_mod.run_snapshot(
+        summary = run_snapshot(
             db=db,
             client=odds_client,
             hours=int(body.get('hours', 24)),
