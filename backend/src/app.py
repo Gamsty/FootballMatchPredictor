@@ -433,6 +433,67 @@ def refit_calibration():
         return _error_response("Calibration fit failed", 500, e, endpoint="refit_calibration")
 
 
+@app.route('/api/admin/snapshot-closing-odds', methods=['POST'])
+def snapshot_closing_odds():
+    """
+    Snapshot the current best/median odds for upcoming matches and (optionally)
+    write them to pending bets as closing_odds for CLV tracking.
+
+    This is the HTTP entry point for the same logic as
+    `backend/jobs/snapshot_odds.py`. Designed to be hit by a scheduled Container
+    Apps Job (cron). Running close to kickoff (~1h before) captures the canonical
+    closing price.
+
+    JSON body (all optional):
+        {
+            "hours":              int (default 24, ignored if closing=true)
+            "closing":            bool (default true) — tags snapshots as 'closing'
+            "closing_window":     float (default 2.0) — only matches within this many
+                                  hours of kickoff
+            "apply_to_bets":      bool (default true when closing=true) — write
+                                  closing_odds into pending bets
+            "markets":            "h2h" | "h2h,totals" (default "h2h")
+        }
+
+    Auth: X-Reload-Token header (same shared secret as other admin endpoints).
+    Response: summary dict with matches scanned, snaps written, bets updated,
+              quota remaining.
+    """
+    if not _require_admin_token():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        # Lazy-import the job-script module so its sys.path manipulation doesn't
+        # run on every app startup. The job module already inserts src/ into
+        # sys.path at import time, which is harmless but adds one entry.
+        import sys
+        from pathlib import Path
+        jobs_path = str(Path(__file__).parent.parent / "jobs")
+        if jobs_path not in sys.path:
+            sys.path.insert(0, jobs_path)
+        import snapshot_odds as snap_mod
+
+        body = request.get_json(silent=True) or {}
+        closing = bool(body.get('closing', True))
+        markets_raw = body.get('markets', 'h2h')
+        markets = tuple(m.strip() for m in markets_raw.split(',') if m.strip())
+
+        summary = snap_mod.run_snapshot(
+            db=db,
+            client=odds_client,
+            hours=int(body.get('hours', 24)),
+            closing=closing,
+            closing_window_hours=float(body.get('closing_window', 2.0)),
+            apply_to_bets=bool(body.get('apply_to_bets', closing)),
+            markets=markets,
+        )
+        db.session.commit()
+        return jsonify(summary), 200
+    except Exception as e:
+        db.session.rollback()
+        return _error_response("Snapshot failed", 500, e, endpoint="snapshot_closing_odds")
+
+
 @app.route('/api/admin/odds-status', methods=['GET'])
 def odds_status():
     """
@@ -1308,12 +1369,23 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
             bet.profit_loss = 0.0
             return True
         leg_results = [_resolve_leg(leg) for leg in legs]
-        if any(r is None for r in leg_results):
-            return False  # at least one leg's match isn't finished yet
+
+        # Early-settle on first lost leg: a combo is dead the moment ANY leg
+        # loses, even if other legs are still pending. Without this, a Saturday
+        # lost leg would show "pending" until Tuesday when the last leg plays —
+        # bad UX and breaks ROI accuracy during the week.
         if any(r == 'lost' for r in leg_results):
             bet.status = 'lost'
             bet.profit_loss = -bet.stake
-        elif any(r == 'void' for r in leg_results):
+            bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            return True
+
+        # Some legs still unfinished and none lost yet → stay pending.
+        if any(r is None for r in leg_results):
+            return False
+
+        # All legs settled, none lost. Either all won, or some void.
+        if any(r == 'void' for r in leg_results):
             # In real bookmakers, a void leg reduces the combo to remaining legs.
             # We don't model partial-stake refund here — treat as void.
             bet.status = 'void'
@@ -1711,9 +1783,19 @@ def bets_performance():
         total_pl = sum(b.profit_loss or 0 for b in settled)
         roi = (total_pl / total_stake) if total_stake > 0 else 0.0
 
-        # Edge realisation: average edge vs realised win rate
-        avg_edge = sum(b.edge_at_bet or 0 for b in settled) / len(settled) if settled else 0
-        avg_model_prob = sum(b.model_prob_at_bet or 0 for b in settled) / len(settled) if settled else 0
+        # Edge realisation: average edge vs realised win rate.
+        # Compute avg_edge across ALL bets (settled + pending), but exclude combos
+        # — their multiplicative edge is mathematically incomparable to singles'
+        # additive edge (a 3-leg combo's "edge_at_bet" of +300% is just (p1*p2*p3)
+        # × (o1*o2*o3) − 1, not a per-stake-unit expectation).
+        non_combo = [b for b in bets if b.market != 'combo']
+        non_combo_with_edge = [b for b in non_combo if b.edge_at_bet is not None]
+        avg_edge = (sum(b.edge_at_bet for b in non_combo_with_edge) / len(non_combo_with_edge)
+                    if non_combo_with_edge else 0.0)
+        # Avg model prob — use the same non-combo pool for the same reason.
+        non_combo_with_prob = [b for b in non_combo if b.model_prob_at_bet is not None]
+        avg_model_prob = (sum(b.model_prob_at_bet for b in non_combo_with_prob) / len(non_combo_with_prob)
+                          if non_combo_with_prob else 0.0)
         win_rate = len(won) / len(settled) if settled else 0
 
         # CLV: avg of (placed_odds / closing_odds - 1). Positive = bet at better

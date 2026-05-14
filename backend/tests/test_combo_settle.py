@@ -80,3 +80,88 @@ class TestCompoundMarketCoverage:
         for k in ('h_btts_yes', 'd_btts_yes', 'a_btts_yes',
                   'h_btts_no', 'd_btts_no', 'a_btts_no'):
             assert k in r, f"missing compound resolver: {k}"
+
+
+# ---------------------------------------------------------------------------
+# Combo early-settle — a combo is dead the moment ANY leg loses, even if
+# other legs are still pending. Without this fix the combo would stay
+# "pending" until the last leg plays, which is misleading on multi-day combos.
+# ---------------------------------------------------------------------------
+
+class TestComboEarlySettle:
+    """
+    These tests exercise _settle_one_bet's combo branch using a fake bet object
+    and a stubbed _resolve_leg. Going through the real DB would force test_combo_settle
+    to take on the persistence fixture; we don't need full integration to cover
+    the branching logic.
+    """
+
+    def _make_bet(self, *, legs, stake=100.0, odds=10.0):
+        from datetime import datetime
+        return SimpleNamespace(
+            id=1,
+            market='combo',
+            outcome_key='multi',
+            stake=stake,
+            odds_at_bet=odds,
+            combo_legs=legs,
+            status='pending',
+            settled_at=None,
+            profit_loss=None,
+            placed_at=datetime(2026, 5, 1),
+        )
+
+    def _patch_resolver(self, monkeypatch, results):
+        """Patch _resolve_leg to return the given results in sequence."""
+        import app
+        calls = iter(results)
+        monkeypatch.setattr(app, '_resolve_leg', lambda leg: next(calls))
+
+    def test_combo_lost_immediately_when_first_leg_loses(self, monkeypatch):
+        from app import _settle_one_bet
+        legs = [{'match_id': 1}, {'match_id': 2}, {'match_id': 3}]
+        # First leg lost, others still pending — should settle as LOST now.
+        self._patch_resolver(monkeypatch, ['lost', None, None])
+        bet = self._make_bet(legs=legs)
+        changed = _settle_one_bet(bet, SimpleNamespace())
+        assert changed is True
+        assert bet.status == 'lost'
+        assert bet.profit_loss == -100.0
+
+    def test_combo_stays_pending_when_legs_unfinished_no_loss(self, monkeypatch):
+        from app import _settle_one_bet
+        legs = [{'match_id': 1}, {'match_id': 2}]
+        self._patch_resolver(monkeypatch, ['won', None])
+        bet = self._make_bet(legs=legs)
+        changed = _settle_one_bet(bet, SimpleNamespace())
+        assert changed is False
+        assert bet.status == 'pending'
+
+    def test_combo_won_when_all_legs_won(self, monkeypatch):
+        from app import _settle_one_bet
+        legs = [{'match_id': 1}, {'match_id': 2}, {'match_id': 3}]
+        self._patch_resolver(monkeypatch, ['won', 'won', 'won'])
+        bet = self._make_bet(legs=legs, stake=100.0, odds=11.65)
+        changed = _settle_one_bet(bet, SimpleNamespace())
+        assert changed is True
+        assert bet.status == 'won'
+        # P/L = stake * (odds - 1) = 100 * 10.65 = 1065
+        assert bet.profit_loss == round(100 * (11.65 - 1.0), 6)
+
+    def test_combo_void_when_any_leg_voids_and_none_lost(self, monkeypatch):
+        from app import _settle_one_bet
+        legs = [{'match_id': 1}, {'match_id': 2}]
+        self._patch_resolver(monkeypatch, ['won', 'void'])
+        bet = self._make_bet(legs=legs)
+        changed = _settle_one_bet(bet, SimpleNamespace())
+        assert changed is True
+        assert bet.status == 'void'
+        assert bet.profit_loss == 0.0
+
+    def test_empty_combo_voids_immediately(self):
+        """Malformed combo (no legs) shouldn't loop forever as pending."""
+        from app import _settle_one_bet
+        bet = self._make_bet(legs=[])
+        changed = _settle_one_bet(bet, SimpleNamespace())
+        assert changed is True
+        assert bet.status == 'void'

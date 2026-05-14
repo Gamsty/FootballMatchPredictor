@@ -1,0 +1,53 @@
+name: Snapshot closing odds
+
+# Captures bookmaker odds for matches kicking off within the next 2 hours and
+# writes them as `closing_odds` on any pending bet for the same match/market/
+# outcome. This is what makes CLV (closing line value) tracking work in the
+# Bet log — CLV is the only short-run +EV proof that doesn't depend on win/
+# loss noise.
+#
+# Most runs are no-ops: the admin endpoint filters to matches in the 2h closing
+# window and skips fetching odds when nothing matches. On a typical weekend
+# slate this fires ~6-10 productive runs and ~80 no-op runs per week. The Odds
+# API's 30-min response cache absorbs duplicate requests cheaply.
+#
+# Secrets used:
+#   - RELOAD_TOKEN   shared secret for admin endpoints (already in use for
+#                    /api/admin/reload-model, /api/fixtures/refresh)
+#   - BACKEND_URL    full https URL to the Azure Container Apps backend, e.g.
+#                    https://ca-fotballpred-prod.redpond-XYZ.swedencentral.azurecontainerapps.io
+
+on:
+  schedule:
+    # Every 30 minutes. The Odds API cache TTL is also 30min so this aligns
+    # naturally with refresh boundaries — we don't pay extra by running more
+    # often than the cache lifetime.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger snapshot
+        env:
+          RELOAD_TOKEN: ${{ secrets.RELOAD_TOKEN }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+        run: |
+          if [ -z "$RELOAD_TOKEN" ] || [ -z "$BACKEND_URL" ]; then
+            echo "Missing RELOAD_TOKEN or BACKEND_URL secret — skipping."
+            exit 1
+          fi
+          # -f: fail on HTTP >= 400. Body still captured to stdout via -s -S.
+          # Pass closing=true + apply_to_bets=true so any pending bet gets its
+          # closing_odds + closing_snapshot_at fields populated for CLV calc.
+          response=$(curl -fsS -X POST "$BACKEND_URL/api/admin/snapshot-closing-odds" \
+            -H "X-Reload-Token: $RELOAD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"closing": true, "closing_window": 2, "apply_to_bets": true, "markets": "h2h,totals"}')
+          echo "Response: $response"
+          # No-op runs (no matches in window) return enabled=true with
+          # matches_scanned=0; that's success, not a failure.
