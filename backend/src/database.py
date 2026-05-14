@@ -495,6 +495,12 @@ class DatabaseManager:
             match.winner = match_data.get('winner')
             match.status = match_data.get('status')
             match.stage = match_data.get('stage')
+            # Kickoff time can move after the initial import — football-data.org
+            # often imports matches with TBD/placeholder times and updates them
+            # later when the broadcaster confirms. Without this line, our DB
+            # would stay stuck on the original (often 00:00) timestamp.
+            if match_data.get('date') is not None:
+                match.date = match_data['date']
             for field in extra_fields:
                 if field in match_data:
                     setattr(match, field, match_data[field])
