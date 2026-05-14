@@ -226,6 +226,24 @@ def team_dict(team):
         'crest': f'https://crests.football-data.org/{team.api_id}.png',
     }
 
+
+def iso_utc(dt):
+    """
+    Serialize a naive datetime as an ISO 8601 string with explicit UTC tz.
+
+    Our DateTime columns store naive UTC (see database._utcnow_naive) — calling
+    plain `.isoformat()` produces e.g. '2026-05-18T19:00:00' which JS Date
+    parses as LOCAL TIME, silently shifting every displayed kickoff by the
+    user's tz offset. Appending '+00:00' makes JS interpret it as UTC and
+    convert to local for display, which is what we want.
+
+    Use this everywhere a match.date or other naive-UTC datetime is going
+    out over the wire.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat() if dt.tzinfo is None else dt.isoformat()
+
 @app.teardown_appcontext
 def shutdown_session(exception=None):
     """Remove thread-local session after each request to prevent stale connections."""
@@ -757,7 +775,7 @@ def get_prediction_history():
                     'id': match.id,
                     'home_team': match.home_team.name,
                     'away_team': match.away_team.name,
-                    'date': match.date.isoformat(),
+                    'date': iso_utc(match.date),
                     'actual_winner': match.winner
                 },
                 'prediction': {
@@ -769,7 +787,7 @@ def get_prediction_history():
                 },
                 'correct': pred.correct,
                 'model_type': pred.model_type,
-                'created_at': pred.created_at.isoformat()
+                'created_at': iso_utc(pred.created_at)
             })
 
         total = len([p for p in predictions if p.actual_winner is not None])
@@ -865,7 +883,7 @@ def get_upcoming_predictions():
 
                 results.append({
                     'id': match.id,
-                    'date': match.date.isoformat(),
+                    'date': iso_utc(match.date),
                     'competition': match.competition,
                     'stage': match.stage,
                     'matchday': match.matchday,
@@ -885,7 +903,7 @@ def get_upcoming_predictions():
                 # Still include the match, just without prediction
                 results.append({
                     'id': match.id,
-                    'date': match.date.isoformat(),
+                    'date': iso_utc(match.date),
                     'competition': match.competition,
                     'stage': match.stage,
                     'matchday': match.matchday,
@@ -1044,7 +1062,7 @@ def get_value_bets():
                     market_odds = odds.get(pick_market_to_odds_key.get(pick.get('market'), pick.get('market')), {})
                     results.append({
                         'match_id': match.id,
-                        'date': match.date.isoformat(),
+                        'date': iso_utc(match.date),
                         'competition': match.competition,
                         'home_team': team_dict(match.home_team),
                         'away_team': team_dict(match.away_team),
@@ -1295,7 +1313,7 @@ def _bet_to_dict(bet: Bet) -> dict:
         'match': {
             'home': match.home_team.name if match and match.home_team else None,
             'away': match.away_team.name if match and match.away_team else None,
-            'date': match.date.isoformat() if match and match.date else None,
+            'date': iso_utc(match.date) if match else None,
             'competition': match.competition if match else None,
             'status': match.status if match else None,
             'home_score': match.home_score if match else None,
@@ -1313,8 +1331,8 @@ def _bet_to_dict(bet: Bet) -> dict:
         'edge_at_bet': bet.edge_at_bet,
         'model_version_at_bet': bet.model_version_at_bet,
         'status': bet.status,
-        'placed_at': bet.placed_at.isoformat() if bet.placed_at else None,
-        'settled_at': bet.settled_at.isoformat() if bet.settled_at else None,
+        'placed_at': iso_utc(bet.placed_at),
+        'settled_at': iso_utc(bet.settled_at),
         'profit_loss': bet.profit_loss,
         'notes': bet.notes,
     }
@@ -1661,7 +1679,7 @@ def get_matches():
             'id': match.id,
             'home_team': {'id': match.home_team.id, 'name': match.home_team.name},
             'away_team': {'id': match.away_team.id, 'name': match.away_team.name},
-            'date': match.date.isoformat(),
+            'date': iso_utc(match.date),
             'season': match.season,
             'matchday': match.matchday,
             'competition': match.competition,
@@ -1702,7 +1720,7 @@ def get_match(match_id):
                 'name': match.away_team.name,
                 'short_name': match.away_team.short_name
             },
-            'date': match.date.isoformat(),
+            'date': iso_utc(match.date),
             'season': match.season,
             'matchday': match.matchday,
             'competition': match.competition,
@@ -1767,7 +1785,7 @@ def get_upcoming_matches():
 
             results.append({
                 'id': match.id,
-                'date': match.date.isoformat(),
+                'date': iso_utc(match.date),
                 'competition': match.competition,
                 'stage': match.stage,
                 'matchday': match.matchday,
@@ -1900,7 +1918,7 @@ def get_head_to_head():
                     result = 'team2_win'
 
             recent_matches.append({
-                'date': match.date.isoformat(),
+                'date': iso_utc(match.date),
                 'home_team': match.home_team.name,
                 'away_team': match.away_team.name,
                 'score': f"{match.home_score}-{match.away_score}",

@@ -168,13 +168,41 @@ function ValueBets({ onSelectMatch }) {
 
     const picks = data.value_bets || [];
 
-    // Group picks by match — multiple market outcomes on the same fixture are
-    // shown together so the user sees the full picture.
-    const byMatch = new Map();
+    // Group picks by match, then group matches by league. Within each league,
+    // matches are ordered by kickoff (earliest first) — that's how a bettor
+    // actually scans: "which league am I focusing on, what's coming up next".
+    // Within a match, picks stay sorted by edge desc (best opportunity first).
+    const matchesByLeague = new Map();   // competition → Map<match_id, picks[]>
     for (const pick of picks) {
-        if (!byMatch.has(pick.match_id)) byMatch.set(pick.match_id, []);
-        byMatch.get(pick.match_id).push(pick);
+        const comp = pick.competition || 'Other';
+        if (!matchesByLeague.has(comp)) matchesByLeague.set(comp, new Map());
+        const matchesInLeague = matchesByLeague.get(comp);
+        if (!matchesInLeague.has(pick.match_id)) matchesInLeague.set(pick.match_id, []);
+        matchesInLeague.get(pick.match_id).push(pick);
     }
+
+    // Sort leagues by priority (Premier League first, then alphabetical)
+    const LEAGUE_PRIORITY = [
+        'Premier League', 'Championship', 'La Liga', 'Primera Division',
+        'Bundesliga', 'Serie A', 'Ligue 1', 'Eredivisie',
+        'Primeira Liga', 'UEFA Champions League',
+    ];
+    const sortedLeagues = Array.from(matchesByLeague.keys()).sort((a, b) => {
+        const ia = LEAGUE_PRIORITY.indexOf(a);
+        const ib = LEAGUE_PRIORITY.indexOf(b);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a.localeCompare(b);
+    });
+
+    // Within each league, sort matches by kickoff date (earliest first)
+    const sortedMatchesPerLeague = sortedLeagues.map(league => {
+        const matches = Array.from(matchesByLeague.get(league).entries());
+        matches.sort(([, picksA], [, picksB]) =>
+            new Date(picksA[0].date) - new Date(picksB[0].date));
+        return { league, matches };
+    });
 
     const quota = data.meta?.quota;
     const quotaLow = quota?.low;
@@ -275,10 +303,19 @@ function ValueBets({ onSelectMatch }) {
                 </div>
             )}
 
-            {/* Picks */}
+            {/* Picks — grouped by league with earliest kickoff first inside each */}
             {picks.length > 0 && (
-                <div className="space-y-3">
-                    {Array.from(byMatch.entries()).map(([matchId, matchPicks]) => {
+                <div className="space-y-8">
+                    {sortedMatchesPerLeague.map(({ league, matches }) => (
+                        <div key={league}>
+                            <div className="flex items-baseline gap-3 mb-3 pb-2 border-b border-line">
+                                <h2 className="display text-xl text-ink">
+                                    {COMPETITION_LABELS[league] || league}
+                                </h2>
+                                <span className="mono text-xs text-ink-muted">{matches.length}</span>
+                            </div>
+                            <div className="space-y-3">
+                    {matches.map(([matchId, matchPicks]) => {
                         const first = matchPicks[0];
                         const agreement = first.ensemble_agreement;
                         return (
@@ -436,6 +473,9 @@ function ValueBets({ onSelectMatch }) {
                             </div>
                         );
                     })}
+                            </div>
+                        </div>
+                    ))}
                 </div>
             )}
 

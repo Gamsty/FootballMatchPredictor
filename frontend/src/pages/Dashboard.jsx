@@ -208,8 +208,14 @@ function Dashboard() {
                     leagues. Retrained nightly on Azure with AUC validation against production.
                 </p>
                 <div className="flex items-center gap-3 mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
-                    <span>{filteredMatches.length} shown</span>
-                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                    {/* The 'shown' counter is for the match-grid tabs only. Hide on Value
+                        tab because that view has its own pick counter in its toolbar. */}
+                    {activeTab !== 'value' && (
+                        <>
+                            <span>{filteredMatches.length} shown</span>
+                            <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                        </>
+                    )}
                     <button
                         onClick={() => setShowAbout(true)}
                         className="text-accent hover:text-accent-soft transition-colors inline-flex items-center gap-1.5 cursor-pointer"
