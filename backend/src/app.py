@@ -590,8 +590,18 @@ def scrape_lineups_endpoint():
         db.session.commit()
         return jsonify(summary), 200
     except Exception as e:
+        # Surface exception details in body — Azure log capture for
+        # logger.exception is unreliable on Container Apps, so without this
+        # the caller just sees "Lineup scrape failed" with no actionable info.
+        import traceback
         db.session.rollback()
-        return _error_response("Lineup scrape failed", 500, e, endpoint="scrape_lineups")
+        logger.exception("scrape_lineups crash")
+        return jsonify({
+            "error": "Lineup scrape failed",
+            "exception_type": type(e).__name__,
+            "exception_message": str(e),
+            "traceback_tail": traceback.format_exc().splitlines()[-6:],
+        }), 500
 
 
 @app.route('/api/admin/snapshot-closing-odds', methods=['POST'])
