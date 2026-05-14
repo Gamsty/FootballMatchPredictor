@@ -471,7 +471,18 @@ def refit_calibration():
         }), 200
 
     except Exception as e:
-        return _error_response("Calibration fit failed", 500, e, endpoint="refit_calibration")
+        # Surface the actual exception type + message in the response body so
+        # we don't have to chase Azure log buffering to debug. Stack trace
+        # still goes through logger.exception via _error_response below if we
+        # want it server-side — but the response gives the caller enough.
+        import traceback
+        logger.exception("refit_calibration crash")
+        return jsonify({
+            "error": "Calibration fit failed",
+            "exception_type": type(e).__name__,
+            "exception_message": str(e),
+            "traceback_tail": traceback.format_exc().splitlines()[-5:],
+        }), 500
 
 
 @app.route('/api/admin/backfill-predictions', methods=['POST'])
