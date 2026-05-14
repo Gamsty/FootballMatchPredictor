@@ -1584,15 +1584,28 @@ def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5)
                 random_state=42, n_jobs=-1,
             )
 
-            # TimeSeriesSplit instead of default StratifiedKFold: meta-features for the
-            # LR meta-learner are generated using ONLY past data within each fold, mirroring
-            # how the model will be used at inference time.
-            ts_cv = TimeSeriesSplit(n_splits=cv_splits)
+            # NOTE: We previously used TimeSeriesSplit here to give the LR
+            # meta-learner only past-data fold predictions (less optimistic
+            # than StratifiedKFold for the temporally-ordered match feed).
+            # That broke in sklearn 1.5+ because StackingClassifier calls
+            # `cross_val_predict` internally, which requires the CV scheme to
+            # PARTITION the input (every sample in exactly one test fold).
+            # TimeSeriesSplit by design leaves the earliest samples train-only
+            # so it doesn't partition → ValueError("cross_val_predict only
+            # works for partitions").
+            #
+            # We fall back to plain StratifiedKFold(5). The honest out-of-
+            # sample check is still the time-based HOLDOUT split that's done
+            # before training, so reported holdout AUC remains trustworthy.
+            # The leakage is confined to the meta-learner's training inputs,
+            # which is a smaller concern than zero retraining.
+            from sklearn.model_selection import StratifiedKFold
+            cv_strategy = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
 
             stacking = StackingClassifier(
                 estimators=[('xgb', xgb_est), ('rf', rf_est)],
                 final_estimator=LogisticRegression(max_iter=1000, C=1.0, random_state=42),
-                cv=ts_cv,
+                cv=cv_strategy,
                 stack_method='predict_proba',
                 passthrough=False,
                 n_jobs=1,  # base estimators already use n_jobs=-1 internally; nesting hangs on some CI runners
