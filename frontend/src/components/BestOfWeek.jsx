@@ -212,8 +212,13 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
     // Combo math — multiplicative assuming independence (sometimes wrong, e.g.
     // two picks in the same match are NOT independent — but our UI prevents that
     // by deduping on match_id below).
+    //
+    // Resolve combo legs against the FULL scored pool, not just the top-N
+    // ranked list. Presets (ComboPresets) re-sort by edge or probability and
+    // can pick legs that don't make our Kelly-ranked top 20 — looking them up
+    // in `top` would silently drop them and leave the combo bar empty.
     const comboKeys = new Set(combo);
-    const selectedPicks = top.filter(p => comboKeys.has(pickKey(p)));
+    const selectedPicks = scored.filter(p => comboKeys.has(pickKey(p)));
     const comboProb = selectedPicks.reduce((acc, p) => acc * (p.prob ?? 0), 1);
     const comboOdds = selectedPicks.reduce(
         (acc, p) => acc * (p.odds_median ?? p.odds ?? 1), 1
@@ -247,8 +252,11 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
             // Same match? swap (only one leg per match — different selections
             // in the same fixture are not independent so the multiplicative
             // combo math would be flat-out wrong).
+            //
+            // Look up existing legs against the full scored pool, not just
+            // top-N — preset-loaded legs may live outside top-N.
             const sameMatch = prev.find(k => {
-                const sel = top.find(t => pickKey(t) === k);
+                const sel = scored.find(t => pickKey(t) === k);
                 return sel && sel.match_id === p.match_id;
             });
             if (sameMatch === key) return prev.filter(k => k !== key);
