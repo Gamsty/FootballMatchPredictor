@@ -1554,7 +1554,14 @@ def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5)
                 tmp_csv, include_odds=include_odds, binary_mode=False
             )
 
-            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
+            # `format='mixed'` because the export carries TWO date formats: old
+            # CSV-imported matches stored as 'YYYY-MM-DD' (date-only) and newer
+            # API-imported ones as 'YYYY-MM-DD HH:MM:SS'. Without `mixed`,
+            # pandas infers format from the first row and silently coerces all
+            # mismatches to NaT — which here was the entire holdout window
+            # (newer matches), so retrain reported Holdout: 0 even with
+            # thousands of recent matches in the CSV.
+            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce', format='mixed')
             cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=holdout_days)
             train_mask = df['date'] < cutoff
             hold_mask = df['date'] >= cutoff

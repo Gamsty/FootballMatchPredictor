@@ -234,7 +234,12 @@ def _eval_prod_on_same_holdout(db, prod_model_data, y_hold_expected, cutoff):
             fe.export_features_to_csv(output_path=tmp_csv)
             X, y, df, _, _ = model_training._build_xy_from_csv(tmp_csv, include_odds=False, binary_mode=False)
 
-            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce')
+            # `format='mixed'` — same fix as model_training.train_production_model.
+            # Mixed date formats in the CSV (date-only old rows + datetime new
+            # rows) make pandas pick a strict format from row 0 and silently
+            # NaT all mismatches. That made hold_mask empty and caused the
+            # "prod model can't be evaluated" warning path.
+            df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce', format='mixed')
             hold_mask = df['date'] >= cutoff
 
             X_hold_raw = X[hold_mask].copy()
