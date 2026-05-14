@@ -94,7 +94,11 @@ CORS(app, resources={
     r"/api/*": {
         "origins": ALLOWED_ORIGINS + [VERCEL_PREVIEW_REGEX],
         "methods": ["GET", "POST", "PUT", "DELETE"],
-        "allow_headers": ["Content-Type"]
+        # X-Bet-Token gates POST/DELETE on /api/bets (see _require_bet_write_token).
+        # Without it in allow_headers, browser preflight blocks the request
+        # and axios surfaces it as a generic "Network Error" rather than 401 —
+        # confusingly suggesting the backend is unreachable.
+        "allow_headers": ["Content-Type", "X-Bet-Token"]
     }
 })
 
