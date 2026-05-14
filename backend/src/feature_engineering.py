@@ -343,10 +343,12 @@ class FeatureEngineer:
         """
         Average expected goals FOR by team across recent matches.
 
-        Falls back to None when no xG-tagged matches are available — caller
-        treats None as "use the goals-based proxy". The xg_home / xg_away
-        columns are populated only for understat-covered leagues (top-5),
-        so teams in Eredivisie / Primeira Liga / Championship return None.
+        Returns 0.0 when no xG-tagged matches are available (e.g. teams in
+        understat-uncovered leagues). The 0.0 sentinel matches the goal-based
+        feature convention (`calculate_avg_goals_scored`) so pandas keeps
+        the column as float64 instead of object dtype — critical for
+        sklearn's cross_val_predict which choked on mixed None/float
+        columns with `cross_val_predict only works for partitions`.
 
         xG-for is a strictly better feature than goals-for for short
         windows: a team that creates good chances but doesn't convert is
@@ -372,10 +374,11 @@ class FeatureEngineer:
                 )
             ).order_by(Match.date.desc()).limit(last_n).all()
             xg = [m.xg_away for m in matches]
-        return float(np.mean(xg)) if xg else None
+        return float(np.mean(xg)) if xg else 0.0
 
     def calculate_avg_xg_against(self, team_id, before_date, home=True, last_n=5):
-        """Average xG conceded — mirror of calculate_avg_xg_for."""
+        """Average xG conceded — mirror of calculate_avg_xg_for. Returns 0.0
+        when no xG data available; same dtype-stability rationale."""
         if home:
             matches = self.db.session.query(Match).filter(
                 and_(
@@ -396,7 +399,7 @@ class FeatureEngineer:
                 )
             ).order_by(Match.date.desc()).limit(last_n).all()
             xg = [m.xg_home for m in matches]
-        return float(np.mean(xg)) if xg else None
+        return float(np.mean(xg)) if xg else 0.0
 
     def calculate_head_to_head(self, home_team_id, away_team_id, before_date, last_n=5):
         """
@@ -822,10 +825,10 @@ class FeatureEngineer:
             'away_goals_scored_avg': self.calculate_avg_goals_scored(away_team_id, match_date, False, 5),
             'home_goals_conceded_avg': self.calculate_avg_goals_conceded(home_team_id, match_date, True, 5),
             'away_goals_conceded_avg': self.calculate_avg_goals_conceded(away_team_id, match_date, False, 5),
-            # xG-based equivalents. None for teams in understat-uncovered leagues
-            # (Eredivisie / Primeira Liga / Championship). Model treats NaN as
-            # missing data — XGBoost natively handles NaN; for the stacking
-            # logreg head we impute with the same column's mean at training.
+            # xG-based equivalents. 0.0 for teams in understat-uncovered leagues
+            # (Eredivisie / Primeira Liga / Championship) — matches the goal-
+            # feature fallback so dtype stays float64 (None/float mix breaks
+            # sklearn's cross_val_predict in the stacked-ensemble training).
             'home_xg_for_avg': self.calculate_avg_xg_for(home_team_id, match_date, True, 5),
             'away_xg_for_avg': self.calculate_avg_xg_for(away_team_id, match_date, False, 5),
             'home_xg_against_avg': self.calculate_avg_xg_against(home_team_id, match_date, True, 5),
@@ -1029,10 +1032,10 @@ class FeatureEngineer:
             'away_goals_scored_avg': float(np.mean(away_away_scored)) if away_away_scored else 0.0,
             'home_goals_conceded_avg': float(np.mean(home_home_conceded)) if home_home_conceded else 0.0,
             'away_goals_conceded_avg': float(np.mean(away_away_conceded)) if away_away_conceded else 0.0,
-            'home_xg_for_avg': float(np.mean(home_xg_for)) if home_xg_for else None,
-            'away_xg_for_avg': float(np.mean(away_xg_for)) if away_xg_for else None,
-            'home_xg_against_avg': float(np.mean(home_xg_against)) if home_xg_against else None,
-            'away_xg_against_avg': float(np.mean(away_xg_against)) if away_xg_against else None,
+            'home_xg_for_avg': float(np.mean(home_xg_for)) if home_xg_for else 0.0,
+            'away_xg_for_avg': float(np.mean(away_xg_for)) if away_xg_for else 0.0,
+            'home_xg_against_avg': float(np.mean(home_xg_against)) if home_xg_against else 0.0,
+            'away_xg_against_avg': float(np.mean(away_xg_against)) if away_xg_against else 0.0,
             'home_win_rate': float(home_wr),
             'away_win_rate': float(away_wr),
             'h2h_home_wins': h2h_home_wins,
