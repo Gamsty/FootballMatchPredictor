@@ -327,6 +327,13 @@ class FootballDataCollector:
                     now = datetime.now()
                     season_year = now.year if now.month >= 8 else now.year - 1
 
+                # Extract scores + winner for matches that have already finished
+                # within our query window. football-data.org's /matches endpoint
+                # returns finished matches with score data inline — leaving
+                # these as None would silently drop results and prevent bet
+                # settlement / calibration backfill.
+                score = match.get('score') or {}
+                full_time = score.get('fullTime') or {}
                 fixtures.append({
                     'api_id': match['id'],
                     'competition': comp_name,
@@ -341,9 +348,9 @@ class FootballDataCollector:
                     'away_team_api_id': match['awayTeam']['id'],
                     'away_team_name': match['awayTeam']['name'],
                     'away_team_short': match['awayTeam'].get('shortName', ''),
-                    'home_score': None,
-                    'away_score': None,
-                    'winner': None,
+                    'home_score': full_time.get('home'),
+                    'away_score': full_time.get('away'),
+                    'winner': score.get('winner'),
                 })
             except (KeyError, TypeError) as e:
                 print(f"Error processing fixture {match.get('id', '?')}: {e}")

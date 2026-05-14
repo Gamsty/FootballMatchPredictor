@@ -25,6 +25,35 @@ api.interceptors.response.use(
     }
 );
 
+// Bet-write token — gates POST/DELETE on /api/bets and /api/bets/combo when
+// the backend has BET_WRITE_TOKEN set. Stored per-device in localStorage.
+// User sets it via `?bet_token=<value>` in URL once, persists thereafter.
+// Sent on bet mutations only — read endpoints stay unauthenticated.
+const BET_TOKEN_STORAGE_KEY = 'fmp.bet_token';
+
+export function getBetToken() {
+    if (typeof window === 'undefined') return null;
+    // Bootstrap from URL on first visit, then cache to localStorage.
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get('bet_token');
+    if (fromUrl === 'clear') {
+        localStorage.removeItem(BET_TOKEN_STORAGE_KEY);
+        return null;
+    }
+    if (fromUrl) {
+        localStorage.setItem(BET_TOKEN_STORAGE_KEY, fromUrl);
+        return fromUrl;
+    }
+    return localStorage.getItem(BET_TOKEN_STORAGE_KEY);
+}
+
+function withBetTokenHeader(extra = {}) {
+    const token = getBetToken();
+    return token
+        ? { ...extra, headers: { ...(extra.headers || {}), 'X-Bet-Token': token } }
+        : extra;
+}
+
 // API methods
 export const footballAPI = {
 
@@ -97,17 +126,17 @@ export const footballAPI = {
         return response.data;
     },
     createBet: async (payload) => {
-        const response = await api.post('/bets', payload);
+        const response = await api.post('/bets', payload, withBetTokenHeader());
         return response.data;
     },
     createComboBet: async (payload) => {
         // Combo bet — payload is {legs: [...], stake, bookmaker?, notes?}.
         // Returns a single Bet row with market='combo' and combo_legs filled.
-        const response = await api.post('/bets/combo', payload);
+        const response = await api.post('/bets/combo', payload, withBetTokenHeader());
         return response.data;
     },
     deleteBet: async (betId) => {
-        const response = await api.delete(`/bets/${betId}`);
+        const response = await api.delete(`/bets/${betId}`, withBetTokenHeader());
         return response.data;
     },
     getBetsPerformance: async (params = {}, { signal } = {}) => {

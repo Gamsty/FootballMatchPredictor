@@ -1,0 +1,45 @@
+name: Refresh fixtures
+
+# Syncs upcoming + recently-finished fixtures from football-data.org into our
+# Postgres. Critical for bet auto-settle: a match doesn't get its scores +
+# winner until this runs after kickoff, and until those are set the bet stays
+# pending.
+#
+# Frequency rationale:
+#   - football-data.org free tier allows 10 requests/min.
+#   - One refresh call fans out to one request per competition + season chunk
+#     (~10-20 requests). Running every 4h gives ~6 runs/day × 20 reqs ≈ 120
+#     reqs/day. Well within the quota.
+#   - Match finish → first refresh: at worst 4h delay. Bet settles on next
+#     /api/bets/performance call after that.
+#
+# Secrets:
+#   RELOAD_TOKEN  same shared secret used by other admin endpoints
+#   BACKEND_URL   prod backend URL
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # every 4 hours on the hour
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger fixture refresh
+        env:
+          RELOAD_TOKEN: ${{ secrets.RELOAD_TOKEN }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+        run: |
+          if [ -z "$RELOAD_TOKEN" ] || [ -z "$BACKEND_URL" ]; then
+            echo "Missing RELOAD_TOKEN or BACKEND_URL secret — skipping."
+            exit 1
+          fi
+          # days=14 covers the upcoming + just-finished window. Server clamps
+          # to ≤60 anyway.
+          response=$(curl -fsS -X POST "$BACKEND_URL/api/fixtures/refresh?days=14" \
+            -H "X-Reload-Token: $RELOAD_TOKEN")
+          echo "Response: $response"

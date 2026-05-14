@@ -515,9 +515,13 @@ function ValueBets({ onSelectMatch }) {
 // Exported so BestOfWeek can reuse the same modal.
 // ----------------------------------------------------------------------------
 
-export function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
+export function LogBetModal({ pick, defaultStake, defaultOdds, defaultBookmaker, onClose, onLogged }) {
     const [stake, setStake] = useState(defaultStake);
-    const [bookmaker, setBookmaker] = useState(pick.bookmaker || '');
+    // Odds at-bet is editable so the user can override Pinnacle's median with
+    // the actual price they got at their book (typically NT). Default to NT
+    // odds if caller pre-filled them, otherwise the pick's best/median.
+    const [odds, setOdds] = useState(defaultOdds ?? pick.odds);
+    const [bookmaker, setBookmaker] = useState(defaultBookmaker ?? pick.bookmaker ?? '');
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState(null);
@@ -527,19 +531,28 @@ export function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
             setError('Stake must be > 0');
             return;
         }
+        if (!odds || odds <= 1.0) {
+            setError('Odds must be > 1.0');
+            return;
+        }
         setSubmitting(true);
         setError(null);
         try {
+            // Recompute edge against the actual odds used (not Pinnacle's).
+            // When user logs at NT 2.70 vs Pinnacle 2.90, edge_at_bet should
+            // reflect what they actually got — otherwise CLV/edge tracking
+            // is comparing apples to oranges.
+            const actualEdge = (pick.prob ?? 0) * Number(odds) - 1;
             await footballAPI.createBet({
                 match_id: pick.match_id,
                 market: pick.market,
                 outcome_key: pick.outcome_key,
                 outcome_label: pick.outcome,
-                odds_at_bet: pick.odds,
+                odds_at_bet: Number(odds),
                 stake: Number(stake),
                 bookmaker: bookmaker || pick.bookmaker || null,
                 model_prob_at_bet: pick.prob,
-                edge_at_bet: pick.edge_best ?? pick.edge,
+                edge_at_bet: actualEdge,
                 notes: notes || null,
                 placed_via: 'frontend',
             });
@@ -566,8 +579,9 @@ export function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
         }
     };
 
-    const potentialReturn = stake * pick.odds;
+    const potentialReturn = stake * (Number(odds) || 0);
     const potentialProfit = potentialReturn - stake;
+    const liveEdge = (pick.prob ?? 0) * (Number(odds) || 0) - 1;
 
     return (
         <div
@@ -594,12 +608,25 @@ export function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
 
                 <div className="px-5 py-5 space-y-4">
                     <div className="grid grid-cols-2 gap-3">
-                        <ReadOnlyField label="Odds" value={pick.odds.toFixed(2)} />
                         <ReadOnlyField label="Model prob" value={pct(pick.prob)} />
-                        <ReadOnlyField label="Edge"
-                            value={`+${pct(pick.edge_best ?? pick.edge)}`}
-                            className={(pick.edge_best ?? pick.edge) >= SUSPICIOUS_EDGE ? 'text-warning' : 'text-positive'} />
-                        <ReadOnlyField label="Suggested book" value={pick.bookmaker || '—'} />
+                        <ReadOnlyField label="Edge at these odds"
+                            value={`${liveEdge >= 0 ? '+' : ''}${pct(liveEdge)}`}
+                            className={liveEdge >= SUSPICIOUS_EDGE ? 'text-warning' : liveEdge >= 0 ? 'text-positive' : 'text-danger'} />
+                        <ReadOnlyField label="Suggested book (sharp)" value={pick.bookmaker || '—'} />
+                        <ReadOnlyField label="Pinnacle median odds" value={pick.odds.toFixed(2)} />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Odds at bet</label>
+                        <input
+                            type="number"
+                            min="1.01"
+                            step="0.01"
+                            value={odds}
+                            onChange={(e) => setOdds(Number(e.target.value))}
+                            className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                            title="Actual odds you got — typically NT odds, not Pinnacle. Edge above recalculates from this."
+                        />
                     </div>
 
                     <div>

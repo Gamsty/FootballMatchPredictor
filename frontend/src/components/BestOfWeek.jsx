@@ -589,6 +589,11 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                                                     onClick={() => setPickToLog({
                                                         pick: p,
                                                         defaultStake: bankroll > 0 ? Math.round(kellyStake) : 100,
+                                                        // If user has typed NT odds for this pick, prefill the
+                                                        // modal with those — that's the actual price they're
+                                                        // betting on. Falls back to Pinnacle median odds.
+                                                        defaultOdds: ntOdds[logKey] ?? p.odds,
+                                                        defaultBookmaker: ntOdds[logKey] != null ? 'Norsk Tipping' : p.bookmaker,
                                                     })}
                                                     className="mono text-[0.65rem] uppercase tracking-[0.12em] px-2 py-1 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
                                                 >
@@ -614,6 +619,8 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                 <LogBetModal
                     pick={pickToLog.pick}
                     defaultStake={pickToLog.defaultStake}
+                    defaultOdds={pickToLog.defaultOdds}
+                    defaultBookmaker={pickToLog.defaultBookmaker}
                     onClose={() => setPickToLog(null)}
                     onLogged={() => {
                         setLogStatus(prev => ({ ...prev, [pickKey(pickToLog.pick)]: 'logged' }));

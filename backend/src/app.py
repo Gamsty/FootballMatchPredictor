@@ -294,6 +294,34 @@ def _require_admin_token() -> bool:
     return hmac.compare_digest(expected_token, provided_token)
 
 
+def _require_bet_write_token() -> bool:
+    """
+    Gate POST/DELETE on /api/bets and /api/bets/combo behind a token so random
+    visitors can't pollute the bet log. The bet log is publicly readable —
+    that's intentional — but only the operator should be able to write.
+
+    Two-tier design:
+      - BET_WRITE_TOKEN unset → endpoints accept all requests (backward compat
+        for pre-auth deployments + local dev). Logs a warning so it's not
+        silently insecure forever.
+      - BET_WRITE_TOKEN set    → require matching X-Bet-Token header.
+
+    Kept separate from RELOAD_TOKEN because we hand this token to the browser
+    (via ?bet_token=X → localStorage) and don't want infra-level secrets in
+    client storage.
+    """
+    expected_token = os.getenv("BET_WRITE_TOKEN")
+    if not expected_token:
+        # Pre-auth deployment; don't block. Log once-ish so this isn't silently
+        # exploitable forever. (Real "log once" would need a sentinel; a warning
+        # per call is fine since /api/bets traffic is low.)
+        logger.warning("BET_WRITE_TOKEN unset — bet writes are unauthenticated. "
+                       "Set BET_WRITE_TOKEN env var to require X-Bet-Token header.")
+        return True
+    provided_token = request.headers.get("X-Bet-Token", "")
+    return hmac.compare_digest(expected_token, provided_token)
+
+
 @app.route('/api/admin/reload-model', methods=['POST'])
 def reload_model():
     """
@@ -1330,9 +1358,21 @@ def _resolve_leg(leg: dict) -> str | None:
     """
     Resolve one combo leg against the current DB state.
     Returns 'won', 'lost', 'void', or None if the leg's match isn't finished.
+
+    Status semantics:
+      - FINISHED with scores → won/lost via the resolver
+      - CANCELLED → void (matches Pinnacle's rule: cancelled leg voids the leg
+        which in turn voids the combo here since we don't model partial-stake
+        reduction). Without this, a cancelled match would leave the combo
+        pending forever.
+      - Anything else (SCHEDULED/TIMED/IN_PLAY/POSTPONED/...) → None (pending)
     """
     match = db.session.query(Match).filter_by(id=leg.get('match_id')).first()
-    if not match or match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
+    if not match:
+        return None
+    if match.status == 'CANCELLED':
+        return 'void'
+    if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
         return None
     resolver = _BET_OUTCOME_RESOLVERS.get(leg.get('market'), {}).get(leg.get('outcome_key'))
     if resolver is None:
@@ -1392,6 +1432,14 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
         return True
 
     # Single-leg bet (h2h, totals_2_5, btts, compound)
+    # CANCELLED matches void the bet (matches typical bookie rule). Without this
+    # a cancelled match leaves the bet pending forever even after we know it
+    # won't play.
+    if match.status == 'CANCELLED':
+        bet.status = 'void'
+        bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        bet.profit_loss = 0.0
+        return True
     if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
         return False
 
@@ -1509,6 +1557,8 @@ def bets_collection():
             return _error_response("Failed to load bets", 500, e, endpoint="bets_list")
 
     # POST
+    if not _require_bet_write_token():
+        return jsonify({'error': 'Unauthorized — provide X-Bet-Token header'}), 401
     try:
         data = request.get_json(silent=True) or {}
         required = ['match_id', 'market', 'outcome_key', 'odds_at_bet', 'stake']
@@ -1600,6 +1650,8 @@ def create_combo_bet():
 
     Response: created bet dict (201) or {error: ...} (400/404).
     """
+    if not _require_bet_write_token():
+        return jsonify({'error': 'Unauthorized — provide X-Bet-Token header'}), 401
     try:
         data = request.get_json(silent=True) or {}
         legs_raw = data.get('legs') or []
@@ -1716,6 +1768,8 @@ def bet_detail(bet_id):
     if not bet:
         return jsonify({'error': 'Bet not found'}), 404
     if request.method == 'DELETE':
+        if not _require_bet_write_token():
+            return jsonify({'error': 'Unauthorized — provide X-Bet-Token header'}), 401
         try:
             db.session.delete(bet)
             db.session.commit()
@@ -1922,6 +1976,16 @@ def refresh_fixtures():
             if existing:
                 existing.status = fixture['status']
                 existing.date = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00'))
+                # Backfill scores + winner when the source has them (i.e. the
+                # match has already finished within our query window). Without
+                # this, FINISHED matches in our DB stay scoreless and bets
+                # never auto-settle. Calibration backfill also depends on this.
+                if fixture.get('home_score') is not None:
+                    existing.home_score = fixture['home_score']
+                if fixture.get('away_score') is not None:
+                    existing.away_score = fixture['away_score']
+                if fixture.get('winner') is not None:
+                    existing.winner = fixture['winner']
                 updated += 1
             else:
                 db.session.add(Match(

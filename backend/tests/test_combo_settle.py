@@ -165,3 +165,138 @@ class TestComboEarlySettle:
         changed = _settle_one_bet(bet, SimpleNamespace())
         assert changed is True
         assert bet.status == 'void'
+
+
+# ---------------------------------------------------------------------------
+# CANCELLED-match handling — without this, cancelled matches leave bets pending
+# forever even though we know the bet will never settle to won/lost.
+# ---------------------------------------------------------------------------
+
+class TestCancelledMatch:
+    def test_single_bet_voids_on_cancelled_match(self):
+        from app import _settle_one_bet
+        from datetime import datetime
+        bet = SimpleNamespace(
+            id=1, market='h2h', outcome_key='home', stake=100.0,
+            odds_at_bet=2.0, status='pending', settled_at=None,
+            profit_loss=None, placed_at=datetime(2026, 5, 1),
+            combo_legs=None,
+        )
+        cancelled_match = SimpleNamespace(
+            status='CANCELLED', home_score=None, away_score=None, winner=None
+        )
+        changed = _settle_one_bet(bet, cancelled_match)
+        assert changed is True
+        assert bet.status == 'void'
+        assert bet.profit_loss == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Auth gate for bet writes — without BET_WRITE_TOKEN env, allows all (backward
+# compat). With it set, requires matching X-Bet-Token header.
+# ---------------------------------------------------------------------------
+
+class TestBetWriteAuth:
+    def test_no_token_env_allows_unauthenticated(self, monkeypatch):
+        from app import app as flask_app, _require_bet_write_token
+        monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
+        with flask_app.test_request_context('/api/bets', method='POST'):
+            assert _require_bet_write_token() is True
+
+    def test_token_env_set_rejects_missing_header(self, monkeypatch):
+        from app import app as flask_app, _require_bet_write_token
+        monkeypatch.setenv('BET_WRITE_TOKEN', 'expected-value')
+        with flask_app.test_request_context('/api/bets', method='POST'):
+            assert _require_bet_write_token() is False
+
+    def test_token_env_set_rejects_wrong_header(self, monkeypatch):
+        from app import app as flask_app, _require_bet_write_token
+        monkeypatch.setenv('BET_WRITE_TOKEN', 'expected-value')
+        with flask_app.test_request_context('/api/bets', method='POST',
+                                            headers={'X-Bet-Token': 'wrong'}):
+            assert _require_bet_write_token() is False
+
+    def test_token_env_set_accepts_matching_header(self, monkeypatch):
+        from app import app as flask_app, _require_bet_write_token
+        monkeypatch.setenv('BET_WRITE_TOKEN', 'expected-value')
+        with flask_app.test_request_context('/api/bets', method='POST',
+                                            headers={'X-Bet-Token': 'expected-value'}):
+            assert _require_bet_write_token() is True
+
+
+# ---------------------------------------------------------------------------
+# Fixture score extraction — verifies the data_collection bug where home_score
+# was hardcoded to None is actually fixed.
+# ---------------------------------------------------------------------------
+
+class TestFixtureScoreExtraction:
+    """
+    get_upcoming_fixtures hardcoded home_score/away_score/winner to None for
+    every match, even FINISHED ones with score data inline. That silently
+    dropped results and prevented bet settlement.
+    """
+
+    def _fake_api_match(self, home_score, away_score, winner, status='FINISHED'):
+        return {
+            'id': 12345,
+            'competition': {'id': 2021, 'name': 'Premier League'},
+            'season': {'startDate': '2025-08-15'},
+            'matchday': 30,
+            'stage': 'REGULAR_SEASON',
+            'utcDate': '2026-05-16T14:00:00Z',
+            'status': status,
+            'homeTeam': {'id': 1, 'name': 'Arsenal', 'shortName': 'Arsenal'},
+            'awayTeam': {'id': 2, 'name': 'Spurs', 'shortName': 'Spurs'},
+            'score': {
+                'fullTime': {'home': home_score, 'away': away_score},
+                'winner': winner,
+            },
+        }
+
+    def test_finished_match_carries_scores_through(self, monkeypatch):
+        import data_collection
+        # COMPETITIONS lookup must include 2021 (it's the EPL ID in our
+        # SUPPORTED_COMPETITIONS map). If the test env's COMPETITIONS dict
+        # doesn't have it, this test is a no-op — skip with a clear reason.
+        if 2021 not in data_collection.COMPETITIONS:
+            import pytest
+            pytest.skip(f"Competition 2021 not in COMPETITIONS: {data_collection.COMPETITIONS}")
+
+        # Stub the HTTP call to return one finished match.
+        fake_match = self._fake_api_match(2, 1, 'HOME_TEAM')
+        monkeypatch.setattr(
+            data_collection.FootballDataCollector,
+            '_make_requests',
+            lambda self, path, params=None: {'matches': [fake_match]},
+        )
+
+        collector = data_collection.FootballDataCollector.__new__(data_collection.FootballDataCollector)
+        collector.api_key = 'fake'
+        fixtures = collector.get_upcoming_fixtures(days=7)
+
+        assert len(fixtures) == 1
+        f = fixtures[0]
+        assert f['home_score'] == 2, "home_score must propagate from API response"
+        assert f['away_score'] == 1
+        assert f['winner'] == 'HOME_TEAM'
+
+    def test_unfinished_match_has_none_scores(self, monkeypatch):
+        import data_collection
+        if 2021 not in data_collection.COMPETITIONS:
+            import pytest
+            pytest.skip(f"Competition 2021 not in COMPETITIONS")
+
+        # Future match: API returns score block with all-None values.
+        future_match = self._fake_api_match(None, None, None, status='SCHEDULED')
+        monkeypatch.setattr(
+            data_collection.FootballDataCollector,
+            '_make_requests',
+            lambda self, path, params=None: {'matches': [future_match]},
+        )
+
+        collector = data_collection.FootballDataCollector.__new__(data_collection.FootballDataCollector)
+        collector.api_key = 'fake'
+        fixtures = collector.get_upcoming_fixtures(days=7)
+
+        assert fixtures[0]['home_score'] is None
+        assert fixtures[0]['winner'] is None

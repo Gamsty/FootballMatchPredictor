@@ -43,6 +43,18 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
           identity: 'system'
         }
         {
+          // Bet-write gate for POST/DELETE on /api/bets and /api/bets/combo.
+          // Public visitors can READ the bet log; only requests carrying a
+          // matching X-Bet-Token header can write. Kept separate from
+          // reload-token because this one's value gets shipped to browsers
+          // (via ?bet_token=X → localStorage). If the KV secret doesn't
+          // exist, the backend logs a warning and allows unauthenticated
+          // writes (backward compat for pre-auth deployments).
+          name: 'bet-write-token'
+          keyVaultUrl: 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/secrets/bet-write-token'
+          identity: 'system'
+        }
+        {
           // The Odds API key — powers /api/value-bets. When this secret doesn't
           // exist in Key Vault the backend gracefully degrades (Value tab shows
           // "not configured"), so the deploy doesn't hard-fail without it. Create
@@ -80,6 +92,7 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'FOOTBALL_API_KEY', secretRef: 'football-api-key' }
             { name: 'RELOAD_TOKEN', secretRef: 'reload-token' }
+            { name: 'BET_WRITE_TOKEN', secretRef: 'bet-write-token' }
             { name: 'ODDS_API_KEY', secretRef: 'odds-api-key' }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
           ]
