@@ -28,6 +28,8 @@ import { useState, useEffect, useRef } from 'react';
 import { footballAPI } from '../services/api';
 import { formatTime, formatMatchDate, COMPETITION_LABELS } from '../utils/constants';
 import { LogBetModal } from './ValueBets';
+import ComboPresets from './ComboPresets';
+import CompoundMarkets from './CompoundMarkets';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const FRACTIONAL_KELLY = 0.25;
@@ -232,6 +234,13 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
         : 0;
     const comboReturn = comboStake * comboOdds;
 
+    // Load a preset combo (from ComboPresets) into the active combo selection.
+    // Replaces any prior selection — presets are presented as drop-in
+    // recommendations, not additions.
+    const loadComboFromPreset = (legs) => {
+        setCombo(legs.map(pickKey));
+    };
+
     const toggleCombo = (p) => {
         const key = pickKey(p);
         setCombo(prev => {
@@ -282,6 +291,13 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                     )}
                 </div>
             </div>
+
+            {/* Auto-generated combo presets (Safest / Best edge / Treble) */}
+            <ComboPresets
+                scoredPicks={scored}
+                bankroll={bankroll}
+                onUseCombo={loadComboFromPreset}
+            />
 
             {/* Combo builder — sticky at top when active */}
             {selectedPicks.length > 0 && (
@@ -556,6 +572,11 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                     })}
                 </ol>
             )}
+
+            {/* Compound Markets — BTTS & Win, model-only with NT odds entry.
+                Lives below the singles list because singles are the primary
+                workflow; compounds are a "while you're here" supplement. */}
+            <CompoundMarkets />
 
             {/* Log Bet modal — reused from ValueBets */}
             {pickToLog && (
