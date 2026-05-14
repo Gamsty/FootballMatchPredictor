@@ -24,8 +24,14 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       // 'Schedule' = cron-triggered. 'Manual' would let us start runs via
       // az CLI but skip the schedule. Schedule is what we want here.
       triggerType: 'Schedule'
-      replicaTimeout: 3600        // 1h max — retrain is typically 5-15min on 1 CPU
-      replicaRetryLimit: 1
+      // 2h timeout: feature computation on 40k+ matches with 0.5 CPU was
+      // hitting 30min, then re-trying after replica crash exhausted the
+      // previous 1h budget. 7200s gives breathing room on slow attempts.
+      replicaTimeout: 7200
+      // No retries — if the first attempt OOMs or times out, retrying with
+      // the same resource limits just wastes time. Better to fail fast and
+      // surface the issue.
+      replicaRetryLimit: 0
       scheduleTriggerConfig: {
         cronExpression: cronExpression
         parallelism: 1
@@ -67,11 +73,11 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           // pandas, xgboost, sklearn) — no need for a separate image.
           command: ['python']
           args: ['jobs/retrain.py']
-          // Retrain is CPU-bound (XGBoost training on 7k+ matches). 1 vCPU /
-          // 2Gi keeps the job within the consumption-plan SKU limits and
-          // typically finishes in 5-15min. Raise both if you ever hit OOM
-          // from a much larger training set.
-          resources: { cpu: json('1.0'), memory: '2.0Gi' }
+          // 2 vCPU / 4Gi — 1 CPU / 2Gi hit OOM during feature computation on
+          // 40k+ matches with the new xG aggregations. Stacked-ensemble
+          // training itself isn't huge but the in-memory feature cache +
+          // joblib model serialization spike near 3GB at peaks.
+          resources: { cpu: json('2.0'), memory: '4.0Gi' }
           env: [
             { name: 'USE_BLOB_STORAGE', value: 'true' }
             { name: 'AZURE_STORAGE_ACCOUNT', value: storageAccountName }
