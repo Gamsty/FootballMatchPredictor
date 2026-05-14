@@ -128,6 +128,25 @@ class Match(Base):
     avg_draw_prob = Column(Float)
     avg_away_prob = Column(Float)
 
+    # Expected goals from understat (covers top-5 leagues only — NULL elsewhere).
+    # Backfilled by jobs/scrape_xg.py; used by FeatureEngineer to build
+    # recent-form xG aggregates that the model learns on alongside raw goals.
+    xg_home = Column(Float)
+    xg_away = Column(Float)
+
+    # Sofascore event_id — caches the lookup so we don't re-resolve every
+    # time we fetch lineups. Set by jobs/scrape_lineups.py the first time
+    # we find this match on sofascore.
+    sofascore_event_id = Column(Integer, index=True)
+
+    # JSON snapshot of starting XI + bench + missing players. Refreshed
+    # ~1h before kickoff by jobs/scrape_lineups.py. Stays NULL when the
+    # lineup hasn't been posted yet or the match doesn't exist on sofascore.
+    # Shape: {confirmed, home_starting:[], away_starting:[],
+    #         home_missing:[{name,reason}], away_missing:[]}
+    lineups = Column(JSON)
+    lineups_fetched_at = Column(DateTime)
+
     # Relationships — link back to teams and forward to features/predictions
     # uselist=False means one-to-one (each match has one feature set and one prediction)
     home_team = relationship("Team", foreign_keys=[home_team_id], back_populates="home_matches")
@@ -176,6 +195,23 @@ class MatchFeatures(Base):
     home_goals_conceded_avg = Column(Float)
     away_goals_scored_avg = Column(Float)
     away_goals_conceded_avg = Column(Float)
+
+    # Expected goals averages — same shape as raw goal averages but from
+    # understat's shot-quality model. Strictly better signal for short windows
+    # (luck-corrected). NULL for teams in leagues understat doesn't cover —
+    # FeatureEngineer falls back to the raw goal averages then.
+    home_xg_for_avg = Column(Float)
+    home_xg_against_avg = Column(Float)
+    away_xg_for_avg = Column(Float)
+    away_xg_against_avg = Column(Float)
+
+    # Lineup-derived injury features. Counts of regular starters missing
+    # from sofascore's pre-match lineup. NULL when lineup wasn't available
+    # at scrape time (small sample, deep history, or league not covered).
+    # Model uses these alongside xG; missing players hurt prediction quality
+    # in goal-poor leagues where one striker carries the squad.
+    home_starters_missing = Column(Integer)
+    away_starters_missing = Column(Integer)
 
     # Head-to-head record — results from last 5 meetings between these two teams
     h2h_home_wins = Column(Integer)
@@ -450,6 +486,31 @@ def _apply_lightweight_migrations():
     MIGRATIONS = [
         ('bets', 'combo_legs',
          'JSONB' if engine.dialect.name == 'postgresql' else 'JSON'),
+        # understat xG — covers top-5 leagues only; rest of matches stay NULL.
+        # FeatureEngineer treats NULL as "use the goal-based fallback" so
+        # mixed coverage degrades gracefully.
+        ('matches', 'xg_home', 'FLOAT'),
+        ('matches', 'xg_away', 'FLOAT'),
+        # xG-based rolling features. Computed by FeatureEngineer when xG
+        # data is available for the team's recent matches; NULL otherwise.
+        # Adding new columns to match_features is safe — the loaded model
+        # uses feature_names to select inputs, so old models ignore them.
+        ('match_features', 'home_xg_for_avg', 'FLOAT'),
+        ('match_features', 'home_xg_against_avg', 'FLOAT'),
+        ('match_features', 'away_xg_for_avg', 'FLOAT'),
+        ('match_features', 'away_xg_against_avg', 'FLOAT'),
+        # Sofascore lineup snapshot per match. Populated by jobs/scrape_lineups.py
+        # ~1h before kickoff. Stays NULL for matches not on sofascore.
+        ('matches', 'sofascore_event_id', 'INTEGER'),
+        ('matches', 'lineups',
+         'JSONB' if engine.dialect.name == 'postgresql' else 'JSON'),
+        ('matches', 'lineups_fetched_at', 'TIMESTAMP'),
+        # Aggregated injury-impact features per match. Counts of missing players
+        # weighted by sofascore's missingType tag. Computed at scrape time, not
+        # at prediction time — so we don't pay sofascore-fetch latency on the
+        # request path.
+        ('match_features', 'home_starters_missing', 'INTEGER'),
+        ('match_features', 'away_starters_missing', 'INTEGER'),
     ]
 
     inspector = inspect(engine)

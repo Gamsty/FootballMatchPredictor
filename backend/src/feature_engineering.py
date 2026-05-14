@@ -339,6 +339,65 @@ class FeatureEngineer:
 
         return float(np.mean(goals)) if goals else 0.0
     
+    def calculate_avg_xg_for(self, team_id, before_date, home=True, last_n=5):
+        """
+        Average expected goals FOR by team across recent matches.
+
+        Falls back to None when no xG-tagged matches are available — caller
+        treats None as "use the goals-based proxy". The xg_home / xg_away
+        columns are populated only for understat-covered leagues (top-5),
+        so teams in Eredivisie / Primeira Liga / Championship return None.
+
+        xG-for is a strictly better feature than goals-for for short
+        windows: a team that creates good chances but doesn't convert is
+        about to mean-revert, and the goals-only signal misses that.
+        """
+        if home:
+            matches = self.db.session.query(Match).filter(
+                and_(
+                    Match.home_team_id == team_id,
+                    Match.date < before_date,
+                    Match.status == 'FINISHED',
+                    Match.xg_home.isnot(None),
+                )
+            ).order_by(Match.date.desc()).limit(last_n).all()
+            xg = [m.xg_home for m in matches]
+        else:
+            matches = self.db.session.query(Match).filter(
+                and_(
+                    Match.away_team_id == team_id,
+                    Match.date < before_date,
+                    Match.status == 'FINISHED',
+                    Match.xg_away.isnot(None),
+                )
+            ).order_by(Match.date.desc()).limit(last_n).all()
+            xg = [m.xg_away for m in matches]
+        return float(np.mean(xg)) if xg else None
+
+    def calculate_avg_xg_against(self, team_id, before_date, home=True, last_n=5):
+        """Average xG conceded — mirror of calculate_avg_xg_for."""
+        if home:
+            matches = self.db.session.query(Match).filter(
+                and_(
+                    Match.home_team_id == team_id,
+                    Match.date < before_date,
+                    Match.status == 'FINISHED',
+                    Match.xg_away.isnot(None),
+                )
+            ).order_by(Match.date.desc()).limit(last_n).all()
+            xg = [m.xg_away for m in matches]
+        else:
+            matches = self.db.session.query(Match).filter(
+                and_(
+                    Match.away_team_id == team_id,
+                    Match.date < before_date,
+                    Match.status == 'FINISHED',
+                    Match.xg_home.isnot(None),
+                )
+            ).order_by(Match.date.desc()).limit(last_n).all()
+            xg = [m.xg_home for m in matches]
+        return float(np.mean(xg)) if xg else None
+
     def calculate_head_to_head(self, home_team_id, away_team_id, before_date, last_n=5):
         """
         Calculate head-to-head record between two teams
@@ -763,6 +822,14 @@ class FeatureEngineer:
             'away_goals_scored_avg': self.calculate_avg_goals_scored(away_team_id, match_date, False, 5),
             'home_goals_conceded_avg': self.calculate_avg_goals_conceded(home_team_id, match_date, True, 5),
             'away_goals_conceded_avg': self.calculate_avg_goals_conceded(away_team_id, match_date, False, 5),
+            # xG-based equivalents. None for teams in understat-uncovered leagues
+            # (Eredivisie / Primeira Liga / Championship). Model treats NaN as
+            # missing data — XGBoost natively handles NaN; for the stacking
+            # logreg head we impute with the same column's mean at training.
+            'home_xg_for_avg': self.calculate_avg_xg_for(home_team_id, match_date, True, 5),
+            'away_xg_for_avg': self.calculate_avg_xg_for(away_team_id, match_date, False, 5),
+            'home_xg_against_avg': self.calculate_avg_xg_against(home_team_id, match_date, True, 5),
+            'away_xg_against_avg': self.calculate_avg_xg_against(away_team_id, match_date, False, 5),
             'home_win_rate': self.calculate_win_rate(home_team_id, match_date, True, 10),
             'away_win_rate': self.calculate_win_rate(away_team_id, match_date, False, 10),
             'h2h_home_wins': h2h_home,
@@ -865,6 +932,14 @@ class FeatureEngineer:
         home_home_scored = [m.home_score for m in home_home if m.home_score is not None]
         away_away_scored = [m.away_score for m in away_away if m.away_score is not None]
 
+        # xG averages — only for matches that have xg data (top-5 leagues).
+        # None when sample is empty so caller / model can distinguish from 0.0
+        # (which legitimately means "team averages 0 xG", essentially never).
+        home_xg_for = [m.xg_home for m in home_home if getattr(m, 'xg_home', None) is not None]
+        away_xg_for = [m.xg_away for m in away_away if getattr(m, 'xg_away', None) is not None]
+        home_xg_against = [m.xg_away for m in home_home if getattr(m, 'xg_away', None) is not None]
+        away_xg_against = [m.xg_home for m in away_away if getattr(m, 'xg_home', None) is not None]
+
         # Win rate (last 10 home/away)
         home_home_10 = self._get_before(self._team_home_matches[home_id], match_date, 10)
         away_away_10 = self._get_before(self._team_away_matches[away_id], match_date, 10)
@@ -954,6 +1029,10 @@ class FeatureEngineer:
             'away_goals_scored_avg': float(np.mean(away_away_scored)) if away_away_scored else 0.0,
             'home_goals_conceded_avg': float(np.mean(home_home_conceded)) if home_home_conceded else 0.0,
             'away_goals_conceded_avg': float(np.mean(away_away_conceded)) if away_away_conceded else 0.0,
+            'home_xg_for_avg': float(np.mean(home_xg_for)) if home_xg_for else None,
+            'away_xg_for_avg': float(np.mean(away_xg_for)) if away_xg_for else None,
+            'home_xg_against_avg': float(np.mean(home_xg_against)) if home_xg_against else None,
+            'away_xg_against_avg': float(np.mean(away_xg_against)) if away_xg_against else None,
             'home_win_rate': float(home_wr),
             'away_win_rate': float(away_wr),
             'h2h_home_wins': h2h_home_wins,

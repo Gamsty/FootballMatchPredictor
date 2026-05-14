@@ -39,7 +39,7 @@ import re
 
 from database import (
     DatabaseManager, Match, Team, Prediction, PredictionSnapshot, MatchFeatures,
-    Bet, init_db,
+    Bet, OddsSnapshot, init_db,
 )
 from feature_engineering import FeatureEngineer
 from prediction_service import (
@@ -560,6 +560,38 @@ def backfill_predictions():
     except Exception as e:
         db.session.rollback()
         return _error_response("Backfill failed", 500, e, endpoint="backfill_predictions")
+
+
+@app.route('/api/admin/scrape-lineups', methods=['POST'])
+def scrape_lineups_endpoint():
+    """
+    Fetch sofascore lineups for upcoming matches and write to Match.lineups +
+    MatchFeatures.home_starters_missing / away_starters_missing.
+
+    Designed for cron-trigger via GitHub Actions every ~30min during the match
+    window. Most invocations are no-ops (lineups not yet posted), the
+    scraper handles that gracefully with None.
+
+    JSON body (all optional):
+        { "hours": 6, "force": false }
+
+    Auth: X-Reload-Token header.
+    """
+    if not _require_admin_token():
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        from lineups_scrape import run_lineup_scrape
+        body = request.get_json(silent=True) or {}
+        summary = run_lineup_scrape(
+            db=db,
+            hours_window=float(body.get('hours', 6.0)),
+            force=bool(body.get('force', False)),
+        )
+        db.session.commit()
+        return jsonify(summary), 200
+    except Exception as e:
+        db.session.rollback()
+        return _error_response("Lineup scrape failed", 500, e, endpoint="scrape_lineups")
 
 
 @app.route('/api/admin/snapshot-closing-odds', methods=['POST'])
@@ -1455,6 +1487,40 @@ _BET_OUTCOME_RESOLVERS = {
 }
 
 
+def _combo_legs_closing(legs: list[dict]) -> float | None:
+    """
+    Multiply the latest 'closing' OddsSnapshot for each leg to get the combo's
+    effective closing odds. Returns None if any leg is missing a closing
+    snapshot — partial coverage would silently misrepresent CLV.
+
+    A combo's CLV is the bookmaker's combined post-line price at kickoff. Since
+    we don't store combined snapshots, we reconstruct it from per-leg ones.
+    Compound markets (market='compound') don't have closing snapshots in the
+    odds_snapshots table at all (The Odds API doesn't bulk-quote them), so any
+    combo containing a compound leg has no CLV. Returning None for those is
+    correct — better than silently dropping legs.
+    """
+    if not legs:
+        return None
+    product = 1.0
+    for leg in legs:
+        snap = (
+            db.session.query(OddsSnapshot)
+            .filter_by(
+                match_id=leg.get('match_id'),
+                market=leg.get('market'),
+                outcome_key=leg.get('outcome_key'),
+                snapshot_type='closing',
+            )
+            .order_by(desc(OddsSnapshot.snapshot_at))
+            .first()
+        )
+        if not snap or not snap.best_odds or snap.best_odds <= 1.0:
+            return None
+        product *= snap.best_odds
+    return product
+
+
 def _resolve_leg(leg: dict) -> str | None:
     """
     Resolve one combo leg against the current DB state.
@@ -1961,9 +2027,25 @@ def bets_performance():
         win_rate = len(won) / len(settled) if settled else 0
 
         # CLV: avg of (placed_odds / closing_odds - 1). Positive = bet at better
-        # price than the eventual closing line. Only includes bets with closing.
-        clv_bets = [b for b in settled if b.closing_odds and b.closing_odds > 1.0]
-        avg_clv = (sum(b.odds_at_bet / b.closing_odds - 1 for b in clv_bets) / len(clv_bets)
+        # price than the eventual closing line.
+        #
+        # Singles: just use bet.closing_odds (set by snapshot-odds cron's
+        # apply_to_bets pass).
+        #
+        # Combos: closing_odds field is never populated by the snapshot cron
+        # (it only matches market+outcome on the single bet shape). Instead,
+        # multiply the latest 'closing' OddsSnapshot for each leg. A combo
+        # qualifies for CLV only if EVERY leg has a closing snapshot — partial
+        # data would understate or overstate the combined price.
+        clv_bets: list[tuple] = []  # (bet, closing_odds)
+        for b in settled:
+            if b.market == 'combo' and b.combo_legs:
+                legs_closing = _combo_legs_closing(b.combo_legs)
+                if legs_closing is not None:
+                    clv_bets.append((b, legs_closing))
+            elif b.closing_odds and b.closing_odds > 1.0:
+                clv_bets.append((b, b.closing_odds))
+        avg_clv = (sum(b.odds_at_bet / cl - 1 for b, cl in clv_bets) / len(clv_bets)
                    if clv_bets else None)
 
         # Per-market breakdown

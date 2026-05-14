@@ -16,6 +16,10 @@ joblib==1.5.3
 
 # API & HTTP
 requests==2.32.5
+# Cloudflare-aware HTTP for sofascore lineup scraping. Wraps requests with
+# the JS-challenge solver so we don't need a headless browser. Pin to a known
+# stable version — newer minor releases occasionally drop bypass methods.
+cloudscraper==1.2.71
 
 # Fuzzy team-name matching (Odds API ↔ football-data.org naming differences)
 rapidfuzz==3.14.5

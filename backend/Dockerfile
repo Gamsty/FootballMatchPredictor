@@ -29,6 +29,11 @@ COPY --from=builder /root/.local /home/app/.local
 COPY --chown=app:app src/ ./src/
 COPY --chown=app:app wsgi.py gunicorn.conf.py ./
 COPY --chown=app:app models/ ./models/
+# Include jobs/ for Container Apps Job entrypoints (retrain, backfill_predictions,
+# snapshot_odds). Gunicorn itself doesn't touch this directory — only the
+# job-mode containers override CMD to "python jobs/<name>.py". Same image
+# serves both purposes.
+COPY --chown=app:app jobs/ ./jobs/
 
 USER app
 ENV PATH=/home/app/.local/bin:$PATH \

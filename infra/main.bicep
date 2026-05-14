@@ -101,8 +101,29 @@ module containerApp 'modules/containerApp.bicep' = {
   }
 }
 
+// Weekly model retraining — separate Container Apps Job so it can run for
+// 5-15 minutes without holding a gunicorn worker. Cron'd Sunday 02:00 UTC by
+// default; output PrincipalId so caller can assign Storage Blob Data Contributor
+// + Key Vault Secrets User out-of-band (RBAC is managed outside this template).
+module retrainJob 'modules/retrainJob.bicep' = {
+  name: 'retrainJob'
+  params: {
+    name: 'caj-retrain-${prefix}'
+    location: location
+    environmentId: cae.outputs.environmentId
+    acrLoginServer: acr.outputs.loginServer
+    storageAccountName: storage.outputs.name
+    keyVaultName: keyVault.outputs.name
+    imageTag: backendImageTag
+  }
+}
+
 output backendUrl string = containerApp.outputs.fqdn
 output acrLoginServer string = acr.outputs.loginServer
 output storageAccountName string = storage.outputs.name
 output keyVaultName string = keyVault.outputs.name
 output postgresFqdn string = postgres.outputs.fqdn
+// Surfaced so the post-deploy RBAC script can grant Storage Blob Data Contributor
+// + Key Vault Secrets User to the job's identity (see infra/README.md).
+output retrainJobPrincipalId string = retrainJob.outputs.principalId
+output retrainJobName string = retrainJob.outputs.name
