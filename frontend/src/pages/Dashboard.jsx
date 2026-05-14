@@ -2,14 +2,14 @@
 Dashboard Page — Main Landing Page
 
 Shows upcoming match predictions grouped by league with:
-    - Category tabs: "Today" and "Upcoming" (tomorrow + day after)
+    - Category tabs: "Today" and "Upcoming" (next 7 days)
     - Filter buttons: High Confidence, Upset Pick, Banker (multi-select)
     - Match cards: compact prediction cards in a responsive grid
     - Accumulator builder: select bets across matches, calculate combined odds/returns
     - Match detail modal: click a card to see all betting markets
 
 Data flow:
-    1. Fetches predictions from /api/predictions/upcoming (3 days ahead)
+    1. Fetches predictions from /api/predictions/upcoming (7 days ahead)
     2. Client-side filters by tab (today vs upcoming) and category tags
     3. Groups matches by league, sorted by priority (PL first, then alphabetical)
     4. Auto-refreshes every 5 minutes
@@ -77,13 +77,13 @@ function Dashboard() {
     const [accumulator, setAccumulator] = useState([]);
     const [stake, setStake] = useState(100);
 
-    // Fetch all matches for the next 3 days. Tab filtering happens client-side
+    // Fetch all matches for the next 7 days. Tab filtering happens client-side
     // (see filteredMatches below), so the fetch itself doesn't depend on activeTab.
     const fetchPredictions = useCallback(async () => {
         setLoading(true);
         setError(null);
         try {
-            const params = { days: 3, sort_by: 'date' };
+            const params = { days: 7, sort_by: 'date' };
             const data = await footballAPI.getUpcomingPredictions(params);
             setMatches(data.matches || []);
         } catch (err) {
