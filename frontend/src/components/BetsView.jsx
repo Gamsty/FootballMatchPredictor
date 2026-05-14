@@ -180,7 +180,14 @@ function PerfSummary({ perf }) {
                 >
                     {perf.avg_edge_at_bet != null ? pct(perf.avg_edge_at_bet) : 'n/a'}
                 </span>
-                {perf.expected_win_rate != null && perf.win_rate < perf.expected_win_rate - 0.05 && (
+                {/* Only flag underperformance once we have a meaningful sample
+                    of settled bets. With 0 settled, win_rate is trivially 0%
+                    vs ~50% expected — would always show "winning 50% less"
+                    even though nothing has played yet. 10 is the smallest
+                    sample where bucket-vs-actual carries any signal. */}
+                {perf.expected_win_rate != null
+                    && perf.settled_count >= 10
+                    && perf.win_rate < perf.expected_win_rate - 0.05 && (
                     <span className="text-warning ml-2">
                         ← winning {pct(perf.expected_win_rate - perf.win_rate)} less than model predicted
                     </span>
