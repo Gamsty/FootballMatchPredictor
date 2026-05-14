@@ -80,32 +80,55 @@ def run_backfill(
     model_version = str(model_data.get('model_version') or 'unversioned')
     model_type = model_data.get('model_type')
 
-    matches_q = (
-        db.session.query(Match)
-        .filter(and_(
-            Match.status == 'FINISHED',
-            Match.date >= since,
-            Match.winner.isnot(None),
-        ))
-        .order_by(Match.date.asc())
+    # Base query — all finished matches in the window with known winner.
+    base_filter = and_(
+        Match.status == 'FINISHED',
+        Match.date >= since,
+        Match.winner.isnot(None),
     )
 
     if not overwrite:
-        # Skip matches that already have a prediction. We over-fetch (×2) and
-        # then trim to `limit` to make sure we land on `limit` new predictions
-        # when most candidates have already been done — avoids progress
-        # stalls during long catch-up runs.
-        predicted_ids = {p.match_id for p in db.session.query(Prediction.match_id).all()}
-        matches = [m for m in matches_q.limit(limit * 2)
-                   if m.id not in predicted_ids][:limit]
+        # Exclude already-predicted matches AT THE SQL LAYER, not in Python.
+        # The previous version did `.limit(limit*2)` + Python-side filter, which
+        # broke as soon as the first `limit*2` matches were all predicted —
+        # the slice came back empty even though un-predicted matches existed
+        # further down the date axis. That caused the catch-up loop to stop
+        # early with a misleading `remaining_estimate: 0`.
+        predicted_subq = db.session.query(Prediction.match_id).subquery()
+        matches_q = (
+            db.session.query(Match)
+            .filter(base_filter)
+            .filter(~Match.id.in_(predicted_subq))
+            .order_by(Match.date.asc())
+            .limit(limit)
+        )
     else:
-        matches = matches_q.limit(limit).all()
+        matches_q = (
+            db.session.query(Match)
+            .filter(base_filter)
+            .order_by(Match.date.asc())
+            .limit(limit)
+        )
 
+    matches = matches_q.all()
     total = len(matches)
     if total == 0:
+        # Even when this batch is empty, compute the honest remaining count.
+        # Caller's loop uses this to decide whether to stop. The previous
+        # version hardcoded 0 here, which caused premature termination.
+        if not overwrite:
+            predicted_subq = db.session.query(Prediction.match_id).subquery()
+            remaining_now = (
+                db.session.query(Match)
+                .filter(base_filter)
+                .filter(~Match.id.in_(predicted_subq))
+                .count()
+            )
+        else:
+            remaining_now = 0
         return {
             'processed': 0, 'written': 0, 'skipped': 0,
-            'remaining_estimate': 0,
+            'remaining_estimate': remaining_now,
             'message': 'No matches to backfill in window',
             'since': since.isoformat(),
         }
@@ -176,16 +199,17 @@ def run_backfill(
     elapsed = time.time() - started
 
     # Rough estimate of how many more matches need backfilling. Useful so a
-    # cron / curl loop can know when to stop calling. Computed by counting
-    # un-predicted FINISHED matches in the window after this batch.
-    predicted_ids_after = {p.match_id for p in db.session.query(Prediction.match_id).all()}
+    # cron / curl loop can know when to stop calling. Computed via a SQL
+    # subquery so we never materialise the predicted-id set in Python — that
+    # would scale O(predictions count) and OOM in catch-up runs.
+    predicted_subq_after = db.session.query(Prediction.match_id).subquery()
     remaining = (
         db.session.query(Match)
         .filter(and_(
             Match.status == 'FINISHED',
             Match.date >= since,
             Match.winner.isnot(None),
-            ~Match.id.in_(predicted_ids_after),
+            ~Match.id.in_(predicted_subq_after),
         ))
         .count()
     )
