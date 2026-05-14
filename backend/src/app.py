@@ -1788,14 +1788,15 @@ def bets_performance():
         # — their multiplicative edge is mathematically incomparable to singles'
         # additive edge (a 3-leg combo's "edge_at_bet" of +300% is just (p1*p2*p3)
         # × (o1*o2*o3) − 1, not a per-stake-unit expectation).
+        # Return None (not 0.0) when no singles exist so the UI can show "n/a"
+        # instead of a misleading 0%.
         non_combo = [b for b in bets if b.market != 'combo']
         non_combo_with_edge = [b for b in non_combo if b.edge_at_bet is not None]
         avg_edge = (sum(b.edge_at_bet for b in non_combo_with_edge) / len(non_combo_with_edge)
-                    if non_combo_with_edge else 0.0)
-        # Avg model prob — use the same non-combo pool for the same reason.
+                    if non_combo_with_edge else None)
         non_combo_with_prob = [b for b in non_combo if b.model_prob_at_bet is not None]
         avg_model_prob = (sum(b.model_prob_at_bet for b in non_combo_with_prob) / len(non_combo_with_prob)
-                          if non_combo_with_prob else 0.0)
+                          if non_combo_with_prob else None)
         win_rate = len(won) / len(settled) if settled else 0
 
         # CLV: avg of (placed_odds / closing_odds - 1). Positive = bet at better
@@ -1846,9 +1847,11 @@ def bets_performance():
             'total_profit_loss': round(total_pl, 2),
             'roi': round(roi, 4),
             'win_rate': round(win_rate, 4),
-            'avg_edge_at_bet': round(avg_edge, 4),
-            'avg_model_prob_at_bet': round(avg_model_prob, 4),
-            'expected_win_rate': round(avg_model_prob, 4),  # alias for clarity
+            'avg_edge_at_bet': round(avg_edge, 4) if avg_edge is not None else None,
+            'avg_model_prob_at_bet': round(avg_model_prob, 4) if avg_model_prob is not None else None,
+            'expected_win_rate': round(avg_model_prob, 4) if avg_model_prob is not None else None,
+            'singles_count': len(non_combo),
+            'combos_count': len(bets) - len(non_combo),
             'avg_clv': round(avg_clv, 4) if avg_clv is not None else None,
             'clv_sample_size': len(clv_bets),
             'by_market': by_market,

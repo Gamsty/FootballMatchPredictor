@@ -167,10 +167,20 @@ function PerfSummary({ perf }) {
             </div>
             <p className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted mt-3 leading-relaxed">
                 Total bets: <span className="text-ink">{perf.total_bets}</span>
+                {perf.singles_count != null && (
+                    <> (<span className="text-ink">{perf.singles_count}</span> singles ·{' '}
+                        <span className="text-ink">{perf.combos_count}</span> combos)</>
+                )}
                 {' · '}Settled: <span className="text-ink">{perf.settled_count}</span>
                 {' · '}Pending: <span className="text-ink">{perf.pending_count}</span>
-                {' · '}Avg edge at bet: <span className="text-ink">{pct(perf.avg_edge_at_bet)}</span>
-                {perf.win_rate < perf.expected_win_rate - 0.05 && (
+                {' · '}Avg edge (singles):{' '}
+                <span
+                    className="text-ink cursor-help border-b border-dotted border-ink-muted/40"
+                    title="Average edge across all logged single-leg bets (settled + pending). Combos are excluded — their multiplicative edge isn't directly comparable."
+                >
+                    {perf.avg_edge_at_bet != null ? pct(perf.avg_edge_at_bet) : 'n/a'}
+                </span>
+                {perf.expected_win_rate != null && perf.win_rate < perf.expected_win_rate - 0.05 && (
                     <span className="text-warning ml-2">
                         ← winning {pct(perf.expected_win_rate - perf.win_rate)} less than model predicted
                     </span>
@@ -207,11 +217,24 @@ function BetRow({ bet, onDelete }) {
                     // The anchored match (bet.match) is just the earliest leg —
                     // not informative on its own for combo rows.
                     <div>
-                        <div className="text-ink text-sm mb-0.5">
-                            {bet.combo_legs.length}-leg combo
-                            <span className="mono text-[0.65rem] text-ink-muted ml-2">
+                        <div className="text-ink text-sm mb-0.5 flex items-baseline gap-2 flex-wrap">
+                            <span>{bet.combo_legs.length}-leg combo</span>
+                            <span className="mono text-[0.65rem] text-ink-muted">
                                 @ {bet.odds_at_bet?.toFixed(2)}
                             </span>
+                            {bet.edge_at_bet != null && (
+                                <span
+                                    className="mono text-[0.65rem] text-positive cursor-help border-b border-dotted border-positive/30"
+                                    title="Combined edge = (∏ leg probabilities × ∏ leg odds) − 1. Multiplicative — not directly comparable to a single bet's edge."
+                                >
+                                    edge {bet.edge_at_bet >= 0 ? '+' : ''}{(bet.edge_at_bet * 100).toFixed(1)}%
+                                </span>
+                            )}
+                            {bet.model_prob_at_bet != null && (
+                                <span className="mono text-[0.65rem] text-ink-muted">
+                                    · hit {(bet.model_prob_at_bet * 100).toFixed(1)}%
+                                </span>
+                            )}
                         </div>
                         <div className="space-y-0.5">
                             {bet.combo_legs.map((leg, i) => (
