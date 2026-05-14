@@ -512,9 +512,10 @@ function ValueBets({ onSelectMatch }) {
 // ----------------------------------------------------------------------------
 // LogBetModal — confirms a picked bet before POSTing to /api/bets.
 // Pre-filled from the picked outcome; user can override stake + bookmaker.
+// Exported so BestOfWeek can reuse the same modal.
 // ----------------------------------------------------------------------------
 
-function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
+export function LogBetModal({ pick, defaultStake, onClose, onLogged }) {
     const [stake, setStake] = useState(defaultStake);
     const [bookmaker, setBookmaker] = useState(pick.bookmaker || '');
     const [notes, setNotes] = useState('');

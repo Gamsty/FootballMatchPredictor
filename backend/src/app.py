@@ -1469,8 +1469,9 @@ def bets_performance():
         market:  optional filter ('h2h', 'totals_2_5', 'btts')
         since:   optional ISO date (only bets placed on/after)
 
-    Response includes per-market breakdown and a CLV summary when closing
-    odds are available.
+    Response includes per-market AND per-league breakdowns and a CLV summary
+    when closing odds are available. The per-league split is what feeds the
+    Recent-ROI widget on the landing page.
     """
     try:
         # Settle pending so stats are current
@@ -1528,6 +1529,23 @@ def bets_performance():
             agg['stake'] = round(agg['stake'], 2)
             agg['pl'] = round(agg['pl'], 2)
 
+        # Per-league breakdown. Joined via Bet.match.competition; some old bets
+        # may have null match relations (legacy data), bucket those under 'Other'.
+        by_league: dict[str, dict] = {}
+        for b in settled:
+            league = (b.match.competition if b.match else None) or 'Other'
+            agg = by_league.setdefault(league, {'count': 0, 'stake': 0.0, 'pl': 0.0, 'won': 0})
+            agg['count'] += 1
+            agg['stake'] += b.stake
+            agg['pl'] += b.profit_loss or 0
+            if b.status == 'won':
+                agg['won'] += 1
+        for league, agg in by_league.items():
+            agg['roi'] = round(agg['pl'] / agg['stake'], 4) if agg['stake'] > 0 else 0
+            agg['win_rate'] = round(agg['won'] / agg['count'], 4) if agg['count'] else 0
+            agg['stake'] = round(agg['stake'], 2)
+            agg['pl'] = round(agg['pl'], 2)
+
         return jsonify({
             'total_bets': len(bets),
             'settled_count': len(settled),
@@ -1543,6 +1561,7 @@ def bets_performance():
             'avg_clv': round(avg_clv, 4) if avg_clv is not None else None,
             'clv_sample_size': len(clv_bets),
             'by_market': by_market,
+            'by_league': by_league,
         }), 200
     except Exception as e:
         return _error_response("Failed to compute performance", 500, e, endpoint="bets_performance")

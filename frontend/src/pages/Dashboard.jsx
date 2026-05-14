@@ -23,8 +23,10 @@ import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
 import ValueBets from '../components/ValueBets';
+import BestOfWeek from '../components/BestOfWeek';
 import CalibrationView from '../components/CalibrationView';
 import BetsView from '../components/BetsView';
+import RecentROI from '../components/RecentROI';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
     calculateAccumulator
@@ -209,8 +211,8 @@ function Dashboard() {
                 </p>
                 <div className="flex items-center gap-3 mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
                     {/* The 'shown' counter is for the match-grid tabs only. Hide on Value
-                        tab because that view has its own pick counter in its toolbar. */}
-                    {activeTab !== 'value' && (
+                        and Best Picks because those have their own counters in their toolbars. */}
+                    {activeTab !== 'value' && activeTab !== 'best' && (
                         <>
                             <span>{filteredMatches.length} shown</span>
                             <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
@@ -232,21 +234,21 @@ function Dashboard() {
                         <span className="border-b border-ink-muted/40 hover:border-ink">Calibration</span>
                         <span aria-hidden="true">→</span>
                     </button>
-                    {advancedMode && (
-                        <>
-                            <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
-                            <button
-                                onClick={() => setShowBets(true)}
-                                className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-                                title="Paper bet log + ROI / CLV tracking."
-                            >
-                                <span className="border-b border-ink-muted/40 hover:border-ink">Bets</span>
-                                <span aria-hidden="true">→</span>
-                            </button>
-                        </>
-                    )}
+                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                    <button
+                        onClick={() => setShowBets(true)}
+                        className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                        title="Bet log + ROI / CLV tracking. Read-only for visitors; advanced mode enables logging & deletion."
+                    >
+                        <span className="border-b border-ink-muted/40 hover:border-ink">Bets</span>
+                        <span aria-hidden="true">→</span>
+                    </button>
                 </div>
             </section>
+
+            {/* Recent-ROI strip — public proof of +EV. Renders nothing until at
+                least 5 settled bets are on record (avoids early-sample noise). */}
+            <RecentROI />
 
             {/* Tabs — Value tab is hidden unless advancedMode is enabled */}
             <CategoryTabs
@@ -256,13 +258,18 @@ function Dashboard() {
                 showValueTab={advancedMode}
             />
 
+            {/* Best Picks tab — top ranked picks across all leagues + combo builder */}
+            {activeTab === 'best' && (
+                <BestOfWeek onSelectMatch={setSelectedMatch} canLog={advancedMode} />
+            )}
+
             {/* Value tab — completely separate render path (odds-driven, not match-grid) */}
             {advancedMode && activeTab === 'value' && (
                 <ValueBets onSelectMatch={setSelectedMatch} />
             )}
 
             {/* Match-grid view (today + upcoming tabs) */}
-            {activeTab !== 'value' && (
+            {activeTab !== 'value' && activeTab !== 'best' && (
             <>
             {/* Filters */}
             <FilterBar filters={filters} onFilterChange={setFilters} />
@@ -442,7 +449,7 @@ function Dashboard() {
             {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
 
             {/* Bets Modal — advanced mode only */}
-            {advancedMode && showBets && <BetsView onClose={() => setShowBets(false)} />}
+            {showBets && <BetsView onClose={() => setShowBets(false)} canEdit={advancedMode} />}
         </div>
     );
 }

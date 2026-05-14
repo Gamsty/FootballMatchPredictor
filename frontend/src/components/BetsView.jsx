@@ -16,7 +16,7 @@ import { formatMatchDate } from '../utils/constants';
 const pct = (v) => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
 const nok = (v) => v == null ? '—' : `${v >= 0 ? '+' : ''}${Math.round(v).toLocaleString()} NOK`;
 
-function BetsView({ onClose }) {
+function BetsView({ onClose, canEdit = false }) {
     const [bets, setBets] = useState(null);
     const [perf, setPerf] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -127,7 +127,13 @@ function BetsView({ onClose }) {
 
                     {!loading && bets?.count > 0 && (
                         <div className="space-y-1.5">
-                            {bets.bets.map(b => <BetRow key={b.id} bet={b} onDelete={handleDelete} />)}
+                            {bets.bets.map(b => (
+                                <BetRow
+                                    key={b.id}
+                                    bet={b}
+                                    onDelete={canEdit ? handleDelete : null}
+                                />
+                            ))}
                         </div>
                     )}
                 </div>
@@ -237,12 +243,14 @@ function BetRow({ bet, onDelete }) {
                 </div>
             </div>
 
-            <button
-                onClick={() => onDelete(bet.id)}
-                className="text-ink-muted hover:text-danger text-lg leading-none cursor-pointer"
-                aria-label="Delete bet"
-                title="Delete bet"
-            >×</button>
+            {onDelete && (
+                <button
+                    onClick={() => onDelete(bet.id)}
+                    className="text-ink-muted hover:text-danger text-lg leading-none cursor-pointer"
+                    aria-label="Delete bet"
+                    title="Delete bet"
+                >×</button>
+            )}
         </div>
     );
 }

@@ -10,9 +10,12 @@ function CategoryTabs({ activeTab, onTabChange, matchCounts, showValueTab = fals
     const tabs = [
         { id: 'today',    label: 'Today',    count: matchCounts.today },
         { id: 'upcoming', label: 'Upcoming', count: matchCounts.upcoming },
-        // Value tab — only shown in advanced mode. Count is undefined-safe.
+        // Best Picks — top picks across all leagues + combo builder. Public; relies
+        // on odds API which gracefully reports "not configured" when key is missing.
+        { id: 'best',     label: 'Best Picks', accent: true },
+        // Value tab — power-user view of every +EV pick. Only shown in advanced mode.
         ...(showValueTab ? [
-            { id: 'value', label: 'Value', count: matchCounts.value, accent: true },
+            { id: 'value', label: 'Value', count: matchCounts.value },
         ] : []),
     ];
 
