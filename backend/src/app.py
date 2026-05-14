@@ -1726,7 +1726,11 @@ def create_combo_bet():
         if stake <= 0:
             return jsonify({'error': 'stake must be > 0'}), 400
 
-        # Validate each leg shape + market support. Compute combined odds + prob.
+        # Two-pass validation: do all structural checks first, then hit the DB
+        # for match existence in a single bulk lookup. Without this split, a
+        # broken leg N would never surface its specific error if leg 0's
+        # match_id happened to be missing from the DB — 404 would short-circuit
+        # before validation reached leg N.
         validated_legs: list[dict] = []
         seen_match_ids: set[int] = set()
         combined_odds = 1.0
@@ -1755,9 +1759,6 @@ def create_combo_bet():
                 # Multiple legs on the same match would be correlated; reject.
                 return jsonify({'error': f'duplicate match_id {match_id} — combos must use one leg per match'}), 400
             seen_match_ids.add(match_id)
-            match = db.session.query(Match).filter_by(id=match_id).first()
-            if not match:
-                return jsonify({'error': f'leg {i} match not found: {match_id}'}), 404
             combined_odds *= leg_odds
             prob = leg.get('prob')
             if prob is None:
@@ -1774,13 +1775,23 @@ def create_combo_bet():
                 'odds': round(leg_odds, 2),
                 'prob': float(prob) if prob is not None else None,
                 'outcome_label': leg.get('outcome_label'),
-                # Snapshot the team names + competition + date for display in
-                # bet log even if the underlying match record changes later.
-                'home_team': match.home_team.name if match.home_team else None,
-                'away_team': match.away_team.name if match.away_team else None,
-                'competition': match.competition,
-                'date': iso_utc(match.date),
             })
+
+        # Pass 2 — bulk match lookup. One query for all legs is cheaper than
+        # N queries even with FK index. Match not found → leg index in error
+        # message tells caller which one's the dud.
+        match_ids = [L['match_id'] for L in validated_legs]
+        matches_by_id = {m.id: m for m in db.session.query(Match).filter(Match.id.in_(match_ids)).all()}
+        for i, leg_data in enumerate(validated_legs):
+            match = matches_by_id.get(leg_data['match_id'])
+            if not match:
+                return jsonify({'error': f"leg {i} match not found: {leg_data['match_id']}"}), 404
+            # Snapshot the team names + competition + date for display in
+            # bet log even if the underlying match record changes later.
+            leg_data['home_team'] = match.home_team.name if match.home_team else None
+            leg_data['away_team'] = match.away_team.name if match.away_team else None
+            leg_data['competition'] = match.competition
+            leg_data['date'] = iso_utc(match.date)
 
         combined_prob_final = None if any_prob_missing else round(combined_prob, 6)
         combined_edge_final = (None if combined_prob_final is None
