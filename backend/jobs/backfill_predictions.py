@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 import time
 from datetime import datetime
@@ -56,7 +55,7 @@ except ImportError:
 
 import io
 import joblib
-from sqlalchemy import and_, desc
+from sqlalchemy import and_
 
 from database import DatabaseManager, Match, Prediction, PredictionSnapshot
 from feature_engineering import FeatureEngineer
@@ -103,6 +102,11 @@ def main() -> int:
                         help='Skip the calibrator even if present. Useful for '
                              'reproducing the raw model output, e.g. to A/B '
                              'compare calibrated vs uncalibrated.')
+    parser.add_argument('--pit-elo', action='store_true',
+                        help='Use point-in-time Elo ratings (recomputed from match '
+                             'history up to each match.date) instead of the frozen '
+                             "model_data['elo_ratings'] snapshot. Use this to test "
+                             'whether ROI gains are real or due to Elo leakage.')
     args = parser.parse_args()
 
     # Default cutoff: last 365 days. This trades coverage for leakage safety —
@@ -143,6 +147,17 @@ def main() -> int:
     db = DatabaseManager()
     feature_engineer = FeatureEngineer()
 
+    # When --pit-elo is set, precompute the full Elo trajectory across DB history.
+    # We'll override model_data['elo_ratings'] per-match below so compute_features
+    # sees a point-in-time-correct Elo instead of the frozen training snapshot.
+    elo_history = None
+    original_elo_snapshot = model_data.get('elo_ratings')
+    if args.pit_elo:
+        from feature_engineering import compute_elo_history
+        logger.info("Pre-computing Elo history from match log (this may take a few seconds)...")
+        elo_history = compute_elo_history(db)
+        logger.info("Elo history computed for %d teams", len(elo_history))
+
     # Find finished matches in the window, ordered oldest-first so progress
     # is human-readable. Skip those already predicted unless --overwrite.
     matches_q = (
@@ -173,6 +188,19 @@ def main() -> int:
 
     for match in matches:
         try:
+            # If point-in-time Elo is enabled, swap the model's frozen ratings
+            # for this match's pre-kickoff values BEFORE building features.
+            # We only set the two teams that matter here — compute_features
+            # only looks up these two names.
+            if elo_history is not None:
+                from feature_engineering import get_elo_at
+                pit_home = get_elo_at(match.home_team.name, match.date, elo_history)
+                pit_away = get_elo_at(match.away_team.name, match.date, elo_history)
+                model_data['elo_ratings'] = {
+                    match.home_team.name: pit_home,
+                    match.away_team.name: pit_away,
+                }
+
             features = compute_features(
                 match.home_team, match.away_team, feature_engineer, model_data,
                 competition=match.competition, match_date=match.date,
@@ -238,6 +266,11 @@ def main() -> int:
 
     if not args.dry_run:
         db.session.commit()
+
+    # Restore the original frozen Elo snapshot so subsequent in-process callers
+    # (if this module is imported elsewhere) see the same model state as before.
+    if args.pit_elo and original_elo_snapshot is not None:
+        model_data['elo_ratings'] = original_elo_snapshot
 
     feature_engineer.close()
     elapsed = time.time() - started

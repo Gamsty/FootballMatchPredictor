@@ -49,7 +49,6 @@ try:
 except ImportError:
     pass
 
-from sqlalchemy import and_
 
 from database import DatabaseManager, Match, Prediction
 
@@ -131,6 +130,10 @@ def main() -> int:
     per_market = {'home': {'bets': 0, 'won': 0, 'stake': 0.0, 'pl': 0.0},
                   'draw': {'bets': 0, 'won': 0, 'stake': 0.0, 'pl': 0.0},
                   'away': {'bets': 0, 'won': 0, 'stake': 0.0, 'pl': 0.0}}
+    # Per-league breakdown — helps identify where the edge actually comes from.
+    # Lower-tier or less-liquid leagues often have softer closing odds; if all the
+    # ROI is concentrated in a single league it's both a signal AND a warning sign.
+    per_league: dict[str, dict] = {}
 
     skipped_no_odds = 0
     skipped_low_edge = 0
@@ -171,6 +174,14 @@ def main() -> int:
             if won:
                 per_market[outcome_key]['won'] += 1
 
+            league = match.competition or 'Unknown'
+            lg = per_league.setdefault(league, {'bets': 0, 'won': 0, 'stake': 0.0, 'pl': 0.0})
+            lg['bets'] += 1
+            lg['stake'] += stake
+            lg['pl'] += pl
+            if won:
+                lg['won'] += 1
+
             bets.append({
                 'date': match.date.isoformat(),
                 'match_id': match.id,
@@ -203,6 +214,13 @@ def main() -> int:
         m['stake'] = round(m['stake'], 2)
         m['pl'] = round(m['pl'], 2)
 
+    # Per-league ROI
+    for k, m in per_league.items():
+        m['roi'] = round(m['pl'] / m['stake'], 4) if m['stake'] > 0 else 0
+        m['win_rate'] = round(m['won'] / m['bets'], 4) if m['bets'] else 0
+        m['stake'] = round(m['stake'], 2)
+        m['pl'] = round(m['pl'], 2)
+
     summary = {
         'strategy': args.strategy,
         'min_edge': args.min_edge,
@@ -216,6 +234,7 @@ def main() -> int:
         'total_pl': round(total_pl, 2),
         'roi': round(roi, 4),
         'per_market': per_market,
+        'per_league': per_league,
         'skipped_no_odds': skipped_no_odds,
         'skipped_low_edge': skipped_low_edge,
         'skipped_too_high_edge': skipped_too_high,
@@ -237,6 +256,12 @@ def main() -> int:
     for k, m in per_market.items():
         logger.info("  %s: %d bets, %d wins, stake %.2f, pl %+.2f, ROI %+.2f%%",
                     k, m['bets'], m['won'], m['stake'], m['pl'], m['roi'] * 100)
+    # Per-league sorted by stake — busiest first
+    logger.info("Per league:")
+    for league in sorted(per_league.keys(), key=lambda k: per_league[k]['stake'], reverse=True):
+        m = per_league[league]
+        logger.info("  %-22s: %4d bets, %3d wins, ROI %+.2f%%  (stake %.0f)",
+                    league, m['bets'], m['won'], m['roi'] * 100, m['stake'])
     logger.info("Skipped — no odds: %d, low edge: %d, too high edge: %d",
                 skipped_no_odds, skipped_low_edge, skipped_too_high)
     logger.info("=" * 60)

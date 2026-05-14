@@ -30,6 +30,32 @@ import {
     calculateAccumulator
 } from '../utils/constants';
 
+// "Advanced mode" gates the betting-workflow features (Value tab, Bets log,
+// Log-bet button on picks) behind ?advanced=true in the URL. The main product
+// is plain predictions for users who bet manually elsewhere — advanced mode is
+// for the operator (me) who wants to also track CLV / paper bets.
+//
+// Toggle via URL: https://...?advanced=true
+// Persisted to localStorage so a single ?advanced=true visit unlocks it for
+// the device until the user clears it via ?advanced=false.
+const ADVANCED_STORAGE_KEY = 'fmp.advanced.enabled';
+
+function readAdvancedMode() {
+    if (typeof window === 'undefined') return false;
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get('advanced');
+    if (fromUrl === 'true' || fromUrl === '1') {
+        localStorage.setItem(ADVANCED_STORAGE_KEY, '1');
+        return true;
+    }
+    if (fromUrl === 'false' || fromUrl === '0') {
+        localStorage.removeItem(ADVANCED_STORAGE_KEY);
+        return false;
+    }
+    return localStorage.getItem(ADVANCED_STORAGE_KEY) === '1';
+}
+
+
 function Dashboard() {
     // Data state
     const [matches, setMatches] = useState([]);
@@ -42,6 +68,7 @@ function Dashboard() {
     const [showAbout, setShowAbout] = useState(false);
     const [showCalibration, setShowCalibration] = useState(false);
     const [showBets, setShowBets] = useState(false);
+    const advancedMode = readAdvancedMode();
     const [filters, setFilters] = useState({
         categories: [],
     });
@@ -199,23 +226,32 @@ function Dashboard() {
                         <span className="border-b border-ink-muted/40 hover:border-ink">Calibration</span>
                         <span aria-hidden="true">→</span>
                     </button>
-                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
-                    <button
-                        onClick={() => setShowBets(true)}
-                        className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-                        title="Paper bet log + ROI / CLV tracking."
-                    >
-                        <span className="border-b border-ink-muted/40 hover:border-ink">Bets</span>
-                        <span aria-hidden="true">→</span>
-                    </button>
+                    {advancedMode && (
+                        <>
+                            <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                            <button
+                                onClick={() => setShowBets(true)}
+                                className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                                title="Paper bet log + ROI / CLV tracking."
+                            >
+                                <span className="border-b border-ink-muted/40 hover:border-ink">Bets</span>
+                                <span aria-hidden="true">→</span>
+                            </button>
+                        </>
+                    )}
                 </div>
             </section>
 
-            {/* Tabs */}
-            <CategoryTabs activeTab={activeTab} onTabChange={setActiveTab} matchCounts={matchCounts} />
+            {/* Tabs — Value tab is hidden unless advancedMode is enabled */}
+            <CategoryTabs
+                activeTab={activeTab}
+                onTabChange={setActiveTab}
+                matchCounts={matchCounts}
+                showValueTab={advancedMode}
+            />
 
             {/* Value tab — completely separate render path (odds-driven, not match-grid) */}
-            {activeTab === 'value' && (
+            {advancedMode && activeTab === 'value' && (
                 <ValueBets onSelectMatch={setSelectedMatch} />
             )}
 
@@ -399,8 +435,8 @@ function Dashboard() {
             {/* Calibration Modal */}
             {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
 
-            {/* Bets Modal */}
-            {showBets && <BetsView onClose={() => setShowBets(false)} />}
+            {/* Bets Modal — advanced mode only */}
+            {advancedMode && showBets && <BetsView onClose={() => setShowBets(false)} />}
         </div>
     );
 }

@@ -18,7 +18,6 @@ Costs ~1 request per league with upcoming fixtures (cached, so re-runs are free)
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 

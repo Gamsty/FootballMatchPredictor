@@ -77,6 +77,7 @@ SEASONS_STANDARD = {
     2022: "2223",
     2023: "2324",
     2024: "2425",
+    2025: "2526",  # Current season (Aug 2025 – May 2026)
 }
 
 # Norway uses calendar year seasons (e.g., 2023 season runs Mar-Nov 2023)
@@ -88,6 +89,7 @@ SEASONS_NORWAY = {
     2022: "2223",
     2023: "2324",
     2024: "2425",
+    2025: "2526",
 }
 
 # Offset for synthetic IDs — each league gets its own range to avoid collisions

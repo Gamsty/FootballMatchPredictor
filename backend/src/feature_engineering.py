@@ -15,11 +15,103 @@ Features computed per match:
 Pipeline: database (matches table) → compute features → match_features table + CSV
 """
 
+import bisect
 import pandas as pd
 import numpy as np
 from collections import defaultdict
 from database import DatabaseManager, Match, Team, MatchFeatures, Standing
 from sqlalchemy import and_, or_
+
+
+# ============================================================================
+# Point-in-time Elo computation — for honest backtests
+# ============================================================================
+#
+# The frozen `model_data['elo_ratings']` snapshot reflects all matches up to
+# the training cutoff. Using it at inference time for matches WITHIN the
+# training window is a form of leakage: the rating for "Arsenal on 2026-02-15"
+# already incorporates the outcome of that very match.
+#
+# These helpers replay the full match history in chronological order to
+# reconstruct each team's Elo AS IT WAS just before any given date.
+#
+# Usage:
+#     history = compute_elo_history(db)
+#     home_elo = get_elo_at("Arsenal FC", match.date, history)
+#     # ↑ Elo computed from matches strictly before match.date
+#
+# Cost: ~2 seconds per league-season once at the start of a backfill, then O(log n)
+# per lookup. Negligible for a 2000-match backfill.
+
+def compute_elo_history(db, k: float = 20.0, home_advantage: float = 50.0) -> dict:
+    """
+    Reconstruct each team's Elo trajectory by replaying every finished match
+    in chronological order. Returns a dict mapping team_name → sorted list of
+    (match_date, pre_match_elo) tuples.
+
+    The Elo snapshot is recorded BEFORE the match is processed for ratings
+    update. So to ask "what was team X's Elo on date D?", find the latest
+    entry strictly before D — that's the value we'd have had at kickoff.
+
+    Mirrors compute_elo_ratings() in model_training.py for consistency with
+    how the training pipeline computes Elo.
+    """
+    matches = (db.session.query(Match)
+               .filter(Match.status == 'FINISHED')
+               .filter(Match.winner.isnot(None))
+               .order_by(Match.date.asc())
+               .all())
+
+    elo: dict[str, float] = defaultdict(lambda: 1500.0)
+    history: dict[str, list[tuple]] = defaultdict(list)
+
+    for m in matches:
+        if not m.home_team or not m.away_team or not m.date:
+            continue
+        home = m.home_team.name
+        away = m.away_team.name
+        # Normalize to tz-naive UTC for consistent bisect comparisons
+        d = m.date.replace(tzinfo=None) if m.date.tzinfo else m.date
+
+        # Snapshot Elo BEFORE this match — this is what would have been visible
+        history[home].append((d, elo[home]))
+        history[away].append((d, elo[away]))
+
+        # Expected scores with home advantage
+        exp_home = 1 / (1 + 10 ** ((elo[away] - elo[home] - home_advantage) / 400))
+        exp_away = 1 - exp_home
+
+        if m.winner == 'HOME_TEAM':
+            actual_home, actual_away = 1.0, 0.0
+        elif m.winner == 'AWAY_TEAM':
+            actual_home, actual_away = 0.0, 1.0
+        else:
+            actual_home, actual_away = 0.5, 0.5
+
+        elo[home] += k * (actual_home - exp_home)
+        elo[away] += k * (actual_away - exp_away)
+
+    return dict(history)
+
+
+def get_elo_at(team_name: str, target_date, history: dict, default: float = 1500.0) -> float:
+    """
+    Return team's Elo as of just BEFORE target_date. Latest history entry
+    strictly less than target_date, or `default` if no prior history exists
+    (team played their first match on/after target_date).
+
+    Uses bisect for O(log n) lookup — works because history lists are
+    chronologically sorted by construction in compute_elo_history.
+    """
+    entries = history.get(team_name)
+    if not entries:
+        return default
+    target = target_date.replace(tzinfo=None) if hasattr(target_date, 'tzinfo') and target_date.tzinfo else target_date
+    dates = [e[0] for e in entries]
+    idx = bisect.bisect_left(dates, target)
+    if idx == 0:
+        return default
+    return float(entries[idx - 1][1])
 
 # League configuration — teams per league and relegation zone start position
 LEAGUE_CONFIG = {

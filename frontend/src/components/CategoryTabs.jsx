@@ -6,12 +6,14 @@ control. Active tab gets the ink-underline; inactive is just muted text. Counts 
 mono numerals sitting next to each label.
 */
 
-function CategoryTabs({ activeTab, onTabChange, matchCounts }) {
+function CategoryTabs({ activeTab, onTabChange, matchCounts, showValueTab = false }) {
     const tabs = [
         { id: 'today',    label: 'Today',    count: matchCounts.today },
         { id: 'upcoming', label: 'Upcoming', count: matchCounts.upcoming },
-        // Value tab — count is hidden until value-bets resolve, hence undefined-safe
-        { id: 'value',    label: 'Value',    count: matchCounts.value, accent: true },
+        // Value tab — only shown in advanced mode. Count is undefined-safe.
+        ...(showValueTab ? [
+            { id: 'value', label: 'Value', count: matchCounts.value, accent: true },
+        ] : []),
     ];
 
     return (
