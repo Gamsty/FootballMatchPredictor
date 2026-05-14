@@ -448,11 +448,16 @@ def refit_calibration():
         local_path.parent.mkdir(parents=True, exist_ok=True)
         cal.save(local_path)
 
-        # Optionally upload to blob
+        # Optionally upload to blob. Calibrator goes straight to `production/`
+        # (not `candidate/`) because we don't have a separate validation step
+        # for calibrator like we do for the full model — refit on validated
+        # historical predictions IS the validation. Without prefix='production',
+        # uploads would land in candidate/ where load_model_bytes never reads,
+        # so the calibrator would never survive a container restart.
         uploaded = False
         if upload and os.getenv('USE_BLOB_STORAGE', '').lower() == 'true':
             from model_storage import upload_model
-            upload_model(local_path, 'calibrator.json')
+            upload_model(local_path, 'calibrator.json', prefix='production')
             uploaded = True
 
         # Hot-attach so subsequent predictions use it immediately, no restart needed
