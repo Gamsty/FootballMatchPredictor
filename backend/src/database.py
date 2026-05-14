@@ -580,13 +580,18 @@ class DatabaseManager:
         return standing
     
     def get_upcoming_matches(self, days=7):
-        # Use start of today (not current time) so we don't miss matches earlier today
+        # Inclusive of the FULL last day. days=3 means today + next 3 calendar
+        # days (so 4 days total, ending at midnight of day+3). Without the +1,
+        # late-evening matches on the last day get cut off — that's how Serie A
+        # Sunday-18:00 fixtures vanished from the dashboard whenever their
+        # kickoff times got refreshed from football-data.org (matches previously
+        # sat at midnight UTC, right on the boundary).
         today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        end = today_start + timedelta(days=days)
+        end = today_start + timedelta(days=days + 1)
         return self.session.query(Match).filter(
             Match.status.in_(['SCHEDULED', 'TIMED']),
             Match.date >= today_start,
-            Match.date <= end,
+            Match.date < end,
         ).order_by(Match.date.asc()).all()
     
 # Main execution
