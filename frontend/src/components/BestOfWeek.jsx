@@ -74,6 +74,8 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
     const [error, setError] = useState(null);
     const [combo, setCombo] = useState([]);  // array of pick keys
     const [pickToLog, setPickToLog] = useState(null);
+    const [comboToLog, setComboToLog] = useState(null);
+    const [comboLogged, setComboLogged] = useState(false);
     const [logStatus, setLogStatus] = useState({});
     const [bankroll, setBankroll] = useState(() => {
         const stored = Number(localStorage.getItem(BANKROLL_STORAGE_KEY));
@@ -378,22 +380,43 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                         </div>
                     )}
 
-                    {selectedPicks.length >= 2 && bankroll > 0 && comboStake > 0 && (
-                        <div className="mt-4 pt-4 border-t border-line flex items-center justify-between">
-                            <div>
-                                <div className="eyebrow">¼-Kelly stake</div>
-                                <div className="display text-lg text-ink mt-0.5">
-                                    {comboStake.toLocaleString()} <span className="mono text-xs text-ink-muted">NOK</span>
+                    {selectedPicks.length >= 2 && (
+                        <div className="mt-4 pt-4 border-t border-line flex items-end justify-between gap-3 flex-wrap">
+                            {bankroll > 0 && comboStake > 0 ? (
+                                <div>
+                                    <div className="eyebrow">¼-Kelly stake</div>
+                                    <div className="display text-lg text-ink mt-0.5">
+                                        {comboStake.toLocaleString()} <span className="mono text-xs text-ink-muted">NOK</span>
+                                    </div>
                                 </div>
-                            </div>
-                            <div className="text-right">
-                                <div className="eyebrow">Potential return</div>
-                                <div className="display text-lg text-accent mt-0.5">
-                                    {Math.round(comboReturn).toLocaleString()} NOK
-                                    <span className="mono text-xs text-positive ml-2">
-                                        +{Math.round(comboReturn - comboStake).toLocaleString()}
-                                    </span>
-                                </div>
+                            ) : <div />}
+                            <div className="flex items-end gap-3">
+                                {bankroll > 0 && comboStake > 0 && (
+                                    <div className="text-right">
+                                        <div className="eyebrow">Potential return</div>
+                                        <div className="display text-lg text-accent mt-0.5">
+                                            {Math.round(comboReturn).toLocaleString()} NOK
+                                            <span className="mono text-xs text-positive ml-2">
+                                                +{Math.round(comboReturn - comboStake).toLocaleString()}
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+                                {canLog && (
+                                    <button
+                                        onClick={() => setComboToLog({
+                                            legs: selectedPicks,
+                                            combinedOdds: comboOdds,
+                                            combinedProb: comboProb,
+                                            combinedEdge: comboEV,
+                                            defaultStake: comboStake > 0 ? comboStake : 100,
+                                        })}
+                                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer"
+                                        title="Log this combo as a single bet record"
+                                    >
+                                        Log combo
+                                    </button>
+                                )}
                             </div>
                         </div>
                     )}
@@ -584,7 +607,7 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
             {/* Compound Markets — BTTS & Win, model-only with NT odds entry.
                 Lives below the singles list because singles are the primary
                 workflow; compounds are a "while you're here" supplement. */}
-            <CompoundMarkets />
+            <CompoundMarkets canLog={canLog} />
 
             {/* Log Bet modal — reused from ValueBets */}
             {pickToLog && (
@@ -599,6 +622,28 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                 />
             )}
 
+            {/* Log Combo modal */}
+            {comboToLog && (
+                <LogComboModal
+                    summary={comboToLog}
+                    onClose={() => setComboToLog(null)}
+                    onLogged={() => {
+                        setComboLogged(true);
+                        setComboToLog(null);
+                        // Clear the combo selection so user starts fresh
+                        setCombo([]);
+                        // Reset the "logged" flash after a couple seconds
+                        setTimeout(() => setComboLogged(false), 3000);
+                    }}
+                />
+            )}
+
+            {comboLogged && (
+                <div className="fixed bottom-6 right-6 z-50 bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive">
+                    Combo logged ✓
+                </div>
+            )}
+
             {/* Footnote */}
             {top.length > 0 && (
                 <p className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted mt-6 leading-relaxed">
@@ -611,6 +656,171 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                     One leg per match enforced (multiple picks in the same fixture are correlated).
                 </p>
             )}
+        </div>
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LogComboModal — confirms a multi-leg combo before POSTing to /api/bets/combo.
+// Stake defaults to ¼-Kelly recommendation from the parent; user can override.
+// ---------------------------------------------------------------------------
+
+function LogComboModal({ summary, onClose, onLogged }) {
+    const { legs, combinedOdds, combinedProb, combinedEdge, defaultStake } = summary;
+    const [stake, setStake] = useState(defaultStake);
+    const [bookmaker, setBookmaker] = useState('Norsk Tipping');
+    const [notes, setNotes] = useState('');
+    const [submitting, setSubmitting] = useState(false);
+    const [error, setError] = useState(null);
+
+    const handleSubmit = async () => {
+        if (!stake || stake <= 0) {
+            setError('Stake must be > 0');
+            return;
+        }
+        setSubmitting(true);
+        setError(null);
+        try {
+            await footballAPI.createComboBet({
+                legs: legs.map(l => ({
+                    match_id: l.match_id,
+                    market: l.market,
+                    outcome_key: l.outcome_key,
+                    outcome_label: l.outcome,
+                    odds: l.odds_median ?? l.odds,
+                    prob: l.prob,
+                })),
+                stake: Number(stake),
+                bookmaker: bookmaker || null,
+                notes: notes || null,
+                placed_via: 'frontend',
+            });
+            onLogged();
+        } catch (err) {
+            console.error('Combo log error:', err);
+            const detail = err.response?.data?.error || err.message || 'Failed to log combo';
+            setError(detail);
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    const potentialReturn = stake * combinedOdds;
+    const potentialProfit = potentialReturn - stake;
+
+    return (
+        <div
+            className="fixed inset-0 z-50 bg-ink/60 flex items-center justify-center p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+            <div className="bg-paper w-full max-w-lg border border-line">
+                <div className="flex items-start justify-between px-5 py-4 border-b border-line">
+                    <div>
+                        <div className="eyebrow mb-1">Log combo bet</div>
+                        <div className="display text-xl text-ink">
+                            {legs.length}-leg combo<span className="text-accent">.</span>
+                        </div>
+                        <div className="mono text-[0.65rem] text-ink-muted mt-1">
+                            Combined odds {combinedOdds.toFixed(2)} ·{' '}
+                            hit {(combinedProb * 100).toFixed(1)}% ·{' '}
+                            edge {combinedEdge >= 0 ? '+' : ''}{(combinedEdge * 100).toFixed(1)}%
+                        </div>
+                    </div>
+                    <button
+                        onClick={onClose}
+                        className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer"
+                        aria-label="Close"
+                    >×</button>
+                </div>
+
+                <div className="px-5 py-5 space-y-4">
+                    {/* Legs preview */}
+                    <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                        {legs.map(l => (
+                            <div key={`${l.match_id}-${l.market}-${l.outcome_key}`}
+                                 className="bg-paper-tint border border-line px-3 py-2 text-xs flex items-center justify-between">
+                                <div className="min-w-0 flex-1">
+                                    <div className="text-ink truncate">
+                                        {l.home_team?.short_name || l.home_team?.name}
+                                        <span className="text-ink-muted mx-1">vs</span>
+                                        {l.away_team?.short_name || l.away_team?.name}
+                                    </div>
+                                    <div className="text-ink-muted text-[0.65rem]">{l.outcome}</div>
+                                </div>
+                                <div className="mono text-ink ml-3">
+                                    {(l.odds_median ?? l.odds).toFixed(2)}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Total stake (NOK)</label>
+                        <input
+                            type="number"
+                            min="1"
+                            step="10"
+                            value={stake}
+                            onChange={(e) => setStake(Number(e.target.value))}
+                            className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                            autoFocus
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Bookmaker</label>
+                        <input
+                            type="text"
+                            value={bookmaker}
+                            onChange={(e) => setBookmaker(e.target.value)}
+                            placeholder="Norsk Tipping"
+                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Notes (optional)</label>
+                        <input
+                            type="text"
+                            value={notes}
+                            onChange={(e) => setNotes(e.target.value)}
+                            placeholder="Why this combo, NT odds, etc."
+                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div className="bg-paper-tint border-l-2 border-accent px-3 py-2.5">
+                        <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
+                            Potential return
+                        </div>
+                        <div className="display text-lg text-ink mt-0.5">
+                            {Math.round(potentialReturn).toLocaleString()} NOK
+                            <span className="mono text-xs text-positive ml-2">
+                                +{Math.round(potentialProfit).toLocaleString()}
+                            </span>
+                        </div>
+                    </div>
+
+                    {error && <div className="text-danger text-sm">{error}</div>}
+                </div>
+
+                <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-line bg-paper-tint">
+                    <button
+                        onClick={onClose}
+                        disabled={submitting}
+                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onClick={handleSubmit}
+                        disabled={submitting}
+                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                        {submitting ? 'Logging…' : 'Log combo'}
+                    </button>
+                </div>
+            </div>
         </div>
     );
 }

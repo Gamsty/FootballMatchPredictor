@@ -50,11 +50,13 @@ function saveCompoundOdds(map) {
     }
 }
 
-function CompoundMarkets() {
+function CompoundMarkets({ canLog = false }) {
     const [matches, setMatches] = useState(null);
     const [error, setError] = useState(false);
     const [expanded, setExpanded] = useState(false);
     const [ntOdds, setNtOdds] = useState(loadCompoundOdds);
+    const [pickToLog, setPickToLog] = useState(null);
+    const [logged, setLogged] = useState({});  // compoundKey → true
 
     useEffect(() => {
         const controller = new AbortController();
@@ -189,6 +191,25 @@ function CompoundMarkets() {
                                         )}
                                     </div>
                                 </div>
+
+                                {canLog && (
+                                    logged[compoundKey] ? (
+                                        <span className="mono text-[0.65rem] uppercase tracking-[0.12em] text-positive border-b border-positive/40 px-2 py-1">
+                                            Logged ✓
+                                        </span>
+                                    ) : (
+                                        <button
+                                            onClick={() => setPickToLog({
+                                                match, best, compoundKey,
+                                                defaultOdds: ntPrice ?? best.odds,
+                                            })}
+                                            className="mono text-[0.65rem] uppercase tracking-[0.12em] px-2 py-1 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
+                                            title="Log this compound pick as a bet"
+                                        >
+                                            Log
+                                        </button>
+                                    )
+                                )}
                             </div>
                         );
                     })}
@@ -204,7 +225,184 @@ function CompoundMarkets() {
                     15-20%, so demand a thicker edge than for singles before placing.
                 </p>
             )}
+
+            {pickToLog && (
+                <LogCompoundModal
+                    summary={pickToLog}
+                    onClose={() => setPickToLog(null)}
+                    onLogged={() => {
+                        setLogged(prev => ({ ...prev, [pickToLog.compoundKey]: true }));
+                        setPickToLog(null);
+                    }}
+                />
+            )}
         </section>
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LogCompoundModal — confirms a compound (BTTS & Win, etc) before POSTing.
+// Uses market='compound' on the single-bet endpoint. Outcome key (e.g.
+// 'H_btts_yes') is normalised to lowercase server-side.
+// ---------------------------------------------------------------------------
+
+function LogCompoundModal({ summary, onClose, onLogged }) {
+    const { match, best, defaultOdds } = summary;
+    const [odds, setOdds] = useState(defaultOdds);
+    const [stake, setStake] = useState(100);
+    const [bookmaker, setBookmaker] = useState('Norsk Tipping');
+    const [notes, setNotes] = useState('');
+    const [submitting, setSubmitting] = useState(false);
+    const [error, setError] = useState(null);
+
+    const handleSubmit = async () => {
+        if (!stake || stake <= 0) { setError('Stake must be > 0'); return; }
+        if (!odds || odds <= 1.0) { setError('Odds must be > 1.0'); return; }
+        setSubmitting(true);
+        setError(null);
+        try {
+            await footballAPI.createBet({
+                match_id: match.id,
+                market: 'compound',
+                outcome_key: best.key,  // 'H_btts_yes' — lowercased on backend
+                outcome_label: best.description,
+                odds_at_bet: Number(odds),
+                stake: Number(stake),
+                bookmaker: bookmaker || null,
+                model_prob_at_bet: best.probability,
+                edge_at_bet: (best.probability * Number(odds)) - 1,
+                notes: notes || null,
+                placed_via: 'frontend',
+            });
+            onLogged();
+        } catch (err) {
+            console.error('Compound log error:', err);
+            const detail = err.response?.data?.error || err.message || 'Failed to log';
+            setError(detail);
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    const potentialReturn = stake * Number(odds);
+    const edge = best.probability * Number(odds) - 1;
+
+    return (
+        <div
+            className="fixed inset-0 z-50 bg-ink/60 flex items-center justify-center p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+            <div className="bg-paper w-full max-w-md border border-line">
+                <div className="flex items-start justify-between px-5 py-4 border-b border-line">
+                    <div>
+                        <div className="eyebrow mb-1">Log compound bet</div>
+                        <div className="display text-xl text-ink">
+                            {best.description}<span className="text-accent">.</span>
+                        </div>
+                        <div className="mono text-[0.65rem] text-ink-muted mt-1">
+                            {match.home_team?.name} vs {match.away_team?.name}
+                        </div>
+                    </div>
+                    <button
+                        onClick={onClose}
+                        className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer"
+                        aria-label="Close"
+                    >×</button>
+                </div>
+
+                <div className="px-5 py-5 space-y-4">
+                    <div className="grid grid-cols-2 gap-3">
+                        <div>
+                            <div className="eyebrow">Model prob</div>
+                            <div className="mono text-sm text-ink mt-0.5">{pct(best.probability)}</div>
+                        </div>
+                        <div>
+                            <div className="eyebrow">Edge at this odds</div>
+                            <div className={'mono text-sm mt-0.5 ' + (edge >= 0 ? 'text-positive' : 'text-warning')}>
+                                {edge >= 0 ? '+' : ''}{pct(edge)}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Odds (typically NT odds)</label>
+                        <input
+                            type="number"
+                            min="1.01"
+                            step="0.05"
+                            value={odds}
+                            onChange={(e) => setOdds(Number(e.target.value))}
+                            className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Stake (NOK)</label>
+                        <input
+                            type="number"
+                            min="1"
+                            step="10"
+                            value={stake}
+                            onChange={(e) => setStake(Number(e.target.value))}
+                            className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                            autoFocus
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Bookmaker</label>
+                        <input
+                            type="text"
+                            value={bookmaker}
+                            onChange={(e) => setBookmaker(e.target.value)}
+                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="eyebrow block mb-1">Notes (optional)</label>
+                        <input
+                            type="text"
+                            value={notes}
+                            onChange={(e) => setNotes(e.target.value)}
+                            placeholder="Why this compound, etc."
+                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                        />
+                    </div>
+
+                    <div className="bg-paper-tint border-l-2 border-accent px-3 py-2.5">
+                        <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
+                            Potential return
+                        </div>
+                        <div className="display text-lg text-ink mt-0.5">
+                            {Math.round(potentialReturn).toLocaleString()} NOK
+                            <span className="mono text-xs text-positive ml-2">
+                                +{Math.round(potentialReturn - stake).toLocaleString()}
+                            </span>
+                        </div>
+                    </div>
+
+                    {error && <div className="text-danger text-sm">{error}</div>}
+                </div>
+
+                <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-line bg-paper-tint">
+                    <button
+                        onClick={onClose}
+                        disabled={submitting}
+                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onClick={handleSubmit}
+                        disabled={submitting}
+                        className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                        {submitting ? 'Logging…' : 'Log bet'}
+                    </button>
+                </div>
+            </div>
+        </div>
     );
 }
 

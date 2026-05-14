@@ -10,7 +10,7 @@ Tables:
     - predictions: Stores model predictions and evaluation results
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Index
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Index, JSON
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base, scoped_session
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -300,9 +300,16 @@ class Bet(Base):
     match_id = Column(Integer, ForeignKey('matches.id'), nullable=False, index=True)
 
     # Market identification
-    market = Column(String(20), nullable=False)       # 'h2h' | 'totals_2_5' | 'btts'
-    outcome_key = Column(String(10), nullable=False)  # 'home'/'draw'/'away' | 'over'/'under' | 'yes'/'no'
-    outcome_label = Column(String(40))                # human-readable, e.g., 'Home Win'
+    market = Column(String(20), nullable=False)       # 'h2h' | 'totals_2_5' | 'btts' | 'combo' | 'compound'
+    outcome_key = Column(String(20), nullable=False)  # 'home'/'draw'/'away' | 'over'/'under' | 'yes'/'no'
+                                                       # 'multi' for combo, 'h_btts_yes'/'a_btts_no'/etc for compound
+    outcome_label = Column(String(80))                # human-readable, e.g., 'Home Win' or 'Home Win & Both Score'
+
+    # Combo legs — JSON array for market='combo'. Each leg is a dict:
+    #   {match_id, market, outcome_key, outcome_label, odds, prob, home_team, away_team, competition, date}
+    # Settle walks each leg's resolver; combo wins iff ALL legs win.
+    # For singles this is NULL.
+    combo_legs = Column(JSON, nullable=True)
 
     # Bet placement
     odds_at_bet = Column(Float, nullable=False)
@@ -417,9 +424,46 @@ class PredictionSnapshot(Base):
 # ============================================================
 
 def init_db():
-    """Create all tables in the database based on the ORM models above."""
+    """Create all tables in the database based on the ORM models above.
+
+    Also runs lightweight idempotent column-adds for additions made to existing
+    tables. We don't have alembic — this is the cheapest way to ship a schema
+    change without forcing a manual DB step on every deploy environment.
+    """
     Base.metadata.create_all(bind=engine)
+    _apply_lightweight_migrations()
     print("Database tables created successfully!")
+
+
+def _apply_lightweight_migrations():
+    """Idempotently add columns that were added to existing tables after the
+    initial schema. Safe to re-run — uses dialect-aware DDL with IF NOT EXISTS
+    where supported.
+
+    Add new migrations by appending to MIGRATIONS below. Each entry is
+    (table, column, type_sql) — we test for existence via the dialect's column
+    introspection so we don't depend on IF NOT EXISTS (some PG/SQLite versions
+    raise on duplicate ADD COLUMN).
+    """
+    from sqlalchemy import inspect, text
+
+    MIGRATIONS = [
+        ('bets', 'combo_legs',
+         'JSONB' if engine.dialect.name == 'postgresql' else 'JSON'),
+    ]
+
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table, column, type_sql in MIGRATIONS:
+            if table not in inspector.get_table_names():
+                # Table doesn't exist yet — create_all just made it with the
+                # column already on board. Nothing to do.
+                continue
+            existing_cols = {c['name'] for c in inspector.get_columns(table)}
+            if column in existing_cols:
+                continue
+            conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {type_sql}'))
+            print(f"Migration: added {table}.{column} ({type_sql})")
 
 def get_db():
     """Yield a database session, ensuring it's closed after use."""

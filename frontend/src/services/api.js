@@ -100,6 +100,12 @@ export const footballAPI = {
         const response = await api.post('/bets', payload);
         return response.data;
     },
+    createComboBet: async (payload) => {
+        // Combo bet — payload is {legs: [...], stake, bookmaker?, notes?}.
+        // Returns a single Bet row with market='combo' and combo_legs filled.
+        const response = await api.post('/bets/combo', payload);
+        return response.data;
+    },
     deleteBet: async (betId) => {
         const response = await api.delete(`/bets/${betId}`);
         return response.data;

@@ -1239,7 +1239,11 @@ def get_prediction_calibration():
 # BETS — paper bet logging + ROI / CLV tracking
 # ============================================================================
 
-# Result mapping per market — which actual_winner / score outcomes constitute a win
+# Result mapping per market — which actual_winner / score outcomes constitute a win.
+# Each entry is keyed by `outcome_key`. Compound markets fold (winner, btts) and
+# (winner, totals) into single keys so we can settle them without modelling a
+# separate market for every combo. Keep `outcome_key` lowercase — frontend sends
+# capital prefix ('H_btts_yes') and we lowercase on insert.
 _BET_OUTCOME_RESOLVERS = {
     'h2h': {
         'home': lambda m: m.winner == 'HOME_TEAM',
@@ -1254,16 +1258,73 @@ _BET_OUTCOME_RESOLVERS = {
         'yes': lambda m: (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
         'no':  lambda m: (m.home_score or 0) == 0 or (m.away_score or 0) == 0,
     },
+    # Compound markets: result + BTTS. Each predicate must be true.
+    'compound': {
+        'h_btts_yes': lambda m: m.winner == 'HOME_TEAM' and (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
+        'd_btts_yes': lambda m: m.winner == 'DRAW'      and (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
+        'a_btts_yes': lambda m: m.winner == 'AWAY_TEAM' and (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
+        'h_btts_no':  lambda m: m.winner == 'HOME_TEAM' and ((m.home_score or 0) == 0 or (m.away_score or 0) == 0),
+        'd_btts_no':  lambda m: m.winner == 'DRAW'      and ((m.home_score or 0) == 0 or (m.away_score or 0) == 0),
+        'a_btts_no':  lambda m: m.winner == 'AWAY_TEAM' and ((m.home_score or 0) == 0 or (m.away_score or 0) == 0),
+    },
 }
+
+
+def _resolve_leg(leg: dict) -> str | None:
+    """
+    Resolve one combo leg against the current DB state.
+    Returns 'won', 'lost', 'void', or None if the leg's match isn't finished.
+    """
+    match = db.session.query(Match).filter_by(id=leg.get('match_id')).first()
+    if not match or match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
+        return None
+    resolver = _BET_OUTCOME_RESOLVERS.get(leg.get('market'), {}).get(leg.get('outcome_key'))
+    if resolver is None:
+        return 'void'
+    return 'won' if resolver(match) else 'lost'
 
 
 def _settle_one_bet(bet: Bet, match: Match) -> bool:
     """
     Resolve a single bet against the finished match. Returns True if a change
     was made (bet became won/lost/void). Idempotent: settled bets are skipped.
+
+    Combos (market='combo') don't tie to a single match — they're resolved by
+    walking combo_legs and aggregating: all-won = won, any-lost = lost,
+    any-pending = stay pending. The `match` arg is irrelevant for combos; the
+    caller (`_settle_pending_bets`) hands us bet.match which can be any of the
+    legs' matches, but we ignore it here.
     """
     if bet.status != 'pending':
         return False
+
+    # Combo bet — multi-leg settlement
+    if bet.market == 'combo':
+        legs = bet.combo_legs or []
+        if not legs:
+            # Malformed combo — void it so we don't loop on it forever
+            bet.status = 'void'
+            bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            bet.profit_loss = 0.0
+            return True
+        leg_results = [_resolve_leg(leg) for leg in legs]
+        if any(r is None for r in leg_results):
+            return False  # at least one leg's match isn't finished yet
+        if any(r == 'lost' for r in leg_results):
+            bet.status = 'lost'
+            bet.profit_loss = -bet.stake
+        elif any(r == 'void' for r in leg_results):
+            # In real bookmakers, a void leg reduces the combo to remaining legs.
+            # We don't model partial-stake refund here — treat as void.
+            bet.status = 'void'
+            bet.profit_loss = 0.0
+        else:
+            bet.status = 'won'
+            bet.profit_loss = bet.stake * (bet.odds_at_bet - 1.0)
+        bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        return True
+
+    # Single-leg bet (h2h, totals_2_5, btts, compound)
     if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
         return False
 
@@ -1335,6 +1396,9 @@ def _bet_to_dict(bet: Bet) -> dict:
         'settled_at': iso_utc(bet.settled_at),
         'profit_loss': bet.profit_loss,
         'notes': bet.notes,
+        # NULL for singles; list of leg dicts for combos. Frontend uses presence
+        # of legs to switch the bet-log row layout.
+        'combo_legs': bet.combo_legs,
     }
 
 
@@ -1345,19 +1409,21 @@ def bets_collection():
         status: 'pending' | 'won' | 'lost' | 'void' (optional)
         limit:  int (default 100, max 500)
 
-    POST — log a new bet. JSON body:
+    POST — log a new single-leg bet. JSON body:
         {
             "match_id":           int (required),
-            "market":             "h2h" | "totals_2_5" | "btts" (required),
-            "outcome_key":        "home"/"draw"/"away"/... (required),
+            "market":             "h2h" | "totals_2_5" | "btts" | "compound" (required),
+            "outcome_key":        "home"/"draw"/"away" for h2h; "over"/"under" for totals;
+                                  "yes"/"no" for btts; "h_btts_yes"/etc for compound (required),
             "odds_at_bet":        float (required, > 1.0),
             "stake":              float (required, > 0),
             "bookmaker":          str (optional),
-            "outcome_label":      str (optional, free text e.g. "Home Win"),
+            "outcome_label":      str (optional, free text e.g. "Home Win & Both Score"),
             "model_prob_at_bet":  float (optional),
             "edge_at_bet":        float (optional),
             "notes":              str (optional),
         }
+        For combos use POST /api/bets/combo instead.
         Response: created bet dict (201) or {error: ...} (400/404).
     """
     if request.method == 'GET':
@@ -1396,7 +1462,12 @@ def bets_collection():
             return jsonify({'error': 'stake must be > 0'}), 400
 
         market = data['market']
-        outcome_key = data['outcome_key']
+        # Compound outcome keys come from prediction_service combos dict with
+        # capital prefix ('H_btts_yes'). Normalise to lowercase so the resolver
+        # lookup matches — saves the frontend from having to know our convention.
+        outcome_key = str(data['outcome_key']).lower()
+        if market == 'combo':
+            return jsonify({'error': 'Use POST /api/bets/combo for combo bets'}), 400
         if market not in _BET_OUTCOME_RESOLVERS:
             return jsonify({'error': f'Unsupported market: {market}'}), 400
         if outcome_key not in _BET_OUTCOME_RESOLVERS[market]:
@@ -1431,6 +1502,144 @@ def bets_collection():
     except Exception as e:
         db.session.rollback()
         return _error_response("Failed to create bet", 500, e, endpoint="bets_create")
+
+
+@app.route('/api/bets/combo', methods=['POST'])
+def create_combo_bet():
+    """
+    Log a multi-leg combo bet as a single Bet row with market='combo'.
+
+    JSON body:
+        {
+            "legs": [                                    # required, 2-10 legs
+                {
+                    "match_id":      int (required),
+                    "market":        "h2h" | "totals_2_5" | "btts" (required),
+                    "outcome_key":   "home" | "draw" | ... (required),
+                    "odds":          float (required, > 1.0) — leg's individual price,
+                    "prob":          float (optional) — model probability,
+                    "outcome_label": str (optional) — for display,
+                },
+                ...
+            ],
+            "stake":     float (required, > 0)            — total stake on the combo,
+            "bookmaker": str (optional)                   — where placed,
+            "notes":     str (optional),
+        }
+
+    Settlement: combo wins only if ALL legs win. profit_loss = stake × (combined_odds − 1)
+    on win, −stake on loss, 0 on void. Stays pending while any leg's match
+    is unfinished.
+
+    Response: created bet dict (201) or {error: ...} (400/404).
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        legs_raw = data.get('legs') or []
+        if not isinstance(legs_raw, list) or len(legs_raw) < 2:
+            return jsonify({'error': 'legs must be a list of at least 2 entries'}), 400
+        if len(legs_raw) > 10:
+            return jsonify({'error': 'combos limited to 10 legs'}), 400
+
+        try:
+            stake = float(data.get('stake', 0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'stake must be numeric'}), 400
+        if stake <= 0:
+            return jsonify({'error': 'stake must be > 0'}), 400
+
+        # Validate each leg shape + market support. Compute combined odds + prob.
+        validated_legs: list[dict] = []
+        seen_match_ids: set[int] = set()
+        combined_odds = 1.0
+        combined_prob = 1.0
+        any_prob_missing = False
+        for i, leg in enumerate(legs_raw):
+            if not isinstance(leg, dict):
+                return jsonify({'error': f'leg {i} must be an object'}), 400
+            for k in ('match_id', 'market', 'outcome_key', 'odds'):
+                if k not in leg:
+                    return jsonify({'error': f'leg {i} missing field: {k}'}), 400
+            try:
+                match_id = int(leg['match_id'])
+                leg_odds = float(leg['odds'])
+            except (TypeError, ValueError):
+                return jsonify({'error': f'leg {i} match_id must be int, odds numeric'}), 400
+            if leg_odds <= 1.0:
+                return jsonify({'error': f'leg {i} odds must be > 1.0'}), 400
+            leg_market = leg['market']
+            leg_outcome = str(leg['outcome_key']).lower()
+            if leg_market not in _BET_OUTCOME_RESOLVERS:
+                return jsonify({'error': f'leg {i} unsupported market: {leg_market}'}), 400
+            if leg_outcome not in _BET_OUTCOME_RESOLVERS[leg_market]:
+                return jsonify({'error': f'leg {i} unsupported outcome_key for {leg_market}: {leg_outcome}'}), 400
+            if match_id in seen_match_ids:
+                # Multiple legs on the same match would be correlated; reject.
+                return jsonify({'error': f'duplicate match_id {match_id} — combos must use one leg per match'}), 400
+            seen_match_ids.add(match_id)
+            match = db.session.query(Match).filter_by(id=match_id).first()
+            if not match:
+                return jsonify({'error': f'leg {i} match not found: {match_id}'}), 404
+            combined_odds *= leg_odds
+            prob = leg.get('prob')
+            if prob is None:
+                any_prob_missing = True
+            else:
+                try:
+                    combined_prob *= float(prob)
+                except (TypeError, ValueError):
+                    any_prob_missing = True
+            validated_legs.append({
+                'match_id': match_id,
+                'market': leg_market,
+                'outcome_key': leg_outcome,
+                'odds': round(leg_odds, 2),
+                'prob': float(prob) if prob is not None else None,
+                'outcome_label': leg.get('outcome_label'),
+                # Snapshot the team names + competition + date for display in
+                # bet log even if the underlying match record changes later.
+                'home_team': match.home_team.name if match.home_team else None,
+                'away_team': match.away_team.name if match.away_team else None,
+                'competition': match.competition,
+                'date': iso_utc(match.date),
+            })
+
+        combined_prob_final = None if any_prob_missing else round(combined_prob, 6)
+        combined_edge_final = (None if combined_prob_final is None
+                               else round(combined_prob_final * combined_odds - 1, 4))
+
+        # Anchor on the EARLIEST leg's match so listing by placed_at + match
+        # ordering puts the combo in a sensible spot. The match itself doesn't
+        # matter for combo settle — _resolve_leg walks each leg individually.
+        anchor_leg = min(validated_legs, key=lambda L: L['date'] or '9999')
+
+        bet = Bet(
+            match_id=anchor_leg['match_id'],
+            market='combo',
+            outcome_key='multi',
+            outcome_label=f"{len(validated_legs)}-leg combo",
+            odds_at_bet=round(combined_odds, 4),
+            stake=stake,
+            bookmaker=data.get('bookmaker'),
+            model_prob_at_bet=combined_prob_final,
+            edge_at_bet=combined_edge_final,
+            model_version_at_bet=str((model_data or {}).get('model_version') or 'unversioned'),
+            notes=(data.get('notes') or None),
+            placed_via=data.get('placed_via', 'frontend'),
+            combo_legs=validated_legs,
+        )
+        db.session.add(bet)
+        db.session.commit()
+
+        # Settle now in case all legs are already finished (logging a historical
+        # combo). _settle_one_bet handles combo by walking combo_legs.
+        _settle_one_bet(bet, bet.match)
+        db.session.commit()
+
+        return jsonify(_bet_to_dict(bet)), 201
+    except Exception as e:
+        db.session.rollback()
+        return _error_response("Failed to create combo bet", 500, e, endpoint="bets_create_combo")
 
 
 @app.route('/api/bets/<int:bet_id>', methods=['GET', 'DELETE'])

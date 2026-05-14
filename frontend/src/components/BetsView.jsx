@@ -192,6 +192,7 @@ function Card({ label, value, valueClass = 'text-ink', hint }) {
 
 function BetRow({ bet, onDelete }) {
     const m = bet.match;
+    const isCombo = bet.market === 'combo' && Array.isArray(bet.combo_legs) && bet.combo_legs.length > 0;
     const statusColor = {
         pending: 'text-ink-soft',
         won: 'text-positive',
@@ -201,22 +202,49 @@ function BetRow({ bet, onDelete }) {
     return (
         <div className="bg-paper border border-line hover:border-ink-muted transition-colors px-4 py-3 flex flex-wrap items-center gap-4">
             <div className="flex-1 min-w-[200px]">
-                <div className="text-ink text-sm">
-                    {m?.home} <span className="text-ink-muted">vs</span> {m?.away}
-                </div>
-                <div className="mono text-[0.65rem] text-ink-muted mt-0.5">
-                    {m?.date && formatMatchDate(m.date)} · {m?.competition || ''}
-                    {m?.home_score != null && m?.away_score != null && (
-                        <span className="ml-2 text-ink-soft">
-                            ({m.home_score} − {m.away_score})
-                        </span>
-                    )}
-                </div>
+                {isCombo ? (
+                    // Combo: render each leg succinctly; outcome on the right.
+                    // The anchored match (bet.match) is just the earliest leg —
+                    // not informative on its own for combo rows.
+                    <div>
+                        <div className="text-ink text-sm mb-0.5">
+                            {bet.combo_legs.length}-leg combo
+                            <span className="mono text-[0.65rem] text-ink-muted ml-2">
+                                @ {bet.odds_at_bet?.toFixed(2)}
+                            </span>
+                        </div>
+                        <div className="space-y-0.5">
+                            {bet.combo_legs.map((leg, i) => (
+                                <div key={i} className="mono text-[0.65rem] text-ink-muted">
+                                    {leg.home_team} <span className="text-ink-muted/60">vs</span> {leg.away_team}
+                                    <span className="text-ink-soft ml-1.5">→ {leg.outcome_label || leg.outcome_key}</span>
+                                    <span className="text-ink-muted ml-1.5">@ {leg.odds?.toFixed(2)}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                ) : (
+                    <>
+                        <div className="text-ink text-sm">
+                            {m?.home} <span className="text-ink-muted">vs</span> {m?.away}
+                        </div>
+                        <div className="mono text-[0.65rem] text-ink-muted mt-0.5">
+                            {m?.date && formatMatchDate(m.date)} · {m?.competition || ''}
+                            {m?.home_score != null && m?.away_score != null && (
+                                <span className="ml-2 text-ink-soft">
+                                    ({m.home_score} − {m.away_score})
+                                </span>
+                            )}
+                        </div>
+                    </>
+                )}
             </div>
 
             <div className="min-w-[100px]">
                 <div className="eyebrow">Pick</div>
-                <div className="text-ink text-sm mt-0.5">{bet.outcome_label || bet.outcome_key}</div>
+                <div className="text-ink text-sm mt-0.5">
+                    {isCombo ? `Combo (${bet.combo_legs.length} legs)` : (bet.outcome_label || bet.outcome_key)}
+                </div>
             </div>
 
             <div className="min-w-[80px]">
