@@ -1874,10 +1874,17 @@ def bets_performance():
             agg['stake'] = round(agg['stake'], 2)
             agg['pl'] = round(agg['pl'], 2)
 
-        # Per-league breakdown. Joined via Bet.match.competition; some old bets
-        # may have null match relations (legacy data), bucket those under 'Other'.
+        # Per-league breakdown. Joined via Bet.match.competition.
+        #
+        # IMPORTANT: combos are excluded here. A combo bet's match_id anchors to
+        # one leg (the earliest), but the actual bet spans multiple leagues —
+        # bucketing it under the anchor's league overstates that league's
+        # volume and skews its ROI. Singles alone give an honest per-league
+        # measurement. Combo P/L is still in the top-line ROI / total_profit_loss.
         by_league: dict[str, dict] = {}
         for b in settled:
+            if b.market == 'combo':
+                continue
             league = (b.match.competition if b.match else None) or 'Other'
             agg = by_league.setdefault(league, {'count': 0, 'stake': 0.0, 'pl': 0.0, 'won': 0})
             agg['count'] += 1
@@ -1909,6 +1916,7 @@ def bets_performance():
             'clv_sample_size': len(clv_bets),
             'by_market': by_market,
             'by_league': by_league,
+            'by_league_excludes_combos': True,
         }), 200
     except Exception as e:
         return _error_response("Failed to compute performance", 500, e, endpoint="bets_performance")

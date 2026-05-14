@@ -227,6 +227,12 @@ class OddsAPIClient:
     # spam the API every request. Permanent errors like btts-on-bulk would
     # otherwise drain quota in seconds.
     NEGATIVE_CACHE_TTL = 600  # 10 min
+    # Circuit breaker — refuse to spend the last N credits regardless of who's
+    # asking. Protects against bug/race/abuse scenarios where /api/value-bets
+    # could otherwise exhaust the 500/month free tier before month end.
+    # Override via ODDS_API_QUOTA_FLOOR env var. Default 20 = leave 4% of a
+    # 500-credit budget as emergency reserve.
+    DEFAULT_QUOTA_FLOOR = 20
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv('ODDS_API_KEY')
@@ -235,6 +241,10 @@ class OddsAPIClient:
         # Latest known quota state from response headers — populated by every successful fetch.
         self._quota_remaining: int | None = None
         self._quota_used: int | None = None
+        try:
+            self.quota_floor = int(os.getenv('ODDS_API_QUOTA_FLOOR', self.DEFAULT_QUOTA_FLOOR))
+        except (TypeError, ValueError):
+            self.quota_floor = self.DEFAULT_QUOTA_FLOOR
 
     @property
     def enabled(self) -> bool:
@@ -300,6 +310,25 @@ class OddsAPIClient:
             cached = self._cache_get(key)
         if cached is not None:
             return cached
+
+        # Circuit breaker: if we know quota is below the floor, refuse to fetch.
+        # First-call-of-the-month case: _quota_remaining is None until we've
+        # made at least one request to read response headers — let those go
+        # through. After that we always have a fresh count.
+        if (self._quota_remaining is not None
+                and self._quota_remaining <= self.quota_floor):
+            logger.warning(
+                "Odds API circuit breaker tripped: quota_remaining=%s ≤ floor=%s — "
+                "refusing fetch for %s. Raise ODDS_API_QUOTA_FLOOR or wait for "
+                "monthly reset.",
+                self._quota_remaining, self.quota_floor, sport_key,
+            )
+            # Cache the empty result so we don't re-evaluate on every call in
+            # the same loop. Short TTL — we want to recover quickly if the
+            # quota window flips over.
+            with self._lock:
+                self._cache_set(key, [], ttl=self.NEGATIVE_CACHE_TTL)
+            return []
 
         params = {
             'apiKey': self.api_key,
@@ -377,10 +406,14 @@ class OddsAPIClient:
 
     def quota_status(self) -> dict:
         """Last known quota state — surfaced by /api/admin/odds-status for monitoring."""
+        breaker_active = (self._quota_remaining is not None
+                          and self._quota_remaining <= self.quota_floor)
         return {
             'remaining': self._quota_remaining,
             'used': self._quota_used,
             'low': self._quota_remaining is not None and self._quota_remaining < 50,
+            'circuit_breaker_active': breaker_active,
+            'quota_floor': self.quota_floor,
         }
 
     # ---- public market resolution ---------------------------------------

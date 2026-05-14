@@ -103,7 +103,12 @@ function RecentROI() {
 
             {leagueRows.length > 0 && (
                 <div className="mt-3 pt-3 border-t border-line flex flex-wrap items-baseline gap-x-5 gap-y-1.5">
-                    <span className="eyebrow">By league</span>
+                    <span
+                        className="eyebrow cursor-help border-b border-dotted border-ink-muted/40"
+                        title="Singles only. Combos span multiple leagues and skew per-league ROI when bucketed under one of them, so they're excluded from this breakdown. Combo P/L is still in the top-line ROI above."
+                    >
+                        By league (singles)
+                    </span>
                     {leagueRows.map(([league, agg]) => (
                         <div key={league} className="flex items-baseline gap-1.5">
                             <span className="text-sm text-ink">

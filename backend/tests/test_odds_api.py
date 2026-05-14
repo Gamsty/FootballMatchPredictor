@@ -399,7 +399,88 @@ class TestQuota:
     def test_quota_status_when_never_fetched(self):
         c = OddsAPIClient(api_key='x')
         s = c.quota_status()
-        assert s == {'remaining': None, 'used': None, 'low': False}
+        assert s == {
+            'remaining': None, 'used': None, 'low': False,
+            'circuit_breaker_active': False,
+            'quota_floor': c.quota_floor,
+        }
+
+
+class TestCircuitBreaker:
+    """
+    Quota circuit breaker: when remaining quota falls below the floor, fetch
+    must refuse instead of making the request. Without this, a bug or abusive
+    caller could drain the last few credits before month-end reset.
+    """
+
+    def test_fetch_blocked_when_below_floor(self, monkeypatch):
+        c = OddsAPIClient(api_key='x')
+        c.quota_floor = 20
+        c._quota_remaining = 15  # below floor
+        # Patch requests.get — should never be called when breaker trips.
+        called = []
+        monkeypatch.setattr('odds_api.requests.get',
+                            lambda *a, **kw: called.append(True) or None)
+        result = c.fetch_odds('soccer_epl', markets=('h2h',))
+        assert result == []
+        assert called == [], "requests.get must not run when breaker trips"
+
+    def test_fetch_allowed_when_above_floor(self, monkeypatch):
+        from unittest.mock import MagicMock
+        c = OddsAPIClient(api_key='x')
+        c.quota_floor = 20
+        c._quota_remaining = 100  # well above floor
+        fake_resp = MagicMock(status_code=200, headers={
+            'x-requests-remaining': '99', 'x-requests-used': '401',
+        })
+        fake_resp.json.return_value = []
+        monkeypatch.setattr('odds_api.requests.get', lambda *a, **kw: fake_resp)
+        result = c.fetch_odds('soccer_epl', markets=('h2h',))
+        assert result == []  # empty events list, but DID make the call
+
+    def test_fetch_allowed_on_first_call_unknown_quota(self, monkeypatch):
+        """
+        Initial state: _quota_remaining is None until we've made one request.
+        Breaker must not refuse the first call — we need it to read the
+        response headers and learn the budget.
+        """
+        from unittest.mock import MagicMock
+        c = OddsAPIClient(api_key='x')
+        assert c._quota_remaining is None
+        fake_resp = MagicMock(status_code=200, headers={
+            'x-requests-remaining': '450', 'x-requests-used': '50',
+        })
+        fake_resp.json.return_value = []
+        called = []
+        def _capture(*a, **kw):
+            called.append(True)
+            return fake_resp
+        monkeypatch.setattr('odds_api.requests.get', _capture)
+        c.fetch_odds('soccer_epl', markets=('h2h',))
+        assert called == [True], "first call must go through to learn quota"
+
+    def test_quota_status_reports_breaker_state(self):
+        c = OddsAPIClient(api_key='x')
+        c.quota_floor = 20
+        # Above floor → breaker inactive
+        c._quota_remaining = 100
+        assert c.quota_status()['circuit_breaker_active'] is False
+        # At floor → breaker active (≤ not <)
+        c._quota_remaining = 20
+        assert c.quota_status()['circuit_breaker_active'] is True
+        # Below floor → breaker active
+        c._quota_remaining = 5
+        assert c.quota_status()['circuit_breaker_active'] is True
+
+    def test_env_var_overrides_default_floor(self, monkeypatch):
+        monkeypatch.setenv('ODDS_API_QUOTA_FLOOR', '100')
+        c = OddsAPIClient(api_key='x')
+        assert c.quota_floor == 100
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv('ODDS_API_QUOTA_FLOOR', 'not-a-number')
+        c = OddsAPIClient(api_key='x')
+        assert c.quota_floor == OddsAPIClient.DEFAULT_QUOTA_FLOOR
 
 
 # ----------------------------------------------------------------------------
