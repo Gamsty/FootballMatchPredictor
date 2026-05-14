@@ -26,6 +26,11 @@ import { COMPETITION_LABELS } from '../utils/constants';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const FRACTIONAL_KELLY = 0.25;
+// Mirror of BestOfWeek's SUSPICIOUS_EDGE — anything above 20% against best is
+// almost always palp error / model overconfidence on low-prob outcomes. We
+// leave these in the singles list (flagged) so users can see them, but they
+// don't belong in auto-generated combo recommendations.
+const SUSPICIOUS_EDGE = 0.20;
 
 function ComboPresets({ scoredPicks, bankroll, onUseCombo }) {
     const [expanded, setExpanded] = useState(false);
@@ -196,8 +201,15 @@ function comboFromLegs(legs) {
 function buildPresets(scoredPicks) {
     if (!scoredPicks || scoredPicks.length < 2) return [null, null, null];
 
+    // Drop suspicious-edge picks before building any preset — those are the
+    // exact picks that would headline a "Best Edge Double" but are almost
+    // certainly fake edges. We'd rather show no preset than recommend a palp.
+    const safe = scoredPicks.filter(
+        p => (p.edge_best ?? p.edge ?? 0) < SUSPICIOUS_EDGE
+    );
+
     // Pool: dedupe by match first, then rerank per preset.
-    const pool = dedupeByMatch([...scoredPicks].sort((a, b) => b._score - a._score));
+    const pool = dedupeByMatch([...safe].sort((a, b) => b._score - a._score));
 
     // Safest double — top 2 by probability (we still require they cleared the
     // 2% edge gate to even be in the pool).
