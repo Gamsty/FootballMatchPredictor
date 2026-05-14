@@ -1,8 +1,22 @@
 """
 understat.com xG scraper.
 
-understat publishes Expected-Goals data as JSON embedded in `<script>` tags on
-match/team/league pages. No public API, no auth — we just parse the HTML.
+⚠ KNOWN-BROKEN AS OF 2026-05-14 ⚠
+----------------------------------
+Understat redesigned their league pages and no longer embed match data as
+inline `var X = JSON.parse(...)` declarations. HTML returns 200 OK but
+contains zero such variables — data is now fetched via separate XHR endpoints
+we'd need to reverse-engineer through browser DevTools.
+
+Module kept as a stub. To unblock xG features either:
+  - Reverse-engineer the new endpoints (1-3 hours research + ongoing maintenance)
+  - Switch to fbref.com (more stable; HTML table scraping instead of JSON)
+  - Pay for a commercial xG data feed
+
+ORIGINAL DESIGN (when site was scrapeable)
+------------------------------------------
+understat published Expected-Goals data as JSON embedded in `<script>` tags
+on match/team/league pages. No public API, no auth — we just parsed the HTML.
 
 LEAGUE COVERAGE
 ---------------
