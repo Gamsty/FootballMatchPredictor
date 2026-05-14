@@ -207,9 +207,20 @@ function Card({ label, value, valueClass = 'text-ink', hint }) {
     );
 }
 
+// Market badge text per market type. Compound gets a distinct label so the
+// row visually tells you it's a result+goals derived bet (e.g. "Home Win &
+// Both Score") rather than a vanilla 1X2 single. h2h doesn't need a badge —
+// it's the implicit default.
+const MARKET_BADGE = {
+    totals_2_5: 'O/U 2.5',
+    btts: 'BTTS',
+    compound: 'Compound',
+};
+
 function BetRow({ bet, onDelete }) {
     const m = bet.match;
     const isCombo = bet.market === 'combo' && Array.isArray(bet.combo_legs) && bet.combo_legs.length > 0;
+    const marketBadge = MARKET_BADGE[bet.market];
     const statusColor = {
         pending: 'text-ink-soft',
         won: 'text-positive',
@@ -271,7 +282,14 @@ function BetRow({ bet, onDelete }) {
             </div>
 
             <div className="min-w-[100px]">
-                <div className="eyebrow">Pick</div>
+                <div className="eyebrow flex items-center gap-1.5">
+                    Pick
+                    {marketBadge && !isCombo && (
+                        <span className="mono text-[0.6rem] tracking-normal normal-case text-ink-muted bg-paper-tint px-1 py-0.5 border border-line">
+                            {marketBadge}
+                        </span>
+                    )}
+                </div>
                 <div className="text-ink text-sm mt-0.5">
                     {isCombo ? `Combo (${bet.combo_legs.length} legs)` : (bet.outcome_label || bet.outcome_key)}
                 </div>

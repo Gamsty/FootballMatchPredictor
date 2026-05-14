@@ -465,6 +465,61 @@ def refit_calibration():
         return _error_response("Calibration fit failed", 500, e, endpoint="refit_calibration")
 
 
+@app.route('/api/admin/backfill-predictions', methods=['POST'])
+def backfill_predictions():
+    """
+    Backfill Prediction rows for FINISHED matches that don't have one yet.
+
+    Why: the calibration endpoint needs evaluated predictions to compute ECE
+    and the curve. Production DB ships empty for that table — this endpoint
+    fills it in. Idempotent on (match_id) — re-runs skip already-predicted
+    matches unless `overwrite=true`.
+
+    JSON body (all optional):
+        {
+            "since":     "YYYY-MM-DD"  default: 365 days ago,
+            "limit":     int           default 500 (max 2000),
+            "overwrite": bool          default false,
+        }
+
+    Run repeatedly until `remaining_estimate == 0`. Capped at 500 matches per
+    request so a single call doesn't hold a gunicorn worker for minutes.
+
+    Auth: X-Reload-Token header (same shared secret as other admin endpoints).
+    Response: summary dict with processed/written/skipped/remaining.
+    """
+    if not _require_admin_token():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not model_data:
+        return jsonify({"error": "Model not loaded"}), 503
+
+    try:
+        from predictions_backfill import run_backfill
+
+        body = request.get_json(silent=True) or {}
+        since = None
+        if body.get('since'):
+            try:
+                since = datetime.strptime(body['since'], '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'since must be YYYY-MM-DD'}), 400
+        limit = max(1, min(int(body.get('limit', 500)), 2000))
+        overwrite = bool(body.get('overwrite', False))
+
+        summary = run_backfill(
+            db=db,
+            feature_engineer=feature_engineer,
+            model_data=model_data,
+            since=since,
+            limit=limit,
+            overwrite=overwrite,
+        )
+        return jsonify(summary), 200
+    except Exception as e:
+        db.session.rollback()
+        return _error_response("Backfill failed", 500, e, endpoint="backfill_predictions")
+
+
 @app.route('/api/admin/snapshot-closing-odds', methods=['POST'])
 def snapshot_closing_odds():
     """

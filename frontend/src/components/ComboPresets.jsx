@@ -198,6 +198,13 @@ function comboFromLegs(legs) {
     return { comboProb: prob, comboOdds: odds, comboEdge: ev, comboMargin: margin };
 }
 
+// Edge cases handled (verified by reading + manual UI test, not a unit test —
+// frontend has no Vitest/Jest setup and adding it for these branches is
+// overkill):
+//   - scoredPicks empty/undefined          → [null, null, null] (caller hides)
+//   - <2 picks after edge<20% filter       → [null, null, null]
+//   - 2 picks: safest + bestEdge populated, triple = null
+//   - 3+ picks after dedupe by match       → all three slots populated
 function buildPresets(scoredPicks) {
     if (!scoredPicks || scoredPicks.length < 2) return [null, null, null];
 

@@ -1,0 +1,42 @@
+name: Refit calibrator
+
+# Re-fits the temperature/isotonic calibrator from the latest evaluated
+# predictions. Model probabilities drift slightly over a season (referee
+# trends, scoring rates, COVID years, etc.) — periodic calibrator refit
+# keeps ECE down without a full model retrain.
+#
+# Frequency: weekly. Calibration shape doesn't move fast — daily would burn
+# CPU without measurable gain. Weekly catches league-end / mid-season
+# regression nicely.
+#
+# Auth: same X-Reload-Token as other admin endpoints.
+# Quota: calibration uses only DB data, no external API spend.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Monday 06:00 UTC — after the weekend slate has settled
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger calibrator refit
+        env:
+          RELOAD_TOKEN: ${{ secrets.RELOAD_TOKEN }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+        run: |
+          if [ -z "$RELOAD_TOKEN" ] || [ -z "$BACKEND_URL" ]; then
+            echo "Missing RELOAD_TOKEN or BACKEND_URL secret — skipping."
+            exit 1
+          fi
+          # Default body: re-fit from the last 365 days, up to 5000 samples,
+          # upload result to blob so the next container restart picks it up.
+          response=$(curl -fsS -X POST "$BACKEND_URL/api/admin/refit-calibration" \
+            -H "X-Reload-Token: $RELOAD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"max": 5000, "upload": true}')
+          echo "Response: $response"
