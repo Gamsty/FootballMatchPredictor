@@ -6,11 +6,16 @@ into the database. Supports multiple leagues across 5 countries,
 both top division and second division.
 
 Leagues supported:
-    England:  Premier League (E0) + Championship (E1)
-    Germany:  Bundesliga (D1) + 2. Bundesliga (D2)
-    Italy:    Serie A (I1) + Serie B (I2)
-    France:   Ligue 1 (F1) + Ligue 2 (F2)
-    Norway:   Eliteserien (N1)
+    England:      Premier League (E0) + Championship (E1)
+    Germany:      Bundesliga (D1) + 2. Bundesliga (D2)
+    Italy:        Serie A (I1) + Serie B (I2)
+    France:       Ligue 1 (F1) + Ligue 2 (F2)
+    Spain:        La Liga (SP1) + Segunda (SP2)
+    Belgium:      Jupiler Pro League (B1)
+    Portugal:     Primeira Liga (P1)
+    Turkey:       Süper Lig (T1)
+    Scotland:     Premiership (SC0) + Championship (SC1)
+    Netherlands:  Eredivisie (N1)
 
 football-data.co.uk CSV columns used:
     - Date: Match date (DD/MM/YYYY)
@@ -63,8 +68,10 @@ LEAGUES = {
     "P1": ("Primeira Liga", "Portugal"),
     # Turkey
     "T1": ("Süper Lig", "Turkey"),
-    # Norway — calendar year season (spring to fall), fewer seasons available
-    "N1": ("Eliteserien", "Norway"),
+    # Netherlands Eredivisie — football-data.co.uk codes N1 as Dutch top flight.
+    # (Was incorrectly labeled as "Eliteserien"/Norway here for a while — fix
+    # applied 2026-05; existing rows migrated via one-off UPDATE.)
+    "N1": ("Eredivisie", "Netherlands"),
 }
 
 # Seasons to download (season label -> URL code)
@@ -80,18 +87,6 @@ SEASONS_STANDARD = {
     2025: "2526",  # Current season (Aug 2025 – May 2026)
 }
 
-# Norway uses calendar year seasons (e.g., 2023 season runs Mar-Nov 2023)
-# football-data.co.uk stores them with the same code format but single-year
-SEASONS_NORWAY = {
-    2019: "1920",
-    2020: "2021",
-    2021: "2122",
-    2022: "2223",
-    2023: "2324",
-    2024: "2425",
-    2025: "2526",
-}
-
 # Offset for synthetic IDs — each league gets its own range to avoid collisions
 # API IDs from Football-Data.org are in the 500000+ range
 # Format: league_code -> (team_id_offset, match_id_offset)
@@ -104,7 +99,7 @@ LEAGUE_ID_OFFSETS = {
     "I2": (350000, 3500000),   # Italy Serie B
     "F1": (400000, 4000000),   # France Ligue 1
     "F2": (450000, 4500000),   # France Ligue 2
-    "N1": (500000, 5000000),   # Norway Eliteserien
+    "N1": (500000, 5000000),   # Netherlands Eredivisie
     "SP1": (550000, 5500000),  # Spain La Liga
     "SP2": (600000, 6000000),  # Spain Segunda División
     "SC0": (650000, 6500000),  # Scotland Premiership
@@ -730,8 +725,9 @@ def load_all_external_data(only_league=None):
         print(f"  {competition_name} ({country}) [{league_code}]")
         print(f"{'='*60}")
 
-        # Norway uses different season mapping
-        seasons = SEASONS_NORWAY if league_code == "N1" else SEASONS_STANDARD
+        # N1 uses the standard August–May calendar like the rest of the
+        # European leagues (it's Eredivisie, not Norway as previously mislabeled).
+        seasons = SEASONS_STANDARD
 
         matches, standings = load_league_data(
             db, league_code, competition_name, seasons
