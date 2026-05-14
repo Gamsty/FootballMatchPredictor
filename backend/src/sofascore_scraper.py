@@ -1,20 +1,36 @@
 """
 sofascore.com lineup + injury scraper.
 
-WHY SOFASCORE
--------------
+⚠ KNOWN-BROKEN AS OF 2026-05-14 ⚠
+----------------------------------
+sofascore now layers fingerprint checks on top of Cloudflare's standard JS
+challenge. cloudscraper passes the JS challenge but the follow-up returns
+403 Forbidden — confirmed via prod logs hitting /sport/football/scheduled-events/.
+A working bypass would need playwright (real browser) which we judged too
+heavy for the marginal feature gain.
+
+This module is kept in the repo as a STUB / future-reference. The matching
+GitHub Actions cron (scrape-lineups.yml) has been disabled. The admin
+endpoint (/api/admin/scrape-lineups) returns gracefully with empty results
+when sofascore 403s. If we ever switch lineup sources (fotmob unofficial
+API or api-football paid), only the fetch_* functions need to swap — the
+JSON output shape from `fetch_lineups()` is what lineups_scrape.py depends on.
+
+WHY SOFASCORE WAS PICKED ORIGINALLY
+-----------------------------------
 - Free, covers every league we care about (including Eredivisie / Primeira
   Liga / Championship — where api-football's free tier failed us)
 - Has pre-match lineups (typically posted ~1h before kickoff) AND injuries
 - Public JSON API at api.sofascore.com — not officially documented but stable
-  for years
+  for years until 2026
 
-WHY CLOUDSCRAPER
-----------------
+WHY CLOUDSCRAPER (kept for reference)
+-------------------------------------
 sofascore is fronted by Cloudflare. Plain `requests` gets 403s on most calls.
 `cloudscraper` wraps requests, solves the JS challenge on first hit, and
 caches the cf_clearance cookie for subsequent calls. Works without a
-headless browser — much lighter for a container.
+headless browser — much lighter for a container. Stopped working when
+sofascore added fingerprint validation.
 
 API SHAPE WE USE
 ----------------

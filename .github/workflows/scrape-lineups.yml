@@ -1,22 +1,29 @@
-name: Scrape lineups
+name: Scrape lineups (DISABLED)
 
-# Sofascore posts pre-match lineups ~1h before kickoff. We poll every 30min
-# in a 6h pre-kickoff window so we (a) cache the event_id resolution well in
-# advance and (b) re-fetch into the final hour when the confirmed lineup
-# replaces the predicted one.
+# DISABLED 2026-05-14 — sofascore returns 403 Forbidden behind their
+# Cloudflare wall regardless of cloudscraper attempts. The fingerprint
+# checks they layer on top of the standard JS challenge can't be bypassed
+# without a real browser (playwright), and we don't want a headless
+# browser stack in the container for marginal feature gain.
 #
-# Most runs are no-ops — lineup endpoint returns None until sofascore posts
-# something. The scraper handles None gracefully; only fetched/scraped runs
-# do DB writes.
+# To re-enable lineup data we'd need one of:
+#   - api-football paid tier ($10-20/mo) — see api_football_client.py
+#   - fotmob unofficial API integration (untested)
+#   - playwright-based scraper (~5x container memory)
 #
-# Quota: sofascore is free but rate-limited. We respect 1.5s between requests
-# inside the scraper. A typical run touches ~5-15 matches → ~10-25s on the
-# happy path. GH Actions runner is well within its 6h limit.
+# Keeping the workflow file as a stub so the on-disk infra-as-code reflects
+# what we intend; the empty `on:` block means it never triggers. To
+# re-enable, restore the schedule + workflow_dispatch triggers below and
+# swap sofascore_scraper.py for an alternative source.
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes
+  # No triggers — workflow stays in repo but never fires.
   workflow_dispatch:
+    inputs:
+      enabled:
+        description: 'Set to "yes" to confirm you understand sofascore is blocked'
+        required: true
+        default: 'no'
 
 permissions:
   contents: read
