@@ -1547,7 +1547,9 @@ def _resolve_leg(leg: dict) -> str | None:
     match = db.session.query(Match).filter_by(id=leg.get('match_id')).first()
     if not match:
         return None
-    if match.status == 'CANCELLED':
+    # Mirror single-bet settle: postponed/cancelled/suspended legs void the
+    # combo. Otherwise an indefinitely-postponed leg would hang the whole combo.
+    if match.status in ('CANCELLED', 'POSTPONED', 'SUSPENDED'):
         return 'void'
     if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
         return None
@@ -1608,11 +1610,13 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
         bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
         return True
 
-    # Single-leg bet (h2h, totals_2_5, btts, compound)
-    # CANCELLED matches void the bet (matches typical bookie rule). Without this
-    # a cancelled match leaves the bet pending forever even after we know it
-    # won't play.
-    if match.status == 'CANCELLED':
+    # Single-leg bet (h2h, totals_2_5, btts, compound).
+    #
+    # Terminal-but-not-played statuses (CANCELLED, POSTPONED, SUSPENDED,
+    # AWARDED with no scores) void the bet. Without this, a postponed match
+    # leaves the bet pending forever — and bookies typically void rather
+    # than re-bind to the rescheduled fixture.
+    if match.status in ('CANCELLED', 'POSTPONED', 'SUSPENDED'):
         bet.status = 'void'
         bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
         bet.profit_loss = 0.0
@@ -1754,6 +1758,12 @@ def bets_collection():
             return jsonify({'error': 'odds_at_bet must be > 1.0'}), 400
         if stake <= 0:
             return jsonify({'error': 'stake must be > 0'}), 400
+        # Sanity cap. A typo like "10000" instead of "100" in the modal would
+        # otherwise commit an unrecoverable bankroll mistake before the user
+        # notices. 50,000 NOK is well above any sensible single-bet stake for
+        # this app's intended use; raise if you ever genuinely need bigger.
+        if stake > 50000:
+            return jsonify({'error': 'stake exceeds safety cap of 50000 NOK'}), 400
 
         market = data['market']
         # Compound outcome keys come from prediction_service combos dict with
@@ -1843,6 +1853,8 @@ def create_combo_bet():
             return jsonify({'error': 'stake must be numeric'}), 400
         if stake <= 0:
             return jsonify({'error': 'stake must be > 0'}), 400
+        if stake > 50000:
+            return jsonify({'error': 'stake exceeds safety cap of 50000 NOK'}), 400
 
         # Two-pass validation: do all structural checks first, then hit the DB
         # for match existence in a single bulk lookup. Without this split, a
@@ -2186,7 +2198,16 @@ def refresh_fixtures():
             ).first()
 
             if existing:
-                existing.status = fixture['status']
+                # Don't downgrade a FINISHED match back to IN_PLAY/TIMED/etc.
+                # football-data.org occasionally serves stale state (e.g.
+                # returns IN_PLAY for a match that ended hours ago). Once we
+                # see FINISHED, lock it in — only let CANCELLED or AWARDED
+                # (legitimate terminal overrides) replace it.
+                terminal_overrides = ('CANCELLED', 'AWARDED')
+                if existing.status == 'FINISHED' and fixture['status'] not in terminal_overrides:
+                    pass  # keep our FINISHED
+                else:
+                    existing.status = fixture['status']
                 existing.date = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00'))
                 # Backfill scores + winner when the source has them (i.e. the
                 # match has already finished within our query window). Without
@@ -2196,6 +2217,10 @@ def refresh_fixtures():
                     existing.home_score = fixture['home_score']
                 if fixture.get('away_score') is not None:
                     existing.away_score = fixture['away_score']
+                # Don't reset winner once set. football-data has been observed
+                # to clear `winner` when downgrading FINISHED → IN_PLAY mid-day,
+                # which would leave our DB without the ground-truth needed by
+                # bet settle + calibration backfill.
                 if fixture.get('winner') is not None:
                     existing.winner = fixture['winner']
                 updated += 1

@@ -271,7 +271,7 @@ class FootballDataCollector:
 
         return pd.DataFrame(flattened)
 
-    def get_upcoming_fixtures(self, days=7):
+    def get_upcoming_fixtures(self, days=7, backfill_days=3):
         """
         Fetch upcoming fixtures across all free-tier competitions.
 
@@ -280,6 +280,12 @@ class FootballDataCollector:
 
         Args:
             days: Number of days ahead to fetch (default 7)
+            backfill_days: Number of days IN THE PAST to also query (default 3).
+                           Critical for score sync: a match played yesterday won't
+                           have its final score in our DB unless we re-query it.
+                           Without backfill, dateFrom=today and yesterday's
+                           matches stay frozen at whatever status football-data
+                           returned just before kickoff.
 
         Returns:
             list[dict]: Flattened fixture dicts
@@ -289,8 +295,10 @@ class FootballDataCollector:
         # API allows max 10-day window per request, so split into chunks
         all_matches = []
         chunk_size = 10
-        start = datetime.now()
-        remaining = days
+        # Start `backfill_days` in the past so yesterday's finished matches
+        # get their score + FINISHED status synced too.
+        start = datetime.now() - timedelta(days=backfill_days)
+        remaining = days + backfill_days
 
         while remaining > 0:
             chunk_days = min(remaining, chunk_size)

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def _match(**kwargs):
     """Build a fake Match-like object with the attributes the resolvers touch."""
@@ -189,6 +191,47 @@ class TestCancelledMatch:
         assert changed is True
         assert bet.status == 'void'
         assert bet.profit_loss == 0.0
+
+    @pytest.mark.parametrize('non_played_status', ['POSTPONED', 'SUSPENDED'])
+    def test_single_bet_voids_on_postponed_or_suspended(self, non_played_status):
+        """
+        POSTPONED and SUSPENDED matches must void the bet — otherwise a bet on
+        a postponed fixture stays pending forever even after the rescheduled
+        match plays under a NEW match_id. Matches typical bookie rules.
+        """
+        from app import _settle_one_bet
+        from datetime import datetime
+        bet = SimpleNamespace(
+            id=1, market='h2h', outcome_key='home', stake=100.0,
+            odds_at_bet=2.0, status='pending', settled_at=None,
+            profit_loss=None, placed_at=datetime(2026, 5, 1),
+            combo_legs=None,
+        )
+        match = SimpleNamespace(
+            status=non_played_status, home_score=None, away_score=None, winner=None
+        )
+        changed = _settle_one_bet(bet, match)
+        assert changed is True
+        assert bet.status == 'void'
+        assert bet.profit_loss == 0.0
+
+    def test_combo_voids_when_leg_postponed(self, monkeypatch):
+        """A combo with one POSTPONED leg should void rather than hang."""
+        from app import _settle_one_bet
+        from datetime import datetime
+        legs = [{'match_id': 1}, {'match_id': 2}]
+        # Patch _resolve_leg to mimic: leg 0 won, leg 1 returns 'void' (postponed).
+        import app
+        results = iter(['won', 'void'])
+        monkeypatch.setattr(app, '_resolve_leg', lambda L: next(results))
+        bet = SimpleNamespace(
+            id=1, market='combo', outcome_key='multi', stake=100.0,
+            odds_at_bet=5.0, combo_legs=legs, status='pending',
+            settled_at=None, profit_loss=None, placed_at=datetime(2026, 5, 1),
+        )
+        changed = _settle_one_bet(bet, SimpleNamespace())
+        assert changed is True
+        assert bet.status == 'void'
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,24 @@ class TestComboEndpointValidation:
         r = client.post('/api/bets/combo', json={'legs': legs, 'stake': -50})
         assert r.status_code == 400
 
+    def test_rejects_stake_above_safety_cap(self, client):
+        """50000 NOK cap protects against typo'd bankroll-killers like 10000→100000."""
+        legs = [{'match_id': 1, 'market': 'h2h', 'outcome_key': 'home', 'odds': 2.0},
+                {'match_id': 2, 'market': 'h2h', 'outcome_key': 'away', 'odds': 2.5}]
+        r = client.post('/api/bets/combo', json={'legs': legs, 'stake': 100000})
+        assert r.status_code == 400
+        assert 'cap' in r.get_json()['error']
+
+
+class TestSingleBetStakeCap:
+    def test_rejects_stake_above_safety_cap_on_single(self, client):
+        r = client.post('/api/bets', json={
+            'match_id': 1, 'market': 'h2h', 'outcome_key': 'home',
+            'odds_at_bet': 2.0, 'stake': 100000,
+        })
+        assert r.status_code == 400
+        assert 'cap' in r.get_json()['error']
+
     def test_rejects_leg_missing_required_field(self, client):
         legs = [
             {'match_id': 1, 'market': 'h2h', 'outcome_key': 'home', 'odds': 2.0},
