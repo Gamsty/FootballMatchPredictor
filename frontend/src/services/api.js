@@ -143,6 +143,13 @@ export const footballAPI = {
         const response = await api.get('/bets/performance', { params, signal });
         return response.data;
     },
+    settleBets: async () => {
+        // Force-settle any pending bets whose match has finished. Same logic
+        // runs implicitly inside listBets / getBetsPerformance, but this gives
+        // the operator an explicit trigger so the UI can flag "n settled".
+        const response = await api.post('/bets/settle', {});
+        return response.data;
+    },
 
     // Matches — supports filters: { season, team_id, status, limit }
     getMatches: async (params = {}) => {

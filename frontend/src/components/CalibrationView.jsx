@@ -76,7 +76,7 @@ function CalibrationView({ onClose }) {
                 </div>
 
                 <div className="px-4 sm:px-6 py-5 sm:py-6 space-y-5">
-                    {/* Outcome picker */}
+                    {/* Outcome picker — px-3 py-2 on mobile for thumb targets */}
                     <div className="flex flex-wrap items-center gap-2">
                         <span className="eyebrow">Outcome</span>
                         {OUTCOMES.map(o => (
@@ -85,7 +85,7 @@ function CalibrationView({ onClose }) {
                                 onClick={() => setOutcome(o.id)}
                                 title={o.hint}
                                 className={
-                                    'mono text-[0.7rem] uppercase tracking-[0.1em] px-2 py-1 border transition-colors cursor-pointer ' +
+                                    'mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 sm:px-2 sm:py-1 border transition-colors cursor-pointer ' +
                                     (outcome === o.id
                                         ? 'bg-ink text-paper border-ink'
                                         : 'border-line text-ink-soft hover:text-ink hover:border-ink-muted')
@@ -158,6 +158,7 @@ function CalibrationView({ onClose }) {
                             ) : (
                                 <>
                                     <CalibrationPlot buckets={data.buckets} />
+                                    <SampleStrip buckets={data.buckets} />
                                     <Summary summary={data.summary} />
                                     <CalibratorBanner calibrator={data.summary?.calibrator} />
                                 </>
@@ -219,12 +220,14 @@ function CalibrationPlot({ buckets }) {
         .join(' ');
 
     return (
-        <div className="overflow-x-auto">
+        // viewBox + 100% width = scales to container; height stays square via
+        // aspect-ratio so the diagonal stays a true 45° on any screen width.
+        <div className="border border-line bg-paper-tint/40">
             <svg
                 viewBox={`0 0 ${PLOT_SIZE} ${PLOT_SIZE}`}
-                width={PLOT_SIZE}
-                height={PLOT_SIZE}
-                className="border border-line bg-paper-tint/40"
+                className="block w-full h-auto"
+                preserveAspectRatio="xMidYMid meet"
+                style={{ aspectRatio: '1 / 1' }}
             >
                 {/* Grid */}
                 {[0.25, 0.5, 0.75].map(v => (
@@ -260,6 +263,40 @@ function CalibrationPlot({ buckets }) {
                     ACTUAL RATE
                 </text>
             </svg>
+        </div>
+    );
+}
+
+// Horizontal strip of hairline bars showing relative sample size per bucket.
+// Sits under the calibration plot so the reader can immediately see which
+// probability ranges have enough data to trust — a tight ECE built on n=3
+// samples is just noise.
+function SampleStrip({ buckets }) {
+    const maxCount = Math.max(1, ...buckets.map(b => b.count || 0));
+    return (
+        <div>
+            <div className="flex gap-px h-6 bg-paper-tint border border-line">
+                {buckets.map((b, i) => {
+                    const h = b.count ? (b.count / maxCount) * 100 : 0;
+                    return (
+                        <div
+                            key={i}
+                            className="flex-1 flex items-end"
+                            title={`Bucket ${(i / buckets.length * 100).toFixed(0)}–${((i + 1) / buckets.length * 100).toFixed(0)}%: n=${b.count || 0}`}
+                        >
+                            <div
+                                className="w-full bg-ink"
+                                style={{ height: `${h}%` }}
+                            />
+                        </div>
+                    );
+                })}
+            </div>
+            <div className="mono text-[0.55rem] uppercase tracking-[0.12em] text-ink-muted mt-1.5 flex justify-between">
+                <span>0%</span>
+                <span>samples per bucket — bigger = more data</span>
+                <span>100%</span>
+            </div>
         </div>
     );
 }

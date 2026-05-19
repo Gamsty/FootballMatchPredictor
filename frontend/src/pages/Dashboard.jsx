@@ -16,17 +16,19 @@ Data flow:
 */
 
 import { useState, useEffect, useCallback } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, getBetToken } from '../services/api';
 import MatchCard from '../components/MatchCard';
 import FilterBar from '../components/FilterBar';
 import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
-import AboutModel from '../components/AboutModel';
 import ValueBets, { LogBetModal } from '../components/ValueBets';
 import BestOfWeek, { LogComboModal } from '../components/BestOfWeek';
 import CalibrationView from '../components/CalibrationView';
 import PerformanceHub from '../components/PerformanceHub';
 import RecentROI from '../components/RecentROI';
+import Settings from '../components/Settings';
+import MethodNote from '../components/MethodNote';
+import BottomNav from '../components/BottomNav';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
     calculateAccumulator
@@ -67,7 +69,6 @@ function Dashboard() {
     // UI state
     const [activeTab, setActiveTab] = useState('today');
     const [selectedMatch, setSelectedMatch] = useState(null);
-    const [showAbout, setShowAbout] = useState(false);
     const [showCalibration, setShowCalibration] = useState(false);
     // Advanced mode is sticky to localStorage. Held in state so the toggle
     // in the meta-links bar can flip it without a full page reload — the
@@ -224,7 +225,7 @@ function Dashboard() {
     const accResult = calculateAccumulator(accumulator, stake);
 
     return (
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-10 py-6 sm:py-14">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-10 py-6 sm:py-14 pb-24 sm:pb-14">
             {/* Hero — display tightens on phone but keeps the editorial weight.
                 Lead paragraph reads as a single column on mobile vs ~60ch on
                 desktop. Meta-links bar uses flex-wrap so it doesn't overflow. */}
@@ -243,15 +244,15 @@ function Dashboard() {
                 </p>
                 <div className="flex items-center flex-wrap gap-x-3 gap-y-2 mt-5 sm:mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
                     {/* The 'shown' counter is for the match-grid tabs only. Hide on Value,
-                        Best Picks, and Performance because those have their own toolbars. */}
-                    {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && (
+                        Best Picks, Performance, Settings, and Method — those have their own toolbars. */}
+                    {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && activeTab !== 'settings' && activeTab !== 'method' && (
                         <>
                             <span>{filteredMatches.length} shown</span>
                             <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
                         </>
                     )}
                     <button
-                        onClick={() => setShowAbout(true)}
+                        onClick={() => setActiveTab('method')}
                         className="text-accent hover:text-accent-soft transition-colors inline-flex items-center gap-1.5 cursor-pointer"
                     >
                         <span className="border-b border-accent/40 hover:border-accent-soft">How it works</span>
@@ -291,6 +292,25 @@ function Dashboard() {
                         <span>ADV</span>
                         <span aria-hidden="true">{advancedMode ? '●' : '○'}</span>
                     </button>
+                    {/* Auth status — only relevant when advanced mode is on
+                        since unauthenticated visitors can't log anything. */}
+                    {advancedMode && (
+                        <button
+                            onClick={() => setActiveTab('settings')}
+                            title={getBetToken()
+                                ? 'Bet-write token is set. Logging will succeed.'
+                                : 'No bet-write token — POST /api/bets will return 401. Click to open Settings.'}
+                            className={
+                                'inline-flex items-center gap-1.5 px-2 py-0.5 border transition-colors cursor-pointer ' +
+                                (getBetToken()
+                                    ? 'border-positive text-positive hover:bg-positive hover:text-paper'
+                                    : 'border-danger text-danger hover:bg-danger hover:text-paper')
+                            }
+                        >
+                            <span>AUTH</span>
+                            <span aria-hidden="true">{getBetToken() ? '●' : '○'}</span>
+                        </button>
+                    )}
                 </div>
             </section>
 
@@ -321,8 +341,31 @@ function Dashboard() {
                 <PerformanceHub canEdit={advancedMode} />
             )}
 
+            {/* Method tab — public deep-dive. Replaces the About modal. */}
+            {activeTab === 'method' && <MethodNote />}
+
+            {/* Settings tab — advanced-mode only, but the toggle itself lives
+                here so users can flip OFF advanced from inside Settings */}
+            {advancedMode && activeTab === 'settings' && (
+                <Settings
+                    advancedMode={advancedMode}
+                    onAdvancedChange={(next) => {
+                        if (next) {
+                            localStorage.setItem(ADVANCED_STORAGE_KEY, '1');
+                        } else {
+                            localStorage.removeItem(ADVANCED_STORAGE_KEY);
+                        }
+                        setAdvancedMode(next);
+                        // When turning off, bounce back to Today so the user
+                        // doesn't see an empty Settings tab they no longer
+                        // have access to (the tab disappears from nav).
+                        if (!next) setActiveTab('today');
+                    }}
+                />
+            )}
+
             {/* Match-grid view (today + upcoming tabs) */}
-            {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && (
+            {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && activeTab !== 'settings' && activeTab !== 'method' && (
             <>
             {/* Filters */}
             <FilterBar filters={filters} onFilterChange={setFilters} />
@@ -570,9 +613,6 @@ function Dashboard() {
                 />
             )}
 
-            {/* About Model Modal */}
-            {showAbout && <AboutModel onClose={() => setShowAbout(false)} />}
-
             {/* Calibration Modal */}
             {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
 
@@ -607,10 +647,20 @@ function Dashboard() {
             )}
 
             {comboLogged && (
-                <div className="fixed bottom-6 right-6 z-50 bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive">
+                <div
+                    className="fixed right-6 z-50 bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive"
+                    style={{ bottom: 'calc(env(safe-area-inset-bottom) + 80px)' }}
+                >
                     Bet logged ✓
                 </div>
             )}
+
+            {/* Mobile bottom nav — hidden on sm+; CategoryTabs handles desktop. */}
+            <BottomNav
+                activeTab={activeTab}
+                onTabChange={setActiveTab}
+                matchCounts={matchCounts}
+            />
         </div>
     );
 }

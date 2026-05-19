@@ -24,14 +24,13 @@ import {
     getRecommendedBets,
     MARKET_LABELS, MARKET_CATEGORIES, COMPETITION_LABELS
 } from '../utils/constants';
-import { LogBetModal } from './ValueBets';
 
 // ---- Frontend → backend market-key mapping ----------------------------------
 // MARKET_LABELS uses display-oriented keys (over_2_5, total_cards_over_3_5),
 // while _BET_OUTCOME_RESOLVERS on the backend uses settle-oriented keys
-// (totals_2_5, cards_3_5). The bet log POST needs the backend names.
-// Returns null when no backend resolver exists for that frontend market —
-// such picks aren't loggable (e.g. corners_result, home_wins_at_least_one_half).
+// (totals_2_5, cards_3_5). The accumulator + log endpoints need the backend
+// names. Returns null when no backend resolver exists for that frontend
+// market — such picks aren't loggable (e.g. corners_result, home_wins_…).
 function backendMarketFor(frontendKey) {
     if (['btts', 'ht_result', 'h2h', 'double_chance'].includes(frontendKey)) return frontendKey;
     if (frontendKey.startsWith('over_')) {
@@ -60,33 +59,33 @@ function backendOutcomeFor(outcomeLabel) {
     return OUTCOME_KEY_MAP[outcomeLabel] ?? String(outcomeLabel).toLowerCase();
 }
 
-// Build the `pick` shape LogBetModal expects from a market entry. Odds are
-// rounded to 2 decimals so the modal's number input doesn't show 16-digit
-// floats (1/0.828 = 1.20724...) — operator overrides with NT odds anyway,
-// but the default should look clean.
-function makePick({ match, market, outcomeKey, outcomeLabel, prob }) {
-    const impliedOdds = prob > 0 ? Math.round((1 / prob) * 100) / 100 : 0;
-    return {
-        match_id: match.id,
-        market,
-        outcome_key: outcomeKey,
-        outcome: outcomeLabel,
-        outcome_label: outcomeLabel,
-        odds: impliedOdds,
-        prob,
-        home_team: { name: match.home_team.name },
-        away_team: { name: match.away_team.name },
-    };
-}
-
-function MatchDetail({ match, onClose, canLog = false }) {
+// MatchDetail now feeds clicks into the shared accumulator slip instead of
+// opening LogBetModal directly. Operator picks one or more outcomes, then
+// confirms via the accumulator bar on the Dashboard (which auto-routes:
+// 1 leg → single bet POST, 2+ → combo POST). Lets the user assemble multi-
+// market combos from inside a single match's detail view, plus stack picks
+// from multiple matches before deciding to log.
+function MatchDetail({ match, onClose, canLog = false,
+                      accumulatorBetByMatchId = {},
+                      accumulatorCount = 0,
+                      onAddToSlip = () => {} }) {
     const [marketData, setMarketData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [expandedReason, setExpandedReason] = useState(null);
-    const [pickToLog, setPickToLog] = useState(null);
-    const [logFlash, setLogFlash] = useState(false);
     const panelRef = useRef(null);
+
+    // Accumulator stores one selection per match (keyed by match.id). If this
+    // match already has a selection, the toggle helper expects bet.label to
+    // recognise "same pick clicked again → remove". We use the leg's display
+    // label for that comparison since it's what gets stored in the slip.
+    const currentSlipLabel = accumulatorBetByMatchId[match.id];
+    const handleSlip = (label, prob, betMarket, betOutcomeKey) => {
+        // Drop unloggable picks early — backendMarketFor returns null for
+        // markets without a settle resolver (corners_result, etc.).
+        if (!betMarket || !betOutcomeKey) return;
+        onAddToSlip(match, { label, prob, betMarket, betOutcomeKey });
+    };
 
     useEffect(() => {
         if (match.markets && Object.keys(match.markets).length > 0) {
@@ -167,13 +166,25 @@ function MatchDetail({ match, onClose, canLog = false }) {
                                 )}
                             </div>
                         </div>
-                        <button
-                            onClick={onClose}
-                            className="text-ink-muted hover:text-accent text-2xl leading-none p-1 transition-colors cursor-pointer"
-                            aria-label="Close"
-                        >
-                            &times;
-                        </button>
+                        <div className="flex items-start gap-2 shrink-0">
+                            {canLog && accumulatorCount > 0 && (
+                                <button
+                                    onClick={onClose}
+                                    title="Close to view + log your slip"
+                                    className="mono text-[0.65rem] uppercase tracking-[0.12em] px-2 py-1.5 bg-accent text-paper border border-accent hover:bg-accent-soft transition-colors cursor-pointer inline-flex items-center gap-1.5"
+                                >
+                                    <span>Slip</span>
+                                    <span className="mono">{accumulatorCount}</span>
+                                </button>
+                            )}
+                            <button
+                                onClick={onClose}
+                                className="text-ink-muted hover:text-accent text-2xl leading-none p-1 transition-colors cursor-pointer"
+                                aria-label="Close"
+                            >
+                                &times;
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -202,8 +213,9 @@ function MatchDetail({ match, onClose, canLog = false }) {
                                         const typeLabels = { best: 'Best bet', safest: 'Safest bet' };
                                         // bet carries betMarket + betOutcomeKey from collectCandidates
                                         const canLogThis = canLog && bet.betMarket && bet.betOutcomeKey;
+                                        const inSlip = currentSlipLabel === bet.label;
                                         return (
-                                            <div key={bet.type} className="border border-line p-4">
+                                            <div key={bet.type} className={'border p-4 transition-colors ' + (inSlip ? 'border-accent bg-accent/5' : 'border-line')}>
                                                 <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">
                                                     {typeLabels[bet.type] || bet.type}
                                                 </div>
@@ -216,16 +228,15 @@ function MatchDetail({ match, onClose, canLog = false }) {
                                                 </div>
                                                 {canLogThis && (
                                                     <button
-                                                        onClick={() => setPickToLog(makePick({
-                                                            match,
-                                                            market: bet.betMarket,
-                                                            outcomeKey: bet.betOutcomeKey,
-                                                            outcomeLabel: bet.label,
-                                                            prob: bet.prob,
-                                                        }))}
-                                                        className="mono text-[0.65rem] uppercase tracking-[0.1em] mt-3 px-2.5 py-1.5 border border-line text-ink-soft hover:text-paper hover:bg-ink hover:border-ink transition-colors cursor-pointer block w-full text-center"
+                                                        onClick={() => handleSlip(bet.label, bet.prob, bet.betMarket, bet.betOutcomeKey)}
+                                                        className={
+                                                            'mono text-[0.65rem] uppercase tracking-[0.1em] mt-3 px-2.5 py-1.5 border transition-colors cursor-pointer block w-full text-center ' +
+                                                            (inSlip
+                                                                ? 'bg-accent text-paper border-accent hover:bg-accent-soft hover:border-accent-soft'
+                                                                : 'border-line text-ink-soft hover:text-paper hover:bg-ink hover:border-ink')
+                                                        }
                                                     >
-                                                        Log bet →
+                                                        {inSlip ? '✓ in slip — remove' : '+ add to slip'}
                                                     </button>
                                                 )}
                                                 {bet.reason && (

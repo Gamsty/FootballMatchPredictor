@@ -21,10 +21,17 @@ function CategoryTabs({ activeTab, onTabChange, matchCounts, showValueTab = fals
         // visitors can see the operator's track record (parity with the existing
         // RecentROI public strip and the "Bets" hero link).
         { id: 'performance', label: 'Performance' },
+        // Settings tab — operator-only (advanced mode, bet token, bankroll).
+        // Hidden from the public to avoid cluttering the consumer view.
+        ...(showValueTab ? [
+            { id: 'settings', label: 'Settings' },
+        ] : []),
     ];
 
     return (
-        <div className="flex gap-6 mb-6 border-b border-line overflow-x-auto">
+        // Hidden on mobile (<sm) — BottomNav handles primary destinations there.
+        // On sm+ we keep the editorial underline-nav at the top.
+        <div className="hidden sm:flex gap-6 mb-6 border-b border-line overflow-x-auto">
             {tabs.map(tab => {
                 const isActive = activeTab === tab.id;
                 return (

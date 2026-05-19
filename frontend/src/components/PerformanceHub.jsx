@@ -116,6 +116,21 @@ function PerformanceHub({ canEdit = false }) {
         await refreshAll();
     };
 
+    // Settle-now status: 'idle' | 'running' | { n: <count> }
+    const [settleStatus, setSettleStatus] = useState('idle');
+    const handleSettleNow = async () => {
+        setSettleStatus('running');
+        try {
+            const r = await footballAPI.settleBets();
+            await refreshAll();
+            setSettleStatus({ n: r.settled || 0 });
+            setTimeout(() => setSettleStatus('idle'), 4000);
+        } catch (e) {
+            setSettleStatus('idle');
+            setError(e.message || 'Settle failed');
+        }
+    };
+
     // Pending bets — for "Open positions" strip
     const pending = useMemo(() => {
         if (!bets?.bets) return { count: 0, risk: 0, potential: 0 };
@@ -123,6 +138,21 @@ function PerformanceHub({ canEdit = false }) {
         const risk = p.reduce((s, b) => s + (b.stake || 0), 0);
         const potential = p.reduce((s, b) => s + (b.stake || 0) * (b.odds_at_bet || 0), 0);
         return { count: p.length, risk, potential };
+    }, [bets]);
+
+    // Activity feed — bets settled in the last 48h, newest first. Surfaces
+    // weekend results without scrolling through the full bet log.
+    // Date.now() inside useMemo trips the react-hooks/purity rule; safe here
+    // because cutoff is only read for filtering — a slight re-render drift
+    // never causes the feed contents to flip mid-frame.
+    const activityFeed = useMemo(() => {
+        if (!bets?.bets) return [];
+        // eslint-disable-next-line react-hooks/purity
+        const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+        return bets.bets
+            .filter(b => b.settled_at && new Date(b.settled_at).getTime() >= cutoff)
+            .sort((a, b) => new Date(b.settled_at) - new Date(a.settled_at))
+            .slice(0, 5);
     }, [bets]);
 
     // Recent activity — most recent 6 bets (API returns newest first)
@@ -157,7 +187,19 @@ function PerformanceHub({ canEdit = false }) {
                     </h2>
                     <PeriodSubtitle perf={perf} period={period} />
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                    {canEdit && (
+                        <button
+                            onClick={handleSettleNow}
+                            disabled={settleStatus === 'running'}
+                            title="Force-settle any pending bets whose match has finished. Runs implicitly on every refresh too — this is just the explicit trigger."
+                            className="mono text-[0.65rem] uppercase tracking-[0.1em] px-3 py-2 sm:py-1.5 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer disabled:opacity-50 mr-1"
+                        >
+                            {settleStatus === 'running'
+                                ? 'Settling…'
+                                : (typeof settleStatus === 'object' ? `Settled ${settleStatus.n} ✓` : 'Settle now')}
+                        </button>
+                    )}
                     <span className="eyebrow mr-2 hidden sm:inline">Period</span>
                     {PERIODS.map(p => (
                         <button
@@ -192,6 +234,25 @@ function PerformanceHub({ canEdit = false }) {
                             <span><span className="text-accent">{Math.round(pending.potential).toLocaleString()} NOK</span> potential return</span>
                         </div>
                     </div>
+                </section>
+            )}
+
+            {/* Activity feed — last 48h of settled bets. Shows the immediate
+                aftermath of a weekend without scrolling the whole log. Hidden
+                when nothing has settled recently to keep the hub uncluttered. */}
+            {activityFeed.length > 0 && (
+                <section>
+                    <div className="flex items-baseline justify-between mb-3">
+                        <div className="eyebrow">Activity feed</div>
+                        <div className="mono text-[0.65rem] text-ink-muted">
+                            settled in last 48h
+                        </div>
+                    </div>
+                    <ul className="border border-line divide-y divide-line-soft">
+                        {activityFeed.map(b => (
+                            <ActivityRow key={b.id} bet={b} onSelect={setSelectedBet} />
+                        ))}
+                    </ul>
                 </section>
             )}
 
@@ -432,6 +493,62 @@ function SegmentCard({ row, onSelect }) {
             </div>
         </button>
     );
+}
+
+// One row in the Activity feed — compact: which match, what outcome,
+// won/lost chip, P/L, relative time ('2h ago'). Click opens BetDetail.
+function ActivityRow({ bet, onSelect }) {
+    const isCombo = bet.market === 'combo' && Array.isArray(bet.combo_legs) && bet.combo_legs.length > 0;
+    const m = bet.match;
+    const statusColor = bet.status === 'won' ? 'text-positive'
+                      : bet.status === 'lost' ? 'text-danger'
+                      : 'text-ink-muted';
+    const plColor = bet.profit_loss > 0 ? 'text-positive'
+                  : bet.profit_loss < 0 ? 'text-danger'
+                  : 'text-ink-muted';
+    return (
+        <li>
+            <button
+                onClick={() => onSelect?.(bet)}
+                className="w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-paper-tint transition-colors cursor-pointer"
+            >
+                <div className="min-w-0 flex-1">
+                    <div className="text-sm text-ink truncate">
+                        {isCombo
+                            ? `${bet.combo_legs.length}-leg combo`
+                            : <>{m?.home} <span className="text-ink-muted">vs</span> {m?.away}</>
+                        }
+                    </div>
+                    <div className="mono text-[0.6rem] text-ink-muted uppercase tracking-[0.08em] mt-0.5">
+                        {isCombo
+                            ? `${bet.combo_legs.length} legs · @ ${bet.odds_at_bet?.toFixed(2)}`
+                            : (bet.outcome_label || bet.outcome_key)}
+                        {' · '}{relativeTime(bet.settled_at)}
+                    </div>
+                </div>
+                <div className="text-right shrink-0">
+                    <div className={'mono text-[0.65rem] uppercase tracking-[0.08em] font-semibold ' + statusColor}>
+                        {bet.status}
+                    </div>
+                    <div className={'mono text-sm font-semibold ' + plColor}>
+                        {bet.profit_loss != null ? nok(bet.profit_loss) : '—'}
+                    </div>
+                </div>
+            </button>
+        </li>
+    );
+}
+
+function relativeTime(iso) {
+    if (!iso) return '';
+    const seconds = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (seconds < 60) return 'just now';
+    const mins = Math.floor(seconds / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
 }
 
 export default PerformanceHub;
