@@ -150,6 +150,13 @@ export const footballAPI = {
         const response = await api.post('/bets/settle', {});
         return response.data;
     },
+    refreshOdds: async () => {
+        // Drop the odds cache so the next value-bets / best-picks fetch
+        // pulls fresh prices from The Odds API. Costs ~18 quota credits
+        // on the cold refetch — use sparingly.
+        const response = await api.post('/admin/odds-refresh', {}, withBetTokenHeader());
+        return response.data;
+    },
 
     // Matches — supports filters: { season, team_id, status, limit }
     getMatches: async (params = {}) => {

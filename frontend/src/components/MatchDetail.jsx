@@ -270,7 +270,8 @@ function MatchDetail({ match, onClose, canLog = false,
                                     prediction={marketData.match_result}
                                     match={match}
                                     canLog={canLog}
-                                    onLog={setPickToLog}
+                                    currentSlipLabel={currentSlipLabel}
+                                    onSlip={handleSlip}
                                 />
                             </Section>
 
@@ -279,24 +280,24 @@ function MatchDetail({ match, onClose, canLog = false,
                                     <div className="grid grid-cols-3 gap-3">
                                         {Object.entries(marketData.double_chance).map(([key, dc]) => {
                                             const outcomeKey = key.toLowerCase();  // '1X' → '1x'
+                                            const inSlip = currentSlipLabel === dc.description;
                                             return (
-                                                <div key={key} className="border border-line p-3 text-center">
+                                                <div key={key} className={'border p-3 text-center transition-colors ' + (inSlip ? 'border-accent bg-accent/5' : 'border-line')}>
                                                     <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-accent mb-1">{key}</div>
                                                     <div className="display text-sm text-ink mb-1">{dc.description}</div>
                                                     <div className="mono text-sm text-ink font-medium">{formatPercentage(dc.probability)}</div>
                                                     <div className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-0.5">@ {dc.odds}</div>
                                                     {canLog && (
                                                         <button
-                                                            onClick={() => setPickToLog(makePick({
-                                                                match,
-                                                                market: 'double_chance',
-                                                                outcomeKey,
-                                                                outcomeLabel: dc.description,
-                                                                prob: dc.probability,
-                                                            }))}
-                                                            className="mono text-[0.6rem] uppercase tracking-[0.1em] mt-2 px-2 py-1 border border-line text-ink-soft hover:text-paper hover:bg-ink hover:border-ink transition-colors cursor-pointer w-full"
+                                                            onClick={() => handleSlip(dc.description, dc.probability, 'double_chance', outcomeKey)}
+                                                            className={
+                                                                'mono text-[0.6rem] uppercase tracking-[0.1em] mt-2 px-2 py-1 border transition-colors cursor-pointer w-full ' +
+                                                                (inSlip
+                                                                    ? 'bg-accent text-paper border-accent hover:bg-accent-soft'
+                                                                    : 'border-line text-ink-soft hover:text-paper hover:bg-ink hover:border-ink')
+                                                            }
                                                         >
-                                                            Log →
+                                                            {inSlip ? '✓ slip' : '+ slip'}
                                                         </button>
                                                     )}
                                                 </div>
@@ -318,9 +319,9 @@ function MatchDetail({ match, onClose, canLog = false,
                                                     label={MARKET_LABELS[marketKey] || marketKey}
                                                     data={marketData.markets[marketKey]}
                                                     frontendKey={marketKey}
-                                                    match={match}
                                                     canLog={canLog}
-                                                    onLog={setPickToLog}
+                                                    currentSlipLabel={currentSlipLabel}
+                                                    onSlip={handleSlip}
                                                 />
                                             ))}
                                         </div>
@@ -332,9 +333,9 @@ function MatchDetail({ match, onClose, canLog = false,
                                 <Section title="Combo bets">
                                     <ComboTable
                                         combos={marketData.combos}
-                                        match={match}
                                         canLog={canLog}
-                                        onLog={setPickToLog}
+                                        currentSlipLabel={currentSlipLabel}
+                                        onSlip={handleSlip}
                                     />
                                 </Section>
                             )}
@@ -344,25 +345,6 @@ function MatchDetail({ match, onClose, canLog = false,
             </div>
         </div>
 
-        {pickToLog && (
-            <LogBetModal
-                pick={pickToLog}
-                defaultStake={100}
-                defaultOdds={pickToLog.odds}
-                onClose={() => setPickToLog(null)}
-                onLogged={() => {
-                    setPickToLog(null);
-                    setLogFlash(true);
-                    setTimeout(() => setLogFlash(false), 3000);
-                }}
-            />
-        )}
-
-        {logFlash && (
-            <div className="fixed bottom-6 right-6 z-[60] bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive">
-                Bet logged ✓
-            </div>
-        )}
         </>
     );
 }
@@ -388,35 +370,34 @@ function Section({ title, children, defaultOpen = false }) {
     );
 }
 
-function ResultBar({ prediction, match, canLog = false, onLog }) {
+function ResultBar({ prediction, match, canLog = false, currentSlipLabel, onSlip }) {
     if (!prediction?.probabilities) return null;
     const { home_win, draw, away_win } = prediction.probabilities;
 
-    const handleLog = (outcomeKey, label, prob) => {
-        onLog?.(makePick({
-            match, market: 'h2h', outcomeKey, outcomeLabel: label, prob,
-        }));
-    };
+    const rows = [
+        { key: 'home', label: `${match.home_team.name} Win`,
+          shortLabel: match.home_team.short_name || match.home_team.name,
+          prob: home_win, accent: 'ink' },
+        { key: 'draw', label: 'Draw', shortLabel: 'Draw',
+          prob: draw, accent: 'muted' },
+        { key: 'away', label: `${match.away_team.name} Win`,
+          shortLabel: match.away_team.short_name || match.away_team.name,
+          prob: away_win, accent: 'accent' },
+    ];
 
     return (
         <div className="space-y-3">
-            <ProbBar
-                label={match.home_team.short_name || match.home_team.name}
-                prob={home_win} accent="ink"
-                canLog={canLog}
-                onLog={() => handleLog('home', `${match.home_team.name} Win`, home_win)}
-            />
-            <ProbBar
-                label="Draw" prob={draw} accent="muted"
-                canLog={canLog}
-                onLog={() => handleLog('draw', 'Draw', draw)}
-            />
-            <ProbBar
-                label={match.away_team.short_name || match.away_team.name}
-                prob={away_win} accent="accent"
-                canLog={canLog}
-                onLog={() => handleLog('away', `${match.away_team.name} Win`, away_win)}
-            />
+            {rows.map(row => (
+                <ProbBar
+                    key={row.key}
+                    label={row.shortLabel}
+                    prob={row.prob}
+                    accent={row.accent}
+                    canLog={canLog}
+                    inSlip={currentSlipLabel === row.label}
+                    onSlip={() => onSlip(row.label, row.prob, 'h2h', row.key)}
+                />
+            ))}
 
             {prediction.odds && (
                 <div className="flex gap-4 pt-2 mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted border-t border-line mt-2">
@@ -429,7 +410,7 @@ function ResultBar({ prediction, match, canLog = false, onLog }) {
     );
 }
 
-function ProbBar({ label, prob, accent, canLog = false, onLog }) {
+function ProbBar({ label, prob, accent, canLog = false, inSlip = false, onSlip }) {
     // accent: 'ink' (home), 'muted' (draw), 'accent' (away)
     const barColor = {
         ink: 'bg-ink',
@@ -445,18 +426,23 @@ function ProbBar({ label, prob, accent, canLog = false, onLog }) {
             <span className="mono text-xs text-ink w-12 text-right font-medium">{formatPercentage(prob)}</span>
             {canLog && (
                 <button
-                    onClick={onLog}
-                    title="Log this pick"
-                    className="mono text-[0.65rem] text-ink-muted hover:text-paper hover:bg-ink border border-line hover:border-ink w-6 h-6 leading-none flex items-center justify-center transition-colors cursor-pointer"
+                    onClick={onSlip}
+                    title={inSlip ? 'Already in slip — click to remove' : 'Add to slip'}
+                    className={
+                        'mono text-[0.65rem] w-6 h-6 leading-none flex items-center justify-center transition-colors cursor-pointer border ' +
+                        (inSlip
+                            ? 'bg-accent text-paper border-accent hover:bg-accent-soft hover:border-accent-soft'
+                            : 'text-ink-muted hover:text-paper hover:bg-ink border-line hover:border-ink')
+                    }
                 >
-                    +
+                    {inSlip ? '✓' : '+'}
                 </button>
             )}
         </div>
     );
 }
 
-function MarketRow({ label, data, frontendKey, match, canLog = false, onLog }) {
+function MarketRow({ label, data, frontendKey, canLog = false, currentSlipLabel, onSlip }) {
     if (!data || data.error) return null;
 
     const probs = data.probabilities || {};
@@ -472,6 +458,8 @@ function MarketRow({ label, data, frontendKey, match, canLog = false, onLog }) {
                 {entries.map(([outcomeLabel, prob]) => {
                     const isBest = best && outcomeLabel === best[0];
                     const outcomeKey = backendOutcomeFor(outcomeLabel);
+                    const slipLabel = `${label}: ${outcomeLabel}`;
+                    const inSlip = currentSlipLabel === slipLabel;
                     return (
                         <div key={outcomeLabel} className="flex items-center gap-1">
                             <span className={`mono text-[0.6rem] uppercase tracking-[0.1em] ${isBest ? 'text-accent' : 'text-ink-muted'}`}>
@@ -482,17 +470,16 @@ function MarketRow({ label, data, frontendKey, match, canLog = false, onLog }) {
                             </span>
                             {loggable && (
                                 <button
-                                    onClick={() => onLog(makePick({
-                                        match,
-                                        market: backendMarket,
-                                        outcomeKey,
-                                        outcomeLabel: `${label}: ${outcomeLabel}`,
-                                        prob,
-                                    }))}
-                                    title="Log this pick"
-                                    className="mono text-[0.6rem] text-ink-muted hover:text-paper hover:bg-ink border border-line hover:border-ink w-5 h-5 leading-none flex items-center justify-center transition-colors cursor-pointer ml-0.5"
+                                    onClick={() => onSlip(slipLabel, prob, backendMarket, outcomeKey)}
+                                    title={inSlip ? 'Already in slip — click to remove' : 'Add to slip'}
+                                    className={
+                                        'mono text-[0.6rem] w-5 h-5 leading-none flex items-center justify-center transition-colors cursor-pointer ml-0.5 border ' +
+                                        (inSlip
+                                            ? 'bg-accent text-paper border-accent hover:bg-accent-soft'
+                                            : 'text-ink-muted hover:text-paper hover:bg-ink border-line hover:border-ink')
+                                    }
                                 >
-                                    +
+                                    {inSlip ? '✓' : '+'}
                                 </button>
                             )}
                         </div>
@@ -503,7 +490,7 @@ function MarketRow({ label, data, frontendKey, match, canLog = false, onLog }) {
     );
 }
 
-function ComboTable({ combos, match, canLog = false, onLog }) {
+function ComboTable({ combos, canLog = false, currentSlipLabel, onSlip }) {
     const groups = {
         'Result + BTTS': [],
         'Result + Over/Under': [],
@@ -529,34 +516,41 @@ function ComboTable({ combos, match, canLog = false, onLog }) {
                     <div key={title}>
                         <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">{title}</div>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                            {items.map(combo => (
-                                <div key={combo.key}
-                                    className="flex items-center justify-between py-2 px-3 bg-paper border border-line gap-2"
-                                >
-                                    <span className="text-xs text-ink-soft truncate min-w-0">{combo.description}</span>
-                                    <div className="flex items-center gap-2 shrink-0">
-                                        <span className="mono text-xs text-ink font-medium">{formatPercentage(combo.probability)}</span>
-                                        <span className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted">@ {combo.odds || '-'}</span>
-                                        {canLog && (
-                                            <button
-                                                onClick={() => onLog(makePick({
-                                                    match,
-                                                    market: 'compound',
-                                                    // Backend lowercases outcome_key on insert; combo
-                                                    // keys come in capitalised ('H_btts_yes').
-                                                    outcomeKey: combo.key.toLowerCase(),
-                                                    outcomeLabel: combo.description,
-                                                    prob: combo.probability,
-                                                }))}
-                                                title="Log this compound bet"
-                                                className="mono text-[0.6rem] text-ink-muted hover:text-paper hover:bg-ink border border-line hover:border-ink w-5 h-5 leading-none flex items-center justify-center transition-colors cursor-pointer"
-                                            >
-                                                +
-                                            </button>
-                                        )}
+                            {items.map(combo => {
+                                const inSlip = currentSlipLabel === combo.description;
+                                return (
+                                    <div key={combo.key}
+                                        className={'flex items-center justify-between py-2 px-3 border gap-2 transition-colors ' + (inSlip ? 'bg-accent/5 border-accent' : 'bg-paper border-line')}
+                                    >
+                                        <span className="text-xs text-ink-soft truncate min-w-0">{combo.description}</span>
+                                        <div className="flex items-center gap-2 shrink-0">
+                                            <span className="mono text-xs text-ink font-medium">{formatPercentage(combo.probability)}</span>
+                                            <span className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted">@ {combo.odds || '-'}</span>
+                                            {canLog && (
+                                                <button
+                                                    onClick={() => onSlip(
+                                                        combo.description,
+                                                        combo.probability,
+                                                        'compound',
+                                                        // Backend lowercases outcome_key on insert; combo
+                                                        // keys come in capitalised ('H_btts_yes').
+                                                        combo.key.toLowerCase(),
+                                                    )}
+                                                    title={inSlip ? 'Already in slip — click to remove' : 'Add compound to slip'}
+                                                    className={
+                                                        'mono text-[0.6rem] w-5 h-5 leading-none flex items-center justify-center transition-colors cursor-pointer border ' +
+                                                        (inSlip
+                                                            ? 'bg-accent text-paper border-accent hover:bg-accent-soft'
+                                                            : 'text-ink-muted hover:text-paper hover:bg-ink border-line hover:border-ink')
+                                                    }
+                                                >
+                                                    {inSlip ? '✓' : '+'}
+                                                </button>
+                                            )}
+                                        </div>
                                     </div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     </div>
                 );

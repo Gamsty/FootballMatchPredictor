@@ -11,6 +11,15 @@ import pytest
 from odds_api import OddsAPIClient, _normalize, _matches, SPORT_KEY_MAP, TRUSTED_BOOKMAKERS
 
 
+@pytest.fixture(autouse=True)
+def isolate_cache_file(tmp_path, monkeypatch):
+    """Point every OddsAPIClient created in this module at a per-test tmp cache
+    file so we don't pick up real cache state from backend/data/odds_cache.json
+    (the running dev server may have populated it). Without this, tests that
+    assert 'first call hits network' fail when the cache has the key cached."""
+    monkeypatch.setenv('ODDS_API_CACHE_FILE', str(tmp_path / 'odds.json'))
+
+
 # ----------------------------------------------------------------------------
 # Name normalization + alias matching
 # ----------------------------------------------------------------------------
@@ -399,11 +408,15 @@ class TestQuota:
     def test_quota_status_when_never_fetched(self):
         c = OddsAPIClient(api_key='x')
         s = c.quota_status()
-        assert s == {
-            'remaining': None, 'used': None, 'low': False,
-            'circuit_breaker_active': False,
-            'quota_floor': c.quota_floor,
-        }
+        # Subset-check quota-specific keys so additions to quota_status
+        # (cache_age_seconds, cache_ttl_seconds, ...) don't break this test.
+        assert s['remaining'] is None
+        assert s['used'] is None
+        assert s['low'] is False
+        assert s['circuit_breaker_active'] is False
+        assert s['quota_floor'] == c.quota_floor
+        assert s['cache_age_seconds'] is None
+        assert s['cache_ttl_seconds'] > 0
 
 
 class TestCircuitBreaker:

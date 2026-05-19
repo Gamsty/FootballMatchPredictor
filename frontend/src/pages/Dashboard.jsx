@@ -604,12 +604,18 @@ function Dashboard() {
             </>
             )}
 
-            {/* Match Detail Modal */}
+            {/* Match Detail Modal — passes accumulator state so MatchDetail's
+                "+ to slip" buttons feed the same shared slip Dashboard renders
+                as the accumulator bar. User stacks across multiple matches /
+                markets, then closes the modal to log from the slip. */}
             {selectedMatch && (
                 <MatchDetail
                     match={selectedMatch}
                     onClose={() => setSelectedMatch(null)}
                     canLog={advancedMode}
+                    accumulatorBetByMatchId={accumulatorBetByMatchId}
+                    accumulatorCount={accumulator.length}
+                    onAddToSlip={toggleAccumulator}
                 />
             )}
 

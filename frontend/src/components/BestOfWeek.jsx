@@ -27,14 +27,16 @@ Reuses LogBetModal from ValueBets to avoid duplication.
 import { useState, useEffect, useRef } from 'react';
 import { footballAPI } from '../services/api';
 import { formatTime, formatMatchDate, COMPETITION_LABELS } from '../utils/constants';
-import { LogBetModal } from './ValueBets';
+import { LogBetModal, RefreshOddsControl } from './ValueBets';
 import ComboPresets from './ComboPresets';
 import CompoundMarkets from './CompoundMarkets';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const FRACTIONAL_KELLY = 0.25;
 const SUSPICIOUS_EDGE = 0.20;
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+// See ValueBets.jsx for rationale: no interval polling, only manual refresh
+// + a stale-window check on tab visibility change.
+const STALE_AFTER_MS = 60 * 60 * 1000;
 const BANKROLL_STORAGE_KEY = 'fmp.bankroll.nok';
 const NT_ODDS_STORAGE_KEY = 'fmp.nt_odds.v1';
 const TOP_N = 20;
@@ -77,6 +79,8 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
     const [comboToLog, setComboToLog] = useState(null);
     const [comboLogged, setComboLogged] = useState(false);
     const [logStatus, setLogStatus] = useState({});
+    // Bumped by RefreshOddsControl after /admin/odds-refresh succeeds.
+    const [refreshKey, setRefreshKey] = useState(0);
     const [bankroll, setBankroll] = useState(() => {
         const stored = Number(localStorage.getItem(BANKROLL_STORAGE_KEY));
         return Number.isFinite(stored) && stored > 0 ? stored : 1000;
@@ -142,13 +146,9 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
 
         fetchOnce();
 
-        const interval = setInterval(() => {
-            if (document.visibilityState === 'visible') fetchOnce();
-        }, REFRESH_INTERVAL_MS);
-
         const onVisibility = () => {
             if (document.visibilityState === 'visible' &&
-                Date.now() - lastFetched.current > REFRESH_INTERVAL_MS) {
+                Date.now() - lastFetched.current > STALE_AFTER_MS) {
                 fetchOnce();
             }
         };
@@ -156,11 +156,10 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
 
         return () => {
             controller.abort();
-            clearInterval(interval);
             if (retryTimer) clearTimeout(retryTimer);
             document.removeEventListener('visibilitychange', onVisibility);
         };
-    }, []);
+    }, [refreshKey]);
 
     if (loading && !data) {
         return (
@@ -292,6 +291,7 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                 </div>
 
                 <div className="flex-1" />
+                <RefreshOddsControl quota={quota} onAfterRefresh={() => setRefreshKey(k => k + 1)} />
                 <div className="mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted text-right">
                     <div>Top {Math.min(TOP_N, top.length)} of {data.value_bets?.length || 0}</div>
                     {quota?.remaining != null && (
@@ -433,17 +433,45 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                 </div>
             )}
 
-            {/* Empty state */}
+            {/* Empty state — same disambiguation as ValueBets: zero picks
+                with a zero quota is a data-source problem, not a market-is-
+                calm problem. */}
             {top.length === 0 && (
                 <div className="text-center py-16 max-w-md mx-auto">
-                    <div className="eyebrow mb-3">No picks</div>
-                    <h3 className="display text-2xl text-ink mb-3">
-                        Quiet week<span className="text-accent">.</span>
-                    </h3>
-                    <p className="text-ink-soft text-sm">
-                        No bets clear the 2% edge threshold across the next 7 days.
-                        Check back after the next odds refresh.
-                    </p>
+                    {quota?.remaining === 0 ? (
+                        <>
+                            <div className="eyebrow mb-3 text-warning">No odds data</div>
+                            <h3 className="display text-2xl text-ink mb-3">
+                                Odds API quota exhausted<span className="text-accent">.</span>
+                            </h3>
+                            <p className="text-ink-soft text-sm">
+                                The Odds API free-tier quota (500 req/month) is at zero.
+                                Without live bookmaker odds the model can't rank picks.
+                                Quota resets at the start of the next billing month.
+                            </p>
+                            <p className="text-ink-soft text-sm mt-3">
+                                Register a fresh free key at{' '}
+                                <a href="https://the-odds-api.com" target="_blank" rel="noopener noreferrer"
+                                   className="text-accent hover:text-accent-soft border-b border-accent/40">
+                                    the-odds-api.com
+                                </a>{' '}
+                                and swap <code className="mono text-[0.85em] bg-paper-tint border border-line px-1">ODDS_API_KEY</code>{' '}
+                                in <code className="mono text-[0.85em] bg-paper-tint border border-line px-1">backend/.env</code>,
+                                or upgrade to a paid tier.
+                            </p>
+                        </>
+                    ) : (
+                        <>
+                            <div className="eyebrow mb-3">No picks</div>
+                            <h3 className="display text-2xl text-ink mb-3">
+                                Quiet week<span className="text-accent">.</span>
+                            </h3>
+                            <p className="text-ink-soft text-sm">
+                                No bets clear the 2% edge threshold across the next 7 days.
+                                Check back after the next odds refresh.
+                            </p>
+                        </>
+                    )}
                 </div>
             )}
 

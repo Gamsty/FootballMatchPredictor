@@ -660,6 +660,33 @@ def snapshot_closing_odds():
         return _error_response("Snapshot failed", 500, e, endpoint="snapshot_closing_odds")
 
 
+@app.route('/api/admin/odds-refresh', methods=['POST'])
+def odds_refresh():
+    """
+    Manually drop the odds cache so the next `/api/value-bets` or
+    `/api/odds-board` call refetches from The Odds API.
+
+    Auth: same X-Bet-Token shared secret used for bet writes — only the
+    operator should be able to burn quota on demand. Returns the number
+    of entries dropped so the UI can confirm what happened.
+
+    Use sparingly: each fresh fetch costs ~18 quota credits on a typical
+    9-league scan with h2h+totals. With a 500/month free tier that's ~27
+    explicit refreshes before the budget tightens.
+    """
+    if not _require_bet_write_token():
+        return jsonify({'error': 'Unauthorized — provide X-Bet-Token header'}), 401
+    try:
+        dropped = odds_client.clear_cache()
+        return jsonify({
+            'dropped': dropped,
+            'quota': odds_client.quota_status(),
+            'message': 'Cache cleared. Next /api/value-bets call will refetch.',
+        }), 200
+    except Exception as e:
+        return _error_response("Cache clear failed", 500, e, endpoint="odds_refresh")
+
+
 @app.route('/api/admin/odds-status', methods=['GET'])
 def odds_status():
     """

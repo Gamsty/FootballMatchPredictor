@@ -37,6 +37,7 @@ the frontend uses to flag suspicious edges.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -211,7 +212,13 @@ class OddsAPIClient:
     """The Odds API v4 client with per-(sport, market, region) TTL cache, retry, quota tracking."""
 
     BASE_URL = 'https://api.the-odds-api.com/v4'
-    CACHE_TTL = 1800           # 30 min — odds move but not by the second
+    # Default cache TTL — long because the free tier (500 req/mo) won't
+    # survive aggressive refetching. 7 days × 18 req-per-refresh ≈ 72 req/mo,
+    # well under quota. Override per-deployment with ODDS_API_CACHE_TTL.
+    # In-memory cache is wiped on restart, so we ALSO persist to disk
+    # (see `_cache_file` / `_save_cache`) — long TTL only matters if the
+    # cache survives uptime gaps.
+    CACHE_TTL = 7 * 24 * 3600
     MAX_RETRIES = 3            # transient 5xx / connection errors only
     INITIAL_BACKOFF = 1.0      # exponential: 1s, 2s, 4s
     DEFAULT_REGIONS = 'eu'     # 'eu', 'uk', 'us', 'au' — comma-separated for multiple
@@ -245,6 +252,24 @@ class OddsAPIClient:
             self.quota_floor = int(os.getenv('ODDS_API_QUOTA_FLOOR', self.DEFAULT_QUOTA_FLOOR))
         except (TypeError, ValueError):
             self.quota_floor = self.DEFAULT_QUOTA_FLOOR
+        # Per-deployment TTL override. ODDS_API_CACHE_TTL takes precedence
+        # over the 7-day class default — set lower in dev if you need
+        # fresher prices, higher in prod to be even more quota-conservative.
+        try:
+            self.cache_ttl = float(os.getenv('ODDS_API_CACHE_TTL', self.CACHE_TTL))
+        except (TypeError, ValueError):
+            self.cache_ttl = float(self.CACHE_TTL)
+        # File-backed persistence. Cache survives backend restarts so the
+        # free-tier user doesn't burn 18 req every time gunicorn cycles a
+        # worker or you reboot in dev. Path is env-configurable; absolute
+        # paths are honoured, relative paths resolve against the backend dir.
+        # File is plain JSON — readable / pruneable from the host shell.
+        cache_path = os.getenv('ODDS_API_CACHE_FILE') or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'data', 'odds_cache.json',
+        )
+        self._cache_file = cache_path
+        self._load_cache()
 
     @property
     def enabled(self) -> bool:
@@ -264,15 +289,86 @@ class OddsAPIClient:
     def _cache_set(self, key: str, data, ttl: float | None = None):
         self._cache[key] = {
             'data': data,
-            'expires': time.time() + (ttl if ttl is not None else self.CACHE_TTL),
+            'expires': time.time() + (ttl if ttl is not None else self.cache_ttl),
         }
+        # Best-effort disk persist — survives restarts. We do this synchronously
+        # because the volume is small (1 file write per league per refresh),
+        # and async would risk losing the write if the process dies mid-fetch.
+        self._save_cache()
+
+    def _load_cache(self):
+        """Restore cache from disk on startup. Silently drops the file if it's
+        malformed — easier to recover than to surface every JSON error."""
+        try:
+            if not os.path.exists(self._cache_file):
+                return
+            with open(self._cache_file, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            now = time.time()
+            # Strip expired entries on load so we don't serve stale data
+            # just because a long TTL was set before a quota outage.
+            self._cache = {
+                k: v for k, v in raw.items()
+                if isinstance(v, dict) and v.get('expires', 0) > now
+            }
+            logger.info(
+                "Odds cache loaded from %s: %d live entries (skipped %d expired)",
+                self._cache_file, len(self._cache), len(raw) - len(self._cache),
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Odds cache load failed (%s): %s. Starting fresh.",
+                           self._cache_file, e)
+            self._cache = {}
+
+    def _save_cache(self):
+        """Persist current cache state to disk. Atomic write via tmp+rename so a
+        crash mid-write can't leave a corrupt file."""
+        try:
+            # makedirs('') would raise — guard for the case where the operator
+            # set ODDS_API_CACHE_FILE to a bare filename in the cwd.
+            parent = os.path.dirname(self._cache_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = self._cache_file + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._cache, f)
+            os.replace(tmp, self._cache_file)
+        except OSError as e:
+            # Don't crash the request just because the disk is full / read-only.
+            # Worst case: we lose the in-memory cache on next restart and pay
+            # one fetch — same as before this code existed.
+            logger.warning("Odds cache save failed: %s", e)
+
+    def cache_age(self) -> float | None:
+        """Seconds since the most recently set entry's expires-stamp was minted.
+        None if the cache is empty OR every entry has already expired (so the
+        UI doesn't show 'cached 8d ago' when in reality the next call refetches).
+        """
+        if not self._cache:
+            return None
+        now = time.time()
+        live = [v for v in self._cache.values() if v.get('expires', 0) > now]
+        if not live:
+            return None
+        # 'expires' = set-time + ttl. So set-time = expires - ttl. Age = now - set-time.
+        most_recent_set = max(v['expires'] - self.cache_ttl for v in live)
+        return max(0.0, now - most_recent_set)
 
     def clear_cache(self) -> int:
-        """Drop everything. Called by retrain webhook after model promotion so the
-        new model's probabilities are compared against fresh odds instead of stale ones."""
+        """Drop everything (memory + disk). Called by retrain webhook after model
+        promotion, by the manual 'Refresh odds' admin endpoint, and on the
+        infrequent cases where odds shape changes mean cached entries would
+        deserialise wrong."""
         with self._lock:
             n = len(self._cache)
             self._cache.clear()
+        # Wipe the disk file so a restart doesn't re-hydrate the entries we
+        # just dropped. Best-effort — same failure handling as save.
+        try:
+            if os.path.exists(self._cache_file):
+                os.remove(self._cache_file)
+        except OSError as e:
+            logger.warning("Odds cache file remove failed: %s", e)
         logger.info("Odds cache cleared (%d entries dropped)", n)
         return n
 
@@ -414,6 +510,10 @@ class OddsAPIClient:
             'low': self._quota_remaining is not None and self._quota_remaining < 50,
             'circuit_breaker_active': breaker_active,
             'quota_floor': self.quota_floor,
+            # Surface cache freshness so the UI can render 'cached N hours ago'.
+            # `cache_age` is None when the cache is empty (first run, just-cleared).
+            'cache_age_seconds': self.cache_age(),
+            'cache_ttl_seconds': self.cache_ttl,
         }
 
     # ---- public market resolution ---------------------------------------

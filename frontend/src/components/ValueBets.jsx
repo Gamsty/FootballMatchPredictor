@@ -17,13 +17,18 @@ reports enabled=false (ODDS_API_KEY missing).
 */
 
 import { useState, useEffect, useRef } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, getBetToken } from '../services/api';
 import { formatTime, formatMatchDate, COMPETITION_LABELS } from '../utils/constants';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const FRACTIONAL_KELLY = 0.25;
 const SUSPICIOUS_EDGE = 0.20;
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+// Stale-data threshold for the visibility-change refresh. We no longer poll on
+// an interval — the backend caches odds for 7 days and the operator has an
+// explicit Refresh Odds button. We only refetch when the user comes back to
+// a tab that hasn't been hydrated for more than this window (browser may have
+// suspended the SPA, or the user just left the tab open overnight).
+const STALE_AFTER_MS = 60 * 60 * 1000;  // 1 hour
 const BANKROLL_STORAGE_KEY = 'fmp.bankroll.nok';
 
 // Per-market display labels — keeps the UI compact when multi-market is on.
@@ -47,6 +52,10 @@ function ValueBets({ onSelectMatch }) {
         const stored = Number(localStorage.getItem(BANKROLL_STORAGE_KEY));
         return Number.isFinite(stored) && stored > 0 ? stored : 1000;
     });
+    // Bumped by the Refresh Odds button to force a re-fetch. Added to the
+    // fetch useEffect deps so manual refreshes pull fresh data after the
+    // backend cache has been cleared.
+    const [refreshKey, setRefreshKey] = useState(0);
     const lastFetched = useRef(0);
 
     // Persist bankroll across sessions — typical user has one number, no point
@@ -55,22 +64,19 @@ function ValueBets({ onSelectMatch }) {
         localStorage.setItem(BANKROLL_STORAGE_KEY, String(bankroll));
     }, [bankroll]);
 
-    // Fetch driver: re-runs when filter params change, also fires on mount.
-    // We intentionally do NOT include bankroll in deps — staking is a pure
-    // frontend computation and shouldn't trigger an API roundtrip.
+    // Fetch driver: runs on mount, on filter change, and when the operator
+    // manually triggers a refresh (refreshKey bump from RefreshOddsControl).
     //
-    // Three resilience features:
-    //   1. AbortController — switching filters rapidly aborts the in-flight
-    //      request so we don't pile up parallel calls and confuse react state
-    //   2. Single auto-retry on transient errors (network blip, Azure cold start)
-    //   3. Auto-refresh pauses when the tab is hidden — no point polling odds
-    //      for a user who isn't looking
+    // No interval polling: the backend odds cache is 7 days now, so a 5-min
+    // poll on the client mostly returns the same cached data while still
+    // forcing the backend to recompute edges across ~70 fixtures. The Refresh
+    // Odds button covers explicit refetch; the visibility handler covers the
+    // "left tab open overnight" case where data is genuinely stale.
     useEffect(() => {
         let controller = new AbortController();
         let retryTimer = null;
 
         const fetchOnce = async (attempt = 0) => {
-            // Always cancel any prior in-flight before starting a new one
             controller.abort();
             controller = new AbortController();
             setLoading(true);
@@ -84,9 +90,7 @@ function ValueBets({ onSelectMatch }) {
                 lastFetched.current = Date.now();
                 setError(null);
             } catch (err) {
-                // Abort isn't an error — it means we started a new request on purpose
                 if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return;
-                // One transient retry after 3s before surfacing the error
                 if (attempt === 0) {
                     retryTimer = setTimeout(() => fetchOnce(1), 3000);
                     return;
@@ -99,19 +103,9 @@ function ValueBets({ onSelectMatch }) {
 
         fetchOnce();
 
-        // Auto-refresh every 5 min, but only when the tab is visible.
-        // The interval handler checks visibility itself rather than swapping
-        // intervals on visibilitychange — simpler and the cost of one ignored
-        // tick per period is nothing.
-        const interval = setInterval(() => {
-            if (document.visibilityState === 'visible') fetchOnce();
-        }, REFRESH_INTERVAL_MS);
-
-        // When the tab becomes visible after being hidden, fire an immediate
-        // refresh if our data is older than the refresh interval.
         const onVisibility = () => {
             if (document.visibilityState === 'visible' &&
-                Date.now() - lastFetched.current > REFRESH_INTERVAL_MS) {
+                Date.now() - lastFetched.current > STALE_AFTER_MS) {
                 fetchOnce();
             }
         };
@@ -119,11 +113,10 @@ function ValueBets({ onSelectMatch }) {
 
         return () => {
             controller.abort();
-            clearInterval(interval);
             if (retryTimer) clearTimeout(retryTimer);
             document.removeEventListener('visibilitychange', onVisibility);
         };
-    }, [minEdge, books]);
+    }, [minEdge, books, refreshKey]);
 
     if (loading && !data) {
         return (
@@ -275,6 +268,7 @@ function ValueBets({ onSelectMatch }) {
                 </div>
 
                 <div className="flex-1" />
+                <RefreshOddsControl quota={quota} onAfterRefresh={() => setRefreshKey(k => k + 1)} />
                 <div className="mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted text-right">
                     <div>
                         {picks.length} {picks.length === 1 ? 'pick' : 'picks'}
@@ -289,17 +283,46 @@ function ValueBets({ onSelectMatch }) {
                 </div>
             </div>
 
-            {/* Empty state */}
+            {/* Empty state — disambiguate between "no edges found" and
+                "no odds data at all" (quota exhausted). The latter is the
+                actual cause when remaining=0; saying "market is efficient"
+                in that case is misleading. */}
             {picks.length === 0 && (
                 <div className="text-center py-16 max-w-md mx-auto">
-                    <div className="eyebrow mb-3">No value</div>
-                    <h3 className="display text-2xl text-ink mb-3">
-                        Market is efficient right now<span className="text-accent">.</span>
-                    </h3>
-                    <p className="text-ink-soft text-sm">
-                        No bets clear the {pct(minEdge)} edge threshold across the next 7 days.
-                        Try lowering the threshold, or check back after the next odds refresh.
-                    </p>
+                    {quota?.remaining === 0 ? (
+                        <>
+                            <div className="eyebrow mb-3 text-warning">No odds data</div>
+                            <h3 className="display text-2xl text-ink mb-3">
+                                Odds API quota exhausted<span className="text-accent">.</span>
+                            </h3>
+                            <p className="text-ink-soft text-sm">
+                                The Odds API free-tier quota (500 req/month) is at zero.
+                                Without live bookmaker odds the model can't compute edges.
+                                Quota resets at the start of the next billing month.
+                            </p>
+                            <p className="text-ink-soft text-sm mt-3">
+                                Workarounds: register a fresh free key at{' '}
+                                <a href="https://the-odds-api.com" target="_blank" rel="noopener noreferrer"
+                                   className="text-accent hover:text-accent-soft border-b border-accent/40">
+                                    the-odds-api.com
+                                </a>{' '}
+                                and swap <code className="mono text-[0.85em] bg-paper-tint border border-line px-1">ODDS_API_KEY</code>{' '}
+                                in <code className="mono text-[0.85em] bg-paper-tint border border-line px-1">backend/.env</code>,
+                                or upgrade to a paid tier (~$30/mo).
+                            </p>
+                        </>
+                    ) : (
+                        <>
+                            <div className="eyebrow mb-3">No value</div>
+                            <h3 className="display text-2xl text-ink mb-3">
+                                Market is efficient right now<span className="text-accent">.</span>
+                            </h3>
+                            <p className="text-ink-soft text-sm">
+                                No bets clear the {pct(minEdge)} edge threshold across the next 7 days.
+                                Try lowering the threshold, or check back after the next odds refresh.
+                            </p>
+                        </>
+                    )}
                 </div>
             )}
 
@@ -622,7 +645,7 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged
                             value={`${liveEdge >= 0 ? '+' : ''}${pct(liveEdge)}`}
                             className={liveEdge >= SUSPICIOUS_EDGE ? 'text-warning' : liveEdge >= 0 ? 'text-positive' : 'text-danger'} />
                         <ReadOnlyField label="Suggested book (sharp)" value={pick.bookmaker || '—'} />
-                        <ReadOnlyField label="Pinnacle median odds" value={pick.odds.toFixed(2)} />
+                        <ReadOnlyField label="Sharp median odds" value={pick.odds.toFixed(2)} />
                     </div>
 
                     <div>
@@ -737,6 +760,71 @@ function ReadOnlyField({ label, value, className = 'text-ink' }) {
         <div>
             <div className="eyebrow">{label}</div>
             <div className={'mono text-sm mt-0.5 ' + className}>{value}</div>
+        </div>
+    );
+}
+
+// Format a duration in seconds → short human label ("3d", "12h", "45m", "just now").
+function ageLabel(seconds) {
+    if (seconds == null) return 'never';
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+// Refresh-odds control + cache-age indicator. Exported so BestOfWeek can
+// reuse the same UI. Calls /api/admin/odds-refresh which clears the backend
+// cache; the parent then re-runs its data fetch (via onAfterRefresh) to
+// pull fresh values. ~18 quota credits per cold refetch on a typical scan.
+//
+// Returns null for visitors without a bet token — the endpoint is auth-gated
+// and we don't want public users to discover a control that will 401. The
+// cache-age info is still surfaced via the Quota line in the parent controls.
+export function RefreshOddsControl({ quota, onAfterRefresh }) {
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState(null);
+    const ageSec = quota?.cache_age_seconds;
+    const ttlSec = quota?.cache_ttl_seconds;
+    if (!getBetToken()) return null;
+
+    const handleClick = async () => {
+        if (!confirm(
+            'Force a fresh fetch from The Odds API? This costs roughly 18 quota credits ' +
+            'on a typical scan (9 leagues × 2 markets). Quota: ' +
+            (quota?.remaining ?? '?') + ' remaining.'
+        )) return;
+        setBusy(true);
+        setError(null);
+        try {
+            await footballAPI.refreshOdds();
+            onAfterRefresh?.();
+        } catch (e) {
+            setError(e.response?.data?.error || e.message || 'Refresh failed');
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return (
+        <div className="flex flex-col items-end gap-1">
+            <button
+                onClick={handleClick}
+                disabled={busy}
+                title={
+                    `Cache age: ${ageLabel(ageSec)}` +
+                    (ttlSec ? ` · TTL ${Math.round(ttlSec / 86400)}d` : '') +
+                    ' · click to drop cache and refetch'
+                }
+                className="mono text-[0.65rem] uppercase tracking-[0.1em] px-2 py-1 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer disabled:opacity-50"
+            >
+                {busy ? 'Refreshing…' : `Refresh odds (cached ${ageLabel(ageSec)})`}
+            </button>
+            {error && (
+                <div className="mono text-[0.55rem] text-danger uppercase tracking-[0.1em]">
+                    {error}
+                </div>
+            )}
         </div>
     );
 }
