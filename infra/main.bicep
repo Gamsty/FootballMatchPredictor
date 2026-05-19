@@ -77,6 +77,17 @@ module keyVault 'modules/keyVault.bicep' = {
   }
 }
 
+// Reference the storage account by its deterministic name (same string the
+// storage module uses) rather than `storage.outputs.name` — Bicep requires
+// listKeys() arguments to be resolvable at deployment start, and module
+// outputs are deploy-time values. The implicit ordering still holds because
+// `cae` depends on `storage.outputs.oddsCacheShareName` further down.
+var storageAccountName = 'st${prefixNoDash}'
+var storageAccountKey = listKeys(
+  resourceId('Microsoft.Storage/storageAccounts', storageAccountName),
+  '2023-05-01'
+).keys[0].value
+
 module cae 'modules/containerAppsEnv.bicep' = {
   name: 'cae'
   params: {
@@ -84,6 +95,9 @@ module cae 'modules/containerAppsEnv.bicep' = {
     location: location
     workspaceId: logAnalytics.outputs.workspaceId
     workspaceKey: logAnalytics.outputs.workspaceKey
+    oddsCacheStorageAccountName: storageAccountName
+    oddsCacheStorageAccountKey: storageAccountKey
+    oddsCacheShareName: storage.outputs.oddsCacheShareName
   }
 }
 
@@ -98,6 +112,7 @@ module containerApp 'modules/containerApp.bicep' = {
     keyVaultName: keyVault.outputs.name
     appInsightsConnectionString: appInsights.outputs.connectionString
     imageTag: backendImageTag
+    oddsCacheStorageName: cae.outputs.oddsCacheStorageName
   }
 }
 

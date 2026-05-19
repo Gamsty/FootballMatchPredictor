@@ -22,9 +22,19 @@ def client(monkeypatch):
     """
     Flask test client. Wipes BET_WRITE_TOKEN so writes go through without
     auth (the auth layer itself is exercised by test_combo_settle.py).
+
+    Ordering matters: `database.py` (imported transitively by app) calls
+    `load_dotenv()` unconditionally — so a delenv *before* the first app
+    import gets immediately undone by .env's BET_WRITE_TOKEN value. We
+    import app first (lets load_dotenv populate os.environ from .env),
+    then strip the token for the request handler to see it absent. Subsequent
+    tests hit the module-import cache so no re-injection happens; the env
+    state from the first test's load_dotenv persists and the delenv works
+    against that. Symptom of the wrong ordering: only the first test in this
+    file fails, with a confusing 401 instead of 400.
     """
-    monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
     from app import app as flask_app
+    monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
     flask_app.config['TESTING'] = True
     return flask_app.test_client()
 

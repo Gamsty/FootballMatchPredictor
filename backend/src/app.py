@@ -1068,7 +1068,7 @@ def get_upcoming_predictions():
     Batch predictions for upcoming matches — powers the dashboard.
 
     Query params:
-        days (int): Days ahead (default 14)
+        days (int): Days ahead (default 7, clamped to [1, 30])
         competition (str): Filter by competition name
         min_confidence (float): Minimum confidence threshold
         sort_by (str): confidence | date | competition (default: date)
@@ -1078,9 +1078,10 @@ def get_upcoming_predictions():
         if not model_data:
             return jsonify({'error': 'Model not loaded'}), 503
 
-        # Clamp days to a 30-day forward window — anything longer hits matches we
-        # don't have fixtures for and just wastes DB queries.
-        days = max(1, min(request.args.get('days', 14, type=int) or 14, 30))
+        # Default matches the dashboard call (`days: 7`) so direct API consumers
+        # see the same window the UI does. Clamp at 30 — anything longer hits
+        # matches we don't have fixtures for and just wastes DB queries.
+        days = max(1, min(request.args.get('days', 7, type=int) or 7, 30))
         competition_filter = request.args.get('competition', '')
         min_confidence = request.args.get('min_confidence', 0, type=float)
         sort_by = request.args.get('sort_by', 'date')

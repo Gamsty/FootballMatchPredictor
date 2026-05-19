@@ -68,6 +68,15 @@ function RecentROI() {
                             <span className="text-ink-muted"> · {data.pending_count} pending</span>
                         )}
                     </span>
+                    {/* Visitor disclosure: operator bets exclusively at Norsk Tipping,
+                        whose margins are 8–12% vs the ~2–3% on Pinnacle/exchanges.
+                        Without this caller might assume sharp-market replicability. */}
+                    <span
+                        className="mono text-[0.6rem] uppercase tracking-[0.12em] text-ink-muted/80 cursor-help border-b border-dotted border-ink-muted/30"
+                        title="All paper bets logged here are priced at Norsk Tipping (Norwegian betting monopoly). NT margins are typically 8–12% vs ~2–3% on Pinnacle and exchanges, so the same picks placed on sharper books would carry materially higher edges than what's shown."
+                    >
+                        @ NT
+                    </span>
                 </div>
 
                 <div className="flex items-baseline gap-1.5">

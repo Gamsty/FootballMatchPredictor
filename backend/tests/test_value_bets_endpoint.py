@@ -36,6 +36,10 @@ def client(monkeypatch):
     monkeypatch.setenv('DATABASE_URL', 'postgresql://x:y@127.0.0.1:65535/none')
     # Prevent app from trying to load real Azure/blob model
     monkeypatch.setenv('FLASK_ENV', 'production')
+    # Bet-write tests in this file assume the auth gate is *off* so POST /api/bets
+    # exercises validation logic, not the 401 path. Clearing here makes the fixture
+    # hermetic against developer .env files that set BET_WRITE_TOKEN locally.
+    monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
 
     # Stub the model_storage loader so import doesn't try blob/disk
     with patch('model_storage.load_model_bytes', side_effect=Exception('mock')):

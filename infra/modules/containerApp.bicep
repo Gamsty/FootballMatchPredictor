@@ -7,6 +7,9 @@ param keyVaultName string
 param appInsightsConnectionString string
 param imageTag string = 'latest'
 
+@description('Name of the CAE-scoped storage definition for the Odds API cache file share. When empty, no volume is mounted and the cache falls back to in-memory only.')
+param oddsCacheStorageName string = ''
+
 resource ca 'Microsoft.App/containerApps@2024-03-01' = {
   name: name
   location: location
@@ -94,6 +97,12 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'RELOAD_TOKEN', secretRef: 'reload-token' }
             { name: 'BET_WRITE_TOKEN', secretRef: 'bet-write-token' }
             { name: 'ODDS_API_KEY', secretRef: 'odds-api-key' }
+            // Point the file-backed odds cache at the mounted share when one
+            // is available. Without a mount the OddsAPIClient still works
+            // (in-memory only) — the file persistence just no-ops. The path
+            // matches the default the client constructs, but setting it here
+            // makes the intent visible in the manifest.
+            { name: 'ODDS_API_CACHE_FILE', value: empty(oddsCacheStorageName) ? '' : '/app/data/odds_cache.json' }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
           ]
           probes: [
@@ -114,6 +123,22 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
               failureThreshold: 3
             }
           ]
+          // Mount the Azure Files share at /app/data so the Odds API cache
+          // (odds_cache.json) survives container restarts. The Dockerfile
+          // pre-creates and chowns /app/data; the SMB mount replaces it at
+          // runtime — file ownership inside the mount follows the storage
+          // account's SMB defaults (root:root, mode 0755), but the cache
+          // client writes via atomic tmp+rename which works regardless.
+          volumeMounts: empty(oddsCacheStorageName) ? [] : [
+            { volumeName: 'odds-cache', mountPath: '/app/data' }
+          ]
+        }
+      ]
+      volumes: empty(oddsCacheStorageName) ? [] : [
+        {
+          name: 'odds-cache'
+          storageType: 'AzureFile'
+          storageName: oddsCacheStorageName
         }
       ]
       scale: {
@@ -135,6 +160,14 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
 //   - AcrPull on the ACR                 (7f951dda-4ed3-4680-a7ca-43fe172d538d)
 //   - Storage Blob Data Reader on the SA (2a2b9908-6ea1-4ae2-8e65-a410df84e7d1)
 //   - Key Vault Secrets User on the KV   (4633458b-17de-408a-b874-0445c86b69e6)
+//
+// Storage Blob Data Reader is sufficient today — the runtime container only
+// reads models from blob. If we ever move bet writes or other state to blob
+// (currently lives in Postgres), upgrade to 'Storage Blob Data Contributor'
+// (ba92f5b4-2d11-453d-a403-e96b0029c9fe) to allow writes. The Odds API file
+// cache mounts via Azure Files using a storage account *key* (set on the
+// CAE storages resource), so it does NOT depend on the managed-identity
+// RBAC chain — SMB auth is key-based on Container Apps.
 //
 // Grant commands (run as Owner once):
 //   $CA_OID=$(az containerapp show -g <RG> -n <CA> --query identity.principalId -o tsv)
