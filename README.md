@@ -33,13 +33,31 @@ A full-stack machine learning application that predicts football match outcomes 
 
 ## Features
 
+### Prediction surface
 - **Multi-market predictions** — Match result (H/D/A), Double Chance, BTTS, Over/Under 2.5, Half-Time result, Corners, Cards
 - **Combo bets** — Result+BTTS, Result+O/U, BTTS+O/U combinations with combined probabilities
-- **Smart bet recommendations** — "Best Bet" (highest edge) and "Safest Bet" (highest probability) with reasoning
-- **Accumulator builder** — Select bets across matches, calculates combined odds and potential returns
+- **Smart bet recommendations** — "Best Bet" (highest edge) and "Safest Bet" (highest probability) with model-driven reasoning
+- **Slip-based accumulator** — Stack picks across matches and markets from the dashboard or inside the match detail; auto-routes to a single-bet or combo POST at log time
 - **Match tagging** — High Confidence, Upset Pick, Banker classifications
-- **Nightly retrain + auto-refresh** — Container Apps Job runs at 03:00 UTC: pulls fresh fixtures, retrains the stacked ensemble with TimeSeriesSplit CV, validates AUC against production on a time-based holdout, promotes or rejects
+- **Nightly retrain** — Container Apps Job runs at 03:00 UTC: pulls fresh fixtures, retrains the stacked ensemble with TimeSeriesSplit CV, validates AUC against production on a time-based holdout, promotes or rejects
 - **9 leagues** — Premier League, Championship, La Liga, Bundesliga, Serie A, Ligue 1, Eredivisie, Primeira Liga, Champions League
+
+### Value-betting workflow (advanced mode)
+- **+EV picks** — `/api/value-bets` joins model probabilities to live bookmaker odds (The Odds API) and surfaces picks above a configurable edge threshold, gated against the *median* of trusted sharp books rather than the best price to suppress palp-error noise
+- **Best Picks ranking** — top-N cross-league picks ranked by ¼-Kelly × ensemble agreement; embeds edge, probability, and model confidence into a single score
+- **Manual NT odds entry** — operator types Norsk Tipping odds inline per pick; the UI shows *edge vs NT* alongside edge vs sharp median (NT margins are 8–12% vs ~2–3% on Pinnacle, so the sharp edge is an upper bound)
+- **Combo presets** — auto-generated Safest / Best-edge / Treble suggestions with combined margin drag and Kelly-adjusted stake
+- **Compound markets** — BTTS & Win combinations priced from the model, with manual NT odds entry for edge discovery
+- **Paper bet logging + automatic settlement** — `POST /api/bets` and `/api/bets/combo` record single and multi-leg bets; settler runs on read so finished matches resolve in-place. Tri-state resolution (won / lost / **void**) prevents auto-LOSS when half-time, corners, or cards data is missing
+- **Performance hub** — ROI, hit rate, CLV vs closing odds, edge calibration, segment breakdowns by market / league / month, activity feed of recently settled bets
+- **Bet-write auth** — `X-Bet-Token` shared-secret header on writes; read endpoints stay public. Frontend bootstraps the token from a `?bet_token=` URL param into localStorage
+
+### Quota- and infra-aware design
+- **Persistent odds cache** — JSON-backed file cache (`backend/data/odds_cache.json`) with 7-day TTL, env-overridable; survives container restarts so the free-tier 500 req/month budget isn't burned on every cold start
+- **Circuit breaker** — refuses to fetch when remaining quota ≤ floor (default 20), protecting the emergency reserve from buggy callers
+- **Manual refresh** — `POST /api/admin/odds-refresh` drops the cache so the next fetch repopulates with current prices; surfaced in the UI as a "Refresh odds" button only for operators with a bet-write token
+- **Calibration view** — bucketed prediction-probability vs actual outcome rate, with sample-size strip and selectable timeframe / league filters
+- **Mobile-responsive** — `<sm` breakpoint renders the bet log as a card stack, the Performance Hub as a vertical KPI strip, and adds a fixed bottom tab nav for primary navigation
 
 ## Architecture
 
@@ -139,7 +157,7 @@ npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:5174` (frontend) and `http://localhost:5000` (API).
+The app will be available at `http://localhost:5173` (frontend) and `http://localhost:5000` (API). To unlock advanced mode (Value tab, Best Picks, bet logging) append `?advanced=true` to the dashboard URL once — it persists to localStorage per device. Add `?bet_token=<value>` if `BET_WRITE_TOKEN` is set in `backend/.env`.
 
 ### Bootstrap data
 
@@ -168,8 +186,9 @@ python src/model_training.py       # train models (optional — pre-trained .pkl
 |--------|----------|-------------|
 | POST | `/api/predict` | Predict match result (H/D/A) |
 | POST | `/api/predict/markets` | Full multi-market prediction |
-| GET | `/api/predictions/upcoming` | Dashboard — batch predictions for next 3 days |
+| GET | `/api/predictions/upcoming` | Dashboard — batch predictions over a configurable window (default 14 days, max 30) |
 | GET | `/api/predictions/history` | Past predictions with accuracy |
+| GET | `/api/predictions/calibration` | Bucketed prediction probability vs actual outcome rate, with sample-size per bucket |
 | GET | `/api/value-bets` | +EV picks: model probabilities × bookmaker odds (requires `ODDS_API_KEY`, gracefully no-ops without one) |
 
 ### Matches
@@ -185,11 +204,28 @@ python src/model_training.py       # train models (optional — pre-trained .pkl
 | GET | `/api/statistics/overview` | League-wide match and goal stats |
 | GET | `/api/statistics/head-to-head` | H2H record between two teams |
 
-### Admin (require `X-Reload-Token` header)
+### Bets (read endpoints public, writes gated by `X-Bet-Token`)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/admin/reload-model` | Hot-reload the model from Blob without restarting the container — called by the retrain job after a successful promotion |
-| POST | `/api/fixtures/refresh` | Sync upcoming fixtures from football-data.org into the DB. Auth-gated because the endpoint burns external-API quota and clears the prediction cache |
+| GET    | `/api/bets` | List bets with filters (status, market, league, date range); settles pending bets in-place on read |
+| POST   | `/api/bets` | Log a single paper bet — match_id, market, outcome_key, odds, stake, optional notes |
+| POST   | `/api/bets/combo` | Log a multi-leg combo as a single record with `combo_legs` JSON column |
+| GET    | `/api/bets/:id` | Single-bet detail including per-leg resolution for combos |
+| DELETE | `/api/bets/:id` | Remove a bet (operator override; primarily for fat-finger fixes) |
+| POST   | `/api/bets/settle` | Force-settle pending bets whose matches have finished — same logic that runs implicitly on list, but explicit for UI feedback |
+| GET    | `/api/bets/performance` | Aggregated ROI, hit rate, CLV vs closing odds, edge calibration, segment breakdowns |
+
+### Admin (require `X-Reload-Token` header unless noted)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/admin/reload-model` | Hot-reload the production model from Blob without restarting the container — called by the retrain job after a successful promotion |
+| POST | `/api/admin/refit-calibration` | Re-fit the Platt / isotonic calibrator from logged predictions without retraining the underlying ensemble |
+| POST | `/api/admin/backfill-predictions` | Replay the prediction service over historical matches to populate the calibration sample |
+| POST | `/api/admin/scrape-lineups` | Trigger the lineups scraper (separate Container Apps Job in prod) |
+| POST | `/api/admin/snapshot-closing-odds` | Capture closing odds snapshots for CLV calculation |
+| POST | `/api/admin/odds-refresh` | **`X-Bet-Token` gated.** Drop the persisted odds cache so the next `/api/value-bets` call refetches with fresh prices. ~18 quota credits per cold refresh — use sparingly |
+| GET  | `/api/admin/odds-status` | Last-known Odds API quota state, cache age, and circuit-breaker status |
+| POST | `/api/fixtures/refresh` | Sync upcoming fixtures from football-data.org into the DB. Auth-gated because the endpoint burns external-API quota |
 
 ## Features Used by ML Model
 
@@ -210,33 +246,56 @@ FootballMatchPredictor/
 ├── backend/
 │   ├── Dockerfile                  # Multi-stage build for Container Apps
 │   ├── models/                     # Pre-trained ML models (.pkl, also in Blob)
-│   │   ├── best_model.pkl          # Main XGBoost match result model
+│   │   ├── best_model.pkl          # Stacked-ensemble match-result model
 │   │   └── multi_market_models.pkl # BTTS, O/U, corners, cards models
+│   ├── data/                       # Runtime artifacts (gitignored)
+│   │   └── odds_cache.json         # File-backed Odds API cache (7-day TTL, auto-managed)
 │   ├── src/
-│   │   ├── app.py                  # Flask API
-│   │   ├── database.py             # SQLAlchemy models & DB manager
-│   │   ├── data_collection.py      # football-data.org API client
+│   │   ├── app.py                  # Flask API — all routes
+│   │   ├── database.py             # SQLAlchemy models (Match, Prediction, Bet, Calibration) + DB manager
+│   │   ├── data_collection.py      # football-data.org client
+│   │   ├── api_football_client.py  # api-football.com client (Eliteserien + leagues outside FDO free tier)
 │   │   ├── feature_engineering.py  # Feature computation pipeline
-│   │   ├── prediction_service.py   # Multi-market prediction engine
+│   │   ├── prediction_service.py   # Multi-market prediction engine + recommendations
+│   │   ├── value_bets.py           # +EV pick computation (model × bookmaker odds, Kelly sizing)
+│   │   ├── odds_api.py             # The Odds API client w/ persistent cache, quota tracking, circuit breaker
+│   │   ├── odds_snapshot.py        # Closing-odds snapshotting for CLV tracking
+│   │   ├── calibrator.py           # Platt / isotonic post-hoc probability calibration
+│   │   ├── predictions_backfill.py # Backfill historical predictions for calibration sample
 │   │   ├── cache.py                # In-memory TTL prediction cache (2h)
 │   │   ├── load_data.py            # CSV → database loader
 │   │   ├── load_external_csv.py    # External league data loader
-│   │   ├── model_training.py       # Model training & evaluation
+│   │   ├── model_training.py       # Stacked-ensemble training pipeline
 │   │   ├── model_storage.py        # Blob storage abstraction (Managed Identity)
-│   │   └── telemetry.py            # Application Insights wiring
+│   │   ├── telemetry.py            # Application Insights wiring
+│   │   ├── lineups_scrape.py       # SofaScore lineups scraper
+│   │   └── sofascore_scraper.py    # (understat scraper is deprecated — see file header)
 │   ├── jobs/
-│   │   ├── Dockerfile              # Retrain job container
+│   │   ├── Dockerfile              # Retrain / backfill / snapshot job container
 │   │   └── retrain.py              # Nightly retrain + AUC validation gate
+│   ├── tests/                      # pytest — odds API, value bets, bet endpoints, combo settle, calibrator
 │   ├── requirements.txt
 │   ├── wsgi.py
 │   └── gunicorn.conf.py
 ├── frontend/
-│   ├── Dockerfile                  # Multi-stage build (used for parity, prod is Vercel)
+│   ├── Dockerfile                  # Multi-stage build (parity only; prod is Vercel)
 │   ├── nginx.conf
 │   ├── src/
-│   │   ├── components/             # MatchCard, MatchDetail, FilterBar, AboutModel, etc.
+│   │   ├── components/
+│   │   │   ├── MatchCard.jsx, MatchDetail.jsx, FilterBar.jsx, CategoryTabs.jsx, BottomNav.jsx
+│   │   │   ├── ValueBets.jsx       # +EV table with edge gating + Kelly sizing + LogBetModal
+│   │   │   ├── BestOfWeek.jsx      # Cross-league Top-N picks + combo builder + LogComboModal
+│   │   │   ├── ComboPresets.jsx    # Auto-generated combo recommendations (Safest / Best-edge / Treble)
+│   │   │   ├── CompoundMarkets.jsx # BTTS & Win with manual NT odds entry
+│   │   │   ├── PerformanceHub.jsx  # ROI / CLV / segment breakdowns / activity feed
+│   │   │   ├── BetLog.jsx, BetRow.jsx, BetDetail.jsx, PerfSummary.jsx, SegmentDetail.jsx
+│   │   │   ├── RecentROI.jsx       # Public proof-of-edge strip
+│   │   │   ├── CalibrationView.jsx # Bucketed probability vs outcome plot
+│   │   │   ├── Settings.jsx        # Advanced mode toggle, bet-token, bankroll, reset
+│   │   │   ├── MethodNote.jsx      # Public model deep-dive
+│   │   │   └── ErrorBoundary.jsx
 │   │   ├── pages/Dashboard.jsx
-│   │   ├── services/api.js         # Axios client (uses VITE_API_URL)
+│   │   ├── services/api.js         # Axios client (uses VITE_API_URL), token persistence
 │   │   ├── utils/constants.js
 │   │   ├── App.jsx
 │   │   └── main.jsx
@@ -246,17 +305,16 @@ FootballMatchPredictor/
 │   ├── main.bicep                  # Composes all modules
 │   ├── main.parameters.prod.json
 │   └── modules/
-│       ├── acr.bicep
-│       ├── appInsights.bicep
-│       ├── containerApp.bicep      # CA + Key Vault secret refs (RBAC granted out-of-band)
-│       ├── containerAppsEnv.bicep
-│       ├── keyVault.bicep
-│       ├── logAnalytics.bicep
-│       ├── postgres.bicep
-│       └── storage.bicep
+│       ├── acr.bicep, appInsights.bicep, containerApp.bicep, containerAppsEnv.bicep
+│       ├── keyVault.bicep, logAnalytics.bicep, postgres.bicep, storage.bicep
+│       └── retrainJob.bicep        # Container Apps Job for nightly retrain
 ├── .github/workflows/
 │   ├── backend.yml                 # Test + build + push + deploy via OIDC
-│   └── infra.yml                   # Bicep deploy via OIDC
+│   ├── infra.yml                   # Bicep deploy via OIDC
+│   ├── refit-calibration.yml       # Scheduled calibration refit
+│   ├── refresh-fixtures.yml        # Scheduled fixture sync
+│   ├── scrape-lineups.yml          # Scheduled lineups scraper
+│   └── snapshot-odds.yml           # Scheduled closing-odds snapshots
 ├── docker-compose.yml              # Local dev convenience (postgres + backend + frontend)
 ├── docs/
 │   └── azure-runbook.md            # Step-by-step Azure deployment commands

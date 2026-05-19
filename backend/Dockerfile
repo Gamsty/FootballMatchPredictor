@@ -35,6 +35,13 @@ COPY --chown=app:app models/ ./models/
 # serves both purposes.
 COPY --chown=app:app jobs/ ./jobs/
 
+# Writable runtime data directory for the file-backed odds cache
+# (backend/data/odds_cache.json). Without the chown, /app stays root-owned
+# and the unprivileged `app` user can't create the directory at runtime —
+# _save_cache silently fails with PermissionError and the cache stays in-memory
+# only, undermining the cross-restart persistence the 7-day TTL relies on.
+RUN mkdir -p /app/data && chown app:app /app/data
+
 USER app
 ENV PATH=/home/app/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
