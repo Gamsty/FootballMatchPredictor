@@ -31,7 +31,7 @@ const SORTS = [
     { id: 'odds_desc',   label: 'Longest odds',  cmp: (a, b) => (b.odds_at_bet || 0) - (a.odds_at_bet || 0) },
 ];
 
-function BetLog({ onClose, canEdit = false, onSelectBet }) {
+function BetLog({ onClose, canEdit = false, onSelectBet, onChange }) {
     const [bets, setBets] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -91,6 +91,10 @@ function BetLog({ onClose, canEdit = false, onSelectBet }) {
         if (status) params.status = status;
         const fresh = await footballAPI.listBets(params);
         setBets(fresh);
+        // Tell parent (PerformanceHub) so its KPIs, Open Positions, and
+        // Recent Activity refresh too. Without this, closing the BetLog
+        // shows stale numbers on the hub until next tab switch.
+        onChange?.();
     };
 
     return (
@@ -98,42 +102,43 @@ function BetLog({ onClose, canEdit = false, onSelectBet }) {
             className="fixed inset-0 z-50 bg-ink/40 flex justify-end animate-fade-in"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
-            <div className="bg-paper w-full max-w-4xl border-l border-line overflow-y-auto animate-slide-in">
+            <div className="bg-paper w-full max-w-4xl sm:border-l border-line overflow-y-auto animate-slide-in">
                 {/* Header */}
                 <div className="sticky top-0 bg-paper/95 backdrop-blur-md border-b border-line z-10">
-                    <div className="px-6 py-4 flex items-start justify-between">
+                    <div className="px-4 sm:px-6 py-4 flex items-start justify-between">
                         <div>
                             <div className="eyebrow mb-1">Tracking</div>
-                            <h2 className="display text-3xl text-ink">
+                            <h2 className="display text-2xl sm:text-3xl text-ink">
                                 Bet log<span className="text-accent">.</span>
                             </h2>
                         </div>
                         <button
                             onClick={onClose}
-                            className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer"
+                            className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer p-2 -m-2"
                             aria-label="Close"
                         >×</button>
                     </div>
                 </div>
 
-                <div className="px-6 py-6 space-y-5">
+                <div className="px-4 sm:px-6 py-5 sm:py-6 space-y-5">
                     {error && (
                         <div className="bg-paper-tint border-l-2 border-danger p-4">
                             <p className="text-ink-soft text-sm">{error}</p>
                         </div>
                     )}
 
-                    {/* Filters row */}
+                    {/* Filters row — status chips wrap full-width on mobile so
+                        tap targets stay thumb-sized; selects stack vertically. */}
                     <div className="flex flex-wrap items-end gap-x-6 gap-y-3 pb-4 border-b border-line">
-                        <div>
+                        <div className="w-full sm:w-auto">
                             <div className="eyebrow mb-1.5">Status</div>
-                            <div className="flex gap-1.5">
+                            <div className="flex gap-1.5 flex-wrap">
                                 {STATUS_OPTIONS.map(opt => (
                                     <button
                                         key={opt.id}
                                         onClick={() => setStatus(opt.id)}
                                         className={
-                                            'mono text-[0.7rem] uppercase tracking-[0.1em] px-2 py-1 border transition-colors cursor-pointer ' +
+                                            'mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 sm:px-2 sm:py-1 border transition-colors cursor-pointer ' +
                                             (status === opt.id
                                                 ? 'bg-ink text-paper border-ink'
                                                 : 'border-line text-ink-soft hover:text-ink hover:border-ink-muted')
@@ -228,12 +233,12 @@ function BetLog({ onClose, canEdit = false, onSelectBet }) {
 
 function SelectField({ label, value, onChange, options }) {
     return (
-        <div>
+        <div className="min-w-[140px] sm:min-w-0">
             <div className="eyebrow mb-1.5">{label}</div>
             <select
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
-                className="bg-paper border border-line px-2 py-1 mono text-[0.75rem] text-ink focus:outline-none focus:border-accent transition-colors cursor-pointer"
+                className="w-full sm:w-auto bg-paper border border-line px-2 py-2 sm:py-1 mono text-[0.75rem] text-ink focus:outline-none focus:border-accent transition-colors cursor-pointer"
             >
                 {options.map(opt => (
                     <option key={opt.value} value={opt.value}>{opt.label}</option>

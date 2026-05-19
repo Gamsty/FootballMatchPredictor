@@ -289,10 +289,10 @@ function LogCompoundModal({ summary, onClose, onLogged }) {
 
     return (
         <div
-            className="fixed inset-0 z-50 bg-ink/60 flex items-center justify-center p-4"
+            className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
-            <div className="bg-paper w-full max-w-md border border-line">
+            <div className="bg-paper w-full max-w-md border-y sm:border border-line">
                 <div className="flex items-start justify-between px-5 py-4 border-b border-line">
                     <div>
                         <div className="eyebrow mb-1">Log compound bet</div>

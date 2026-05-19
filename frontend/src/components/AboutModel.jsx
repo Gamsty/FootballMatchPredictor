@@ -35,13 +35,13 @@ function AboutModel({ onClose }) {
     }, [onClose]);
 
     return (
-        <div className="fixed inset-0 bg-ink/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in">
+        <div className="fixed inset-0 bg-ink/40 backdrop-blur-sm z-50 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto animate-fade-in">
             <div
                 ref={panelRef}
-                className="bg-paper border border-line max-w-lg w-full shadow-[0_24px_60px_-20px_rgba(21,17,13,0.35)]
+                className="bg-paper border-y sm:border border-line max-w-lg w-full shadow-[0_24px_60px_-20px_rgba(21,17,13,0.35)]
                            animate-slide-in"
             >
-                <div className="flex items-baseline justify-between p-6 border-b border-line">
+                <div className="flex items-baseline justify-between p-4 sm:p-6 border-b border-line">
                     <div>
                         <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-ink-muted">
                             Method note
@@ -59,7 +59,7 @@ function AboutModel({ onClose }) {
                     </button>
                 </div>
 
-                <div className="p-6 space-y-5 text-sm">
+                <div className="p-4 sm:p-6 space-y-5 text-sm">
                     <Section label="Architecture">
                         Stacked ensemble — <span className="text-ink font-medium">XGBoost + RandomForest</span> base
                         learners feeding a logistic-regression meta-learner. Out-of-fold predictions
@@ -98,7 +98,7 @@ function AboutModel({ onClose }) {
                     </Section>
                 </div>
 
-                <div className="px-6 py-4 border-t border-line bg-paper-tint">
+                <div className="px-4 sm:px-6 py-4 border-t border-line bg-paper-tint">
                     <p className="mono text-[0.62rem] uppercase tracking-[0.12em] text-ink-muted text-center">
                         Predictions are informational. Match outcomes are inherently uncertain.
                     </p>

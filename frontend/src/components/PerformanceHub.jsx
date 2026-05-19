@@ -147,7 +147,7 @@ function PerformanceHub({ canEdit = false }) {
     }
 
     return (
-        <div className="space-y-10">
+        <div className="space-y-8 sm:space-y-10">
             {/* Header + period selector */}
             <header className="flex flex-wrap items-end justify-between gap-4 pb-4 border-b border-line">
                 <div>
@@ -158,13 +158,13 @@ function PerformanceHub({ canEdit = false }) {
                     <PeriodSubtitle perf={perf} period={period} />
                 </div>
                 <div className="flex items-center gap-2">
-                    <span className="eyebrow mr-2">Period</span>
+                    <span className="eyebrow mr-2 hidden sm:inline">Period</span>
                     {PERIODS.map(p => (
                         <button
                             key={p.id}
                             onClick={() => setPeriod(p.id)}
                             className={
-                                'mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-1.5 border transition-colors cursor-pointer ' +
+                                'mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 sm:py-1.5 border transition-colors cursor-pointer ' +
                                 (period === p.id
                                     ? 'bg-ink text-paper border-ink'
                                     : 'border-line text-ink-soft hover:text-ink hover:border-ink-muted')
@@ -179,15 +179,17 @@ function PerformanceHub({ canEdit = false }) {
             {/* KPI strip */}
             <PerfSummary perf={perf} size="lg" showFootnote />
 
-            {/* Open positions */}
+            {/* Open positions — stacked on mobile (3 rows), inline on desktop. */}
             {pending.count > 0 && (
                 <section>
                     <div className="eyebrow mb-3">Open positions</div>
                     <div className="bg-paper-tint border-l-2 border-accent px-4 py-3">
-                        <div className="mono text-sm text-ink">
-                            <span className="text-ink">{pending.count}</span> pending ·{' '}
-                            <span className="text-ink-soft">{Math.round(pending.risk).toLocaleString()} NOK</span> at risk ·{' '}
-                            <span className="text-accent">{Math.round(pending.potential).toLocaleString()} NOK</span> potential return
+                        <div className="mono text-sm text-ink flex flex-col sm:flex-row sm:items-baseline sm:gap-2 gap-y-0.5">
+                            <span><span className="text-ink">{pending.count}</span> pending</span>
+                            <span className="hidden sm:inline text-ink-muted">·</span>
+                            <span><span className="text-ink-soft">{Math.round(pending.risk).toLocaleString()} NOK</span> at risk</span>
+                            <span className="hidden sm:inline text-ink-muted">·</span>
+                            <span><span className="text-accent">{Math.round(pending.potential).toLocaleString()} NOK</span> potential return</span>
                         </div>
                     </div>
                 </section>
@@ -287,6 +289,7 @@ function PerformanceHub({ canEdit = false }) {
                     onClose={() => setShowLog(false)}
                     canEdit={canEdit}
                     onSelectBet={setSelectedBet}
+                    onChange={refreshAll}
                 />
             )}
         </div>
@@ -317,7 +320,12 @@ function PeriodSubtitle({ perf, period }) {
     );
 }
 
-// Shared market/league segment table.
+// Shared market/league segment table. Two layouts share data:
+//   - Mobile (<sm): each row is a stacked card (segment name + 2x2 metric grid)
+//   - Desktop (sm+): traditional 6-col table with header row
+// The 6-col table never fit on a phone — values truncated to ellipsis at
+// best, completely unreadable at worst. Cards trade horizontal scanning
+// for vertical scrolling, which is what mobile users do anyway.
 function SegmentSection({ title, rows, onSelect, emptyHint, showCombosNote = false }) {
     const sorted = [...rows].sort((a, b) => (b.stake || 0) - (a.stake || 0));
     return (
@@ -333,47 +341,54 @@ function SegmentSection({ title, rows, onSelect, emptyHint, showCombosNote = fal
                     <p className="text-ink-soft text-sm">{emptyHint}</p>
                 </div>
             ) : (
-                <div className="border border-line">
-                    {/* Header row */}
-                    <div className="grid grid-cols-[1.4fr_repeat(4,minmax(0,1fr))_auto] gap-4 px-4 py-2 bg-paper-tint border-b border-line">
-                        <div className="eyebrow">Segment</div>
-                        <div className="eyebrow text-right">Bets</div>
-                        <div className="eyebrow text-right">Stake</div>
-                        <div className="eyebrow text-right">P/L</div>
-                        <div className="eyebrow text-right">ROI</div>
-                        <div className="eyebrow text-right pl-3">Win rate</div>
+                <>
+                    {/* Mobile cards */}
+                    <div className="sm:hidden space-y-2">
+                        {sorted.map(row => (
+                            <SegmentCard key={row.key} row={row} onSelect={onSelect} />
+                        ))}
                     </div>
-                    {/* Rows */}
-                    {sorted.map(row => (
-                        <button
-                            key={row.key}
-                            onClick={() => onSelect(row)}
-                            className="w-full grid grid-cols-[1.4fr_repeat(4,minmax(0,1fr))_auto] gap-4 px-4 py-3 border-b border-line-soft last:border-b-0 text-left hover:bg-paper-tint transition-colors cursor-pointer items-baseline group"
-                        >
-                            <div className="text-ink text-sm flex items-center gap-2 min-w-0">
-                                <span className="truncate">{row.label}</span>
-                                <span className="text-accent opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true">→</span>
-                            </div>
-                            <div className="mono text-sm text-ink text-right">{row.count ?? 0}</div>
-                            <div className="mono text-sm text-ink-soft text-right">{Math.round(row.stake || 0).toLocaleString()}</div>
-                            <div className={
-                                'mono text-sm font-semibold text-right ' +
-                                (row.pl > 0 ? 'text-positive' : row.pl < 0 ? 'text-danger' : 'text-ink-muted')
-                            }>
-                                {nok(row.pl)}
-                            </div>
-                            <div className={
-                                'mono text-sm font-semibold text-right ' +
-                                (row.roi > 0 ? 'text-positive' : row.roi < 0 ? 'text-danger' : 'text-ink-muted')
-                            }>
-                                {pct(row.roi)}
-                            </div>
-                            <div className="mono text-sm text-ink text-right pl-3">
-                                {pct(row.win_rate)}
-                            </div>
-                        </button>
-                    ))}
-                </div>
+                    {/* Desktop table */}
+                    <div className="hidden sm:block border border-line">
+                        <div className="grid grid-cols-[1.4fr_repeat(4,minmax(0,1fr))_auto] gap-4 px-4 py-2 bg-paper-tint border-b border-line">
+                            <div className="eyebrow">Segment</div>
+                            <div className="eyebrow text-right">Bets</div>
+                            <div className="eyebrow text-right">Stake</div>
+                            <div className="eyebrow text-right">P/L</div>
+                            <div className="eyebrow text-right">ROI</div>
+                            <div className="eyebrow text-right pl-3">Win rate</div>
+                        </div>
+                        {sorted.map(row => (
+                            <button
+                                key={row.key}
+                                onClick={() => onSelect(row)}
+                                className="w-full grid grid-cols-[1.4fr_repeat(4,minmax(0,1fr))_auto] gap-4 px-4 py-3 border-b border-line-soft last:border-b-0 text-left hover:bg-paper-tint transition-colors cursor-pointer items-baseline group"
+                            >
+                                <div className="text-ink text-sm flex items-center gap-2 min-w-0">
+                                    <span className="truncate">{row.label}</span>
+                                    <span className="text-accent opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true">→</span>
+                                </div>
+                                <div className="mono text-sm text-ink text-right">{row.count ?? 0}</div>
+                                <div className="mono text-sm text-ink-soft text-right">{Math.round(row.stake || 0).toLocaleString()}</div>
+                                <div className={
+                                    'mono text-sm font-semibold text-right ' +
+                                    (row.pl > 0 ? 'text-positive' : row.pl < 0 ? 'text-danger' : 'text-ink-muted')
+                                }>
+                                    {nok(row.pl)}
+                                </div>
+                                <div className={
+                                    'mono text-sm font-semibold text-right ' +
+                                    (row.roi > 0 ? 'text-positive' : row.roi < 0 ? 'text-danger' : 'text-ink-muted')
+                                }>
+                                    {pct(row.roi)}
+                                </div>
+                                <div className="mono text-sm text-ink text-right pl-3">
+                                    {pct(row.win_rate)}
+                                </div>
+                            </button>
+                        ))}
+                    </div>
+                </>
             )}
             {showCombosNote && (
                 <p className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-2">
@@ -381,6 +396,41 @@ function SegmentSection({ title, rows, onSelect, emptyHint, showCombosNote = fal
                 </p>
             )}
         </section>
+    );
+}
+
+function SegmentCard({ row, onSelect }) {
+    const plClass = row.pl > 0 ? 'text-positive' : row.pl < 0 ? 'text-danger' : 'text-ink-muted';
+    const roiClass = row.roi > 0 ? 'text-positive' : row.roi < 0 ? 'text-danger' : 'text-ink-muted';
+    return (
+        <button
+            onClick={() => onSelect(row)}
+            className="w-full bg-paper border border-line hover:border-ink-muted px-3 py-3 text-left transition-colors cursor-pointer block"
+        >
+            <div className="flex items-baseline justify-between gap-2 mb-2">
+                <div className="text-ink text-sm font-medium truncate flex items-center gap-1.5">
+                    {row.label}
+                    <span className="text-accent" aria-hidden="true">→</span>
+                </div>
+                <div className="mono text-[0.65rem] text-ink-muted whitespace-nowrap">
+                    {row.count ?? 0} bets · {Math.round(row.stake || 0).toLocaleString()} NOK
+                </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3 pt-2 border-t border-line-soft">
+                <div>
+                    <div className="mono text-[0.55rem] uppercase tracking-[0.12em] text-ink-muted">P/L</div>
+                    <div className={'mono text-sm font-semibold ' + plClass}>{nok(row.pl)}</div>
+                </div>
+                <div>
+                    <div className="mono text-[0.55rem] uppercase tracking-[0.12em] text-ink-muted">ROI</div>
+                    <div className={'mono text-sm font-semibold ' + roiClass}>{pct(row.roi)}</div>
+                </div>
+                <div>
+                    <div className="mono text-[0.55rem] uppercase tracking-[0.12em] text-ink-muted">Win</div>
+                    <div className="mono text-sm text-ink">{pct(row.win_rate)}</div>
+                </div>
+            </div>
+        </button>
     );
 }
 

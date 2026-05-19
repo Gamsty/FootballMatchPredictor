@@ -57,25 +57,25 @@ function CalibrationView({ onClose }) {
 
     return (
         <div
-            className="fixed inset-0 z-50 bg-ink/60 flex items-start sm:items-center justify-center p-4 overflow-y-auto"
+            className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
-            <div className="bg-paper w-full max-w-2xl my-8 border border-line">
-                <div className="flex items-start justify-between px-6 py-4 border-b border-line">
+            <div className="bg-paper w-full max-w-2xl sm:my-8 border-y sm:border border-line">
+                <div className="flex items-start justify-between px-4 sm:px-6 py-4 border-b border-line">
                     <div>
                         <div className="eyebrow mb-1">Diagnostic</div>
-                        <h2 className="display text-3xl text-ink">
+                        <h2 className="display text-2xl sm:text-3xl text-ink">
                             Model calibration<span className="text-accent">.</span>
                         </h2>
                     </div>
                     <button
                         onClick={onClose}
-                        className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer"
+                        className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer p-2 -m-2"
                         aria-label="Close"
                     >×</button>
                 </div>
 
-                <div className="px-6 py-6 space-y-5">
+                <div className="px-4 sm:px-6 py-5 sm:py-6 space-y-5">
                     {/* Outcome picker */}
                     <div className="flex flex-wrap items-center gap-2">
                         <span className="eyebrow">Outcome</span>

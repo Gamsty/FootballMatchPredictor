@@ -1505,11 +1505,33 @@ def _total_corners(m):
 
 def _ou(getter, line):
     """Build (over, under) resolver pair for any total-goals/cards/corners line.
-    `getter` returns the total (int) or None if data is missing. None → void."""
+    `getter` returns the total (int) or None if data is missing.
+
+    Resolver convention: True → won, False → lost, None → void. The settle
+    code (`_settle_one_bet`, `_resolve_leg_for_match`) treats None as void
+    so cards/corners/HT bets on matches without those stats stay un-settled
+    instead of silently defaulting to 'lost' — football-data.org's free tier
+    doesn't ship HT/cards/corners, so without this we'd auto-lose every
+    such bet at FINISHED time.
+    """
+    def _make(op):
+        def fn(m):
+            v = getter(m)
+            return None if v is None else op(v, line)
+        return fn
     return {
-        'over':  lambda m: (getter(m) is not None) and getter(m) > line,
-        'under': lambda m: (getter(m) is not None) and getter(m) < line,
+        'over':  _make(lambda v, ln: v > ln),
+        'under': _make(lambda v, ln: v < ln),
     }
+
+
+def _ht_match(winner_value):
+    """Resolver for the ht_result market. Returns None when HT data missing
+    so the bet voids instead of auto-losing. See `_ou` for rationale."""
+    def fn(m):
+        w = _ht_winner(m)
+        return None if w is None else (w == winner_value)
+    return fn
 
 
 _BET_OUTCOME_RESOLVERS = {
@@ -1542,13 +1564,12 @@ _BET_OUTCOME_RESOLVERS = {
     },
 
     # ---- Halftime markets ---------------------------------------------------
-    # Returns False (not None) when HT data is missing so unsupported matches
-    # settle as 'lost' — better than hanging pending forever. Operator can
-    # manually void if they really want that match excluded.
+    # Returns None when HT data is missing → settle path voids the bet. See
+    # `_ou` for the same rationale (free-tier API doesn't ship HT scores).
     'ht_result': {
-        'home': lambda m: _ht_winner(m) == 'HOME_TEAM',
-        'draw': lambda m: _ht_winner(m) == 'DRAW',
-        'away': lambda m: _ht_winner(m) == 'AWAY_TEAM',
+        'home': _ht_match('HOME_TEAM'),
+        'draw': _ht_match('DRAW'),
+        'away': _ht_match('AWAY_TEAM'),
     },
     'ht_totals_0_5': _ou(_ht_total_goals, 0.5),
     'ht_totals_1_5': _ou(_ht_total_goals, 1.5),
@@ -1638,7 +1659,12 @@ def _resolve_leg_for_match(leg: dict, match: Match | None) -> str | None:
     resolver = _BET_OUTCOME_RESOLVERS.get(leg.get('market'), {}).get(leg.get('outcome_key'))
     if resolver is None:
         return 'void'
-    return 'won' if resolver(match) else 'lost'
+    # Tri-state: None means underlying stat is missing (e.g. HT score, cards)
+    # — void the leg rather than mark it lost. See `_ou` for rationale.
+    outcome = resolver(match)
+    if outcome is None:
+        return 'void'
+    return 'won' if outcome else 'lost'
 
 
 def _resolve_leg(leg: dict) -> str | None:
@@ -1722,11 +1748,21 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
         bet.profit_loss = 0.0
         return True
 
-    won = bool(resolver(match))
-    bet.status = 'won' if won else 'lost'
+    outcome = resolver(match)
     bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    # P/L = stake * (odds - 1) on win; -stake on loss
-    bet.profit_loss = bet.stake * (bet.odds_at_bet - 1.0) if won else -bet.stake
+    # Tri-state contract: True → won, False → lost, None → void.
+    # None signals the underlying stat (HT score, cards, corners) isn't
+    # present on the match record — happens whenever the source feed didn't
+    # ship those columns. Voiding is correct: a missing stat is not a loss.
+    if outcome is None:
+        bet.status = 'void'
+        bet.profit_loss = 0.0
+    elif outcome:
+        bet.status = 'won'
+        bet.profit_loss = bet.stake * (bet.odds_at_bet - 1.0)
+    else:
+        bet.status = 'lost'
+        bet.profit_loss = -bet.stake
     return True
 
 
@@ -2149,6 +2185,7 @@ def bets_performance():
 
         settled = [b for b in bets if b.status in ('won', 'lost')]
         pending = [b for b in bets if b.status == 'pending']
+        void = [b for b in bets if b.status == 'void']
         won = [b for b in settled if b.status == 'won']
 
         total_stake = sum(b.stake for b in settled)
@@ -2237,6 +2274,7 @@ def bets_performance():
             'total_bets': len(bets),
             'settled_count': len(settled),
             'pending_count': len(pending),
+            'void_count': len(void),
             'won_count': len(won),
             'total_stake': round(total_stake, 2),
             'total_profit_loss': round(total_pl, 2),

@@ -75,6 +75,9 @@ function PerfSummary({ perf, size = 'md', showFootnote = true }) {
                     )}
                     {' · '}Settled: <span className="text-ink">{perf.settled_count}</span>
                     {' · '}Pending: <span className="text-ink">{perf.pending_count}</span>
+                    {perf.void_count > 0 && (
+                        <> {' · '}Void: <span className="text-ink">{perf.void_count}</span></>
+                    )}
                     {' · '}Avg edge (singles):{' '}
                     <span
                         className="text-ink cursor-help border-b border-dotted border-ink-muted/40"

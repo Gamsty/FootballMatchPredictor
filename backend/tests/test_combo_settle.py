@@ -98,7 +98,7 @@ class TestCompoundMarketCoverage:
 # ---------------------------------------------------------------------------
 # Expanded market resolvers — totals at every line, double chance, HT, cards,
 # corners. Each is a simple > / < check on a derived total, so we test
-# representative lines + edge cases (exact line = lost, missing data = lost).
+# representative lines + edge cases (exact line = lost, missing data = void).
 # ---------------------------------------------------------------------------
 
 class TestTotalsAtVariousLines:
@@ -151,13 +151,13 @@ class TestHalftimeMarkets:
         assert r['home'](m) is False
         assert r['away'](m) is False
 
-    def test_ht_result_loses_when_ht_data_missing(self):
-        """Match without halftime data → all HT picks settle as lost (operator can void)."""
+    def test_ht_result_voids_when_ht_data_missing(self):
+        """Match without HT data → all HT picks resolve to None (settle path voids)."""
         r = _resolvers()['ht_result']
         m = _match(home_ht_score=None, away_ht_score=None)
-        assert r['home'](m) is False
-        assert r['draw'](m) is False
-        assert r['away'](m) is False
+        assert r['home'](m) is None
+        assert r['draw'](m) is None
+        assert r['away'](m) is None
 
     def test_ht_totals_under_with_goalless_first_half(self):
         r = _resolvers()['ht_totals_0_5']
@@ -187,10 +187,10 @@ class TestCardsMarket:
 
     def test_cards_voids_when_data_missing(self):
         r = _resolvers()['cards_3_5']
-        m = _match(home_yellow_cards=None)  # other fields not set
-        # Missing data → both over and under False (operator voids manually)
-        assert r['over'](m) is False
-        assert r['under'](m) is False
+        m = _match(home_yellow_cards=None)  # other fields default to None too
+        # Missing data → None (settle path voids the bet)
+        assert r['over'](m) is None
+        assert r['under'](m) is None
 
 
 class TestCornersMarket:
@@ -211,8 +211,8 @@ class TestCornersMarket:
     def test_corners_voids_when_data_missing(self):
         r = _resolvers()['corners_8_5']
         m = _match(home_corners=None, away_corners=None)
-        assert r['over'](m) is False
-        assert r['under'](m) is False
+        assert r['over'](m) is None
+        assert r['under'](m) is None
 
 
 class TestMarketsCoverage:
@@ -384,6 +384,63 @@ class TestCancelledMatch:
         changed = _settle_one_bet(bet, SimpleNamespace())
         assert changed is True
         assert bet.status == 'void'
+
+
+# ---------------------------------------------------------------------------
+# Tri-state resolver contract — None means underlying stat (HT, cards, corners)
+# is missing on the match record. Settle path must void, not auto-lose.
+# Without this, every HT/cards/corners bet on a free-tier-API match (which
+# never ships those columns) would silently settle to 'lost'.
+# ---------------------------------------------------------------------------
+
+class TestMissingDataVoids:
+    def _make_bet(self, market, outcome_key, *, stake=100.0, odds=2.0):
+        from datetime import datetime
+        return SimpleNamespace(
+            id=1, market=market, outcome_key=outcome_key, stake=stake,
+            odds_at_bet=odds, status='pending', settled_at=None,
+            profit_loss=None, placed_at=datetime(2026, 5, 1),
+            combo_legs=None,
+        )
+
+    def test_single_ht_bet_voids_when_ht_data_missing(self):
+        """FINISHED match with no HT scores → ht_result bet voids, not lost."""
+        from app import _settle_one_bet
+        bet = self._make_bet('ht_result', 'home')
+        match = _match(winner='HOME_TEAM', home_score=2, away_score=0,
+                       home_ht_score=None, away_ht_score=None)
+        changed = _settle_one_bet(bet, match)
+        assert changed is True
+        assert bet.status == 'void'
+        assert bet.profit_loss == 0.0
+
+    def test_single_cards_bet_voids_when_cards_missing(self):
+        from app import _settle_one_bet
+        bet = self._make_bet('cards_3_5', 'over')
+        match = _match(winner='HOME_TEAM', home_score=1, away_score=0)
+        # All card columns default to None
+        changed = _settle_one_bet(bet, match)
+        assert changed is True
+        assert bet.status == 'void'
+
+    def test_single_corners_bet_voids_when_corners_missing(self):
+        from app import _settle_one_bet
+        bet = self._make_bet('corners_9_5', 'under')
+        match = _match(winner='DRAW', home_score=1, away_score=1)
+        changed = _settle_one_bet(bet, match)
+        assert changed is True
+        assert bet.status == 'void'
+
+    def test_single_ht_bet_resolves_normally_with_data(self):
+        """Sanity: tri-state path still settles won/lost correctly with data."""
+        from app import _settle_one_bet
+        bet = self._make_bet('ht_result', 'home', odds=2.0, stake=100.0)
+        match = _match(winner='HOME_TEAM', home_score=3, away_score=1,
+                       home_ht_score=2, away_ht_score=0)
+        changed = _settle_one_bet(bet, match)
+        assert changed is True
+        assert bet.status == 'won'
+        assert bet.profit_loss == 100.0  # stake * (odds - 1)
 
 
 # ---------------------------------------------------------------------------

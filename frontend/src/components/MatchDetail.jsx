@@ -24,12 +24,68 @@ import {
     getRecommendedBets,
     MARKET_LABELS, MARKET_CATEGORIES, COMPETITION_LABELS
 } from '../utils/constants';
+import { LogBetModal } from './ValueBets';
 
-function MatchDetail({ match, onClose }) {
+// ---- Frontend → backend market-key mapping ----------------------------------
+// MARKET_LABELS uses display-oriented keys (over_2_5, total_cards_over_3_5),
+// while _BET_OUTCOME_RESOLVERS on the backend uses settle-oriented keys
+// (totals_2_5, cards_3_5). The bet log POST needs the backend names.
+// Returns null when no backend resolver exists for that frontend market —
+// such picks aren't loggable (e.g. corners_result, home_wins_at_least_one_half).
+function backendMarketFor(frontendKey) {
+    if (['btts', 'ht_result', 'h2h', 'double_chance'].includes(frontendKey)) return frontendKey;
+    if (frontendKey.startsWith('over_')) {
+        return `totals_${frontendKey.replace('over_', '')}`;
+    }
+    if (frontendKey.startsWith('total_cards_over_')) {
+        return `cards_${frontendKey.replace('total_cards_over_', '')}`;
+    }
+    if (frontendKey.startsWith('total_corners_over_')) {
+        return `corners_${frontendKey.replace('total_corners_over_', '')}`;
+    }
+    return null;
+}
+
+// Map display outcome label → backend outcome_key. Market data exposes
+// probabilities keyed by display labels ('Over', 'Under', 'Yes', etc.);
+// backend resolvers expect lowercase identifiers.
+const OUTCOME_KEY_MAP = {
+    'Over': 'over', 'Under': 'under',
+    'Yes': 'yes', 'No': 'no',
+    'Home': 'home', 'Draw': 'draw', 'Away': 'away',
+    'HOME_WIN': 'home', 'DRAW': 'draw', 'AWAY_WIN': 'away',
+    '1X': '1x', 'X2': 'x2', '12': '12',
+};
+function backendOutcomeFor(outcomeLabel) {
+    return OUTCOME_KEY_MAP[outcomeLabel] ?? String(outcomeLabel).toLowerCase();
+}
+
+// Build the `pick` shape LogBetModal expects from a market entry. Odds are
+// rounded to 2 decimals so the modal's number input doesn't show 16-digit
+// floats (1/0.828 = 1.20724...) — operator overrides with NT odds anyway,
+// but the default should look clean.
+function makePick({ match, market, outcomeKey, outcomeLabel, prob }) {
+    const impliedOdds = prob > 0 ? Math.round((1 / prob) * 100) / 100 : 0;
+    return {
+        match_id: match.id,
+        market,
+        outcome_key: outcomeKey,
+        outcome: outcomeLabel,
+        outcome_label: outcomeLabel,
+        odds: impliedOdds,
+        prob,
+        home_team: { name: match.home_team.name },
+        away_team: { name: match.away_team.name },
+    };
+}
+
+function MatchDetail({ match, onClose, canLog = false }) {
     const [marketData, setMarketData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [expandedReason, setExpandedReason] = useState(null);
+    const [pickToLog, setPickToLog] = useState(null);
+    const [logFlash, setLogFlash] = useState(false);
     const panelRef = useRef(null);
 
     useEffect(() => {
@@ -78,17 +134,22 @@ function MatchDetail({ match, onClose }) {
     const recommendedBets = getRecommendedBets(match);
 
     return (
+        // Fragment-wrap so LogBetModal is a SIBLING of the backdrop div, not a
+        // child — otherwise its bubble-up clicks reach `handleBackdropClick`
+        // (which uses panelRef.contains, and the modal isn't inside the panel)
+        // and close MatchDetail mid-submit, killing the POST without UI feedback.
+        <>
         <div
-            className="fixed inset-0 z-50 flex items-start justify-center bg-ink/40 backdrop-blur-sm overflow-y-auto p-4 animate-fade-in"
+            className="fixed inset-0 z-50 flex items-stretch sm:items-start justify-center bg-ink/40 backdrop-blur-sm overflow-y-auto sm:p-4 animate-fade-in"
             onClick={handleBackdropClick}
         >
             <div
                 ref={panelRef}
-                className="bg-paper border border-line w-full max-w-2xl my-8
+                className="bg-paper border-y sm:border border-line w-full max-w-2xl sm:my-8
                            shadow-[0_24px_60px_-20px_rgba(21,17,13,0.35)] animate-slide-in"
             >
                 {/* Header */}
-                <div className="bg-paper-tint p-6 border-b border-line">
+                <div className="bg-paper-tint p-4 sm:p-6 border-b border-line">
                     <div className="flex justify-between items-start gap-4">
                         <div>
                             <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted mb-3">
@@ -117,7 +178,7 @@ function MatchDetail({ match, onClose }) {
                 </div>
 
                 {/* Body */}
-                <div className="p-6 space-y-5">
+                <div className="p-4 sm:p-6 space-y-5">
                     {loading && (
                         <div className="text-center py-12">
                             <div className="inline-block w-3 h-3 bg-accent animate-pulse-soft rounded-full mb-3" />
@@ -139,18 +200,34 @@ function MatchDetail({ match, onClose }) {
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                     {recommendedBets.map((bet) => {
                                         const typeLabels = { best: 'Best bet', safest: 'Safest bet' };
+                                        // bet carries betMarket + betOutcomeKey from collectCandidates
+                                        const canLogThis = canLog && bet.betMarket && bet.betOutcomeKey;
                                         return (
                                             <div key={bet.type} className="border border-line p-4">
                                                 <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">
                                                     {typeLabels[bet.type] || bet.type}
                                                 </div>
                                                 <div className="display text-lg text-ink mb-2">{bet.label}</div>
-                                                <div className="flex items-baseline justify-between">
+                                                <div className="flex items-baseline justify-between gap-2">
                                                     <span className="mono text-sm text-ink font-medium">{formatPercentage(bet.prob)}</span>
                                                     <span className="mono text-[0.65rem] uppercase tracking-[0.1em] text-ink-muted">
                                                         @ {formatOdds(bet.prob)}
                                                     </span>
                                                 </div>
+                                                {canLogThis && (
+                                                    <button
+                                                        onClick={() => setPickToLog(makePick({
+                                                            match,
+                                                            market: bet.betMarket,
+                                                            outcomeKey: bet.betOutcomeKey,
+                                                            outcomeLabel: bet.label,
+                                                            prob: bet.prob,
+                                                        }))}
+                                                        className="mono text-[0.65rem] uppercase tracking-[0.1em] mt-3 px-2.5 py-1.5 border border-line text-ink-soft hover:text-paper hover:bg-ink hover:border-ink transition-colors cursor-pointer block w-full text-center"
+                                                    >
+                                                        Log bet →
+                                                    </button>
+                                                )}
                                                 {bet.reason && (
                                                     <>
                                                         <button
@@ -178,20 +255,42 @@ function MatchDetail({ match, onClose }) {
                             )}
 
                             <Section title="Match result" defaultOpen>
-                                <ResultBar prediction={marketData.match_result} match={match} />
+                                <ResultBar
+                                    prediction={marketData.match_result}
+                                    match={match}
+                                    canLog={canLog}
+                                    onLog={setPickToLog}
+                                />
                             </Section>
 
                             {marketData.double_chance && (
                                 <Section title="Double chance">
                                     <div className="grid grid-cols-3 gap-3">
-                                        {Object.entries(marketData.double_chance).map(([key, dc]) => (
-                                            <div key={key} className="border border-line p-3 text-center">
-                                                <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-accent mb-1">{key}</div>
-                                                <div className="display text-sm text-ink mb-1">{dc.description}</div>
-                                                <div className="mono text-sm text-ink font-medium">{formatPercentage(dc.probability)}</div>
-                                                <div className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-0.5">@ {dc.odds}</div>
-                                            </div>
-                                        ))}
+                                        {Object.entries(marketData.double_chance).map(([key, dc]) => {
+                                            const outcomeKey = key.toLowerCase();  // '1X' → '1x'
+                                            return (
+                                                <div key={key} className="border border-line p-3 text-center">
+                                                    <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-accent mb-1">{key}</div>
+                                                    <div className="display text-sm text-ink mb-1">{dc.description}</div>
+                                                    <div className="mono text-sm text-ink font-medium">{formatPercentage(dc.probability)}</div>
+                                                    <div className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-0.5">@ {dc.odds}</div>
+                                                    {canLog && (
+                                                        <button
+                                                            onClick={() => setPickToLog(makePick({
+                                                                match,
+                                                                market: 'double_chance',
+                                                                outcomeKey,
+                                                                outcomeLabel: dc.description,
+                                                                prob: dc.probability,
+                                                            }))}
+                                                            className="mono text-[0.6rem] uppercase tracking-[0.1em] mt-2 px-2 py-1 border border-line text-ink-soft hover:text-paper hover:bg-ink hover:border-ink transition-colors cursor-pointer w-full"
+                                                        >
+                                                            Log →
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 </Section>
                             )}
@@ -207,6 +306,10 @@ function MatchDetail({ match, onClose }) {
                                                     key={marketKey}
                                                     label={MARKET_LABELS[marketKey] || marketKey}
                                                     data={marketData.markets[marketKey]}
+                                                    frontendKey={marketKey}
+                                                    match={match}
+                                                    canLog={canLog}
+                                                    onLog={setPickToLog}
                                                 />
                                             ))}
                                         </div>
@@ -216,7 +319,12 @@ function MatchDetail({ match, onClose }) {
 
                             {marketData.combos && Object.keys(marketData.combos).length > 0 && (
                                 <Section title="Combo bets">
-                                    <ComboTable combos={marketData.combos} />
+                                    <ComboTable
+                                        combos={marketData.combos}
+                                        match={match}
+                                        canLog={canLog}
+                                        onLog={setPickToLog}
+                                    />
                                 </Section>
                             )}
                         </>
@@ -224,6 +332,27 @@ function MatchDetail({ match, onClose }) {
                 </div>
             </div>
         </div>
+
+        {pickToLog && (
+            <LogBetModal
+                pick={pickToLog}
+                defaultStake={100}
+                defaultOdds={pickToLog.odds}
+                onClose={() => setPickToLog(null)}
+                onLogged={() => {
+                    setPickToLog(null);
+                    setLogFlash(true);
+                    setTimeout(() => setLogFlash(false), 3000);
+                }}
+            />
+        )}
+
+        {logFlash && (
+            <div className="fixed bottom-6 right-6 z-[60] bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive">
+                Bet logged ✓
+            </div>
+        )}
+        </>
     );
 }
 
@@ -248,15 +377,35 @@ function Section({ title, children, defaultOpen = false }) {
     );
 }
 
-function ResultBar({ prediction, match }) {
+function ResultBar({ prediction, match, canLog = false, onLog }) {
     if (!prediction?.probabilities) return null;
     const { home_win, draw, away_win } = prediction.probabilities;
 
+    const handleLog = (outcomeKey, label, prob) => {
+        onLog?.(makePick({
+            match, market: 'h2h', outcomeKey, outcomeLabel: label, prob,
+        }));
+    };
+
     return (
         <div className="space-y-3">
-            <ProbBar label={match.home_team.short_name || match.home_team.name} prob={home_win} accent="ink" />
-            <ProbBar label="Draw" prob={draw} accent="muted" />
-            <ProbBar label={match.away_team.short_name || match.away_team.name} prob={away_win} accent="accent" />
+            <ProbBar
+                label={match.home_team.short_name || match.home_team.name}
+                prob={home_win} accent="ink"
+                canLog={canLog}
+                onLog={() => handleLog('home', `${match.home_team.name} Win`, home_win)}
+            />
+            <ProbBar
+                label="Draw" prob={draw} accent="muted"
+                canLog={canLog}
+                onLog={() => handleLog('draw', 'Draw', draw)}
+            />
+            <ProbBar
+                label={match.away_team.short_name || match.away_team.name}
+                prob={away_win} accent="accent"
+                canLog={canLog}
+                onLog={() => handleLog('away', `${match.away_team.name} Win`, away_win)}
+            />
 
             {prediction.odds && (
                 <div className="flex gap-4 pt-2 mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted border-t border-line mt-2">
@@ -269,7 +418,7 @@ function ResultBar({ prediction, match }) {
     );
 }
 
-function ProbBar({ label, prob, accent }) {
+function ProbBar({ label, prob, accent, canLog = false, onLog }) {
     // accent: 'ink' (home), 'muted' (draw), 'accent' (away)
     const barColor = {
         ink: 'bg-ink',
@@ -278,28 +427,40 @@ function ProbBar({ label, prob, accent }) {
     }[accent];
     return (
         <div className="flex items-center gap-3">
-            <span className="text-xs text-ink-soft w-28 truncate">{label}</span>
+            <span className="text-xs text-ink-soft w-20 sm:w-28 truncate">{label}</span>
             <div className="flex-1 bg-line h-[3px]">
                 <div className={`${barColor} h-full transition-all duration-500`} style={{ width: `${prob * 100}%` }} />
             </div>
             <span className="mono text-xs text-ink w-12 text-right font-medium">{formatPercentage(prob)}</span>
+            {canLog && (
+                <button
+                    onClick={onLog}
+                    title="Log this pick"
+                    className="mono text-[0.65rem] text-ink-muted hover:text-paper hover:bg-ink border border-line hover:border-ink w-6 h-6 leading-none flex items-center justify-center transition-colors cursor-pointer"
+                >
+                    +
+                </button>
+            )}
         </div>
     );
 }
 
-function MarketRow({ label, data }) {
+function MarketRow({ label, data, frontendKey, match, canLog = false, onLog }) {
     if (!data || data.error) return null;
 
     const probs = data.probabilities || {};
     const entries = Object.entries(probs);
     const best = entries.length > 0 ? entries.reduce((a, b) => b[1] > a[1] ? b : a) : null;
+    const backendMarket = backendMarketFor(frontendKey);
+    const loggable = canLog && backendMarket;
 
     return (
-        <div className="flex items-center justify-between py-2 px-3 bg-paper border border-line">
-            <span className="text-xs text-ink-soft">{label}</span>
-            <div className="flex items-center gap-3">
+        <div className="flex items-center justify-between py-2 px-3 bg-paper border border-line gap-2 flex-wrap">
+            <span className="text-xs text-ink-soft min-w-0">{label}</span>
+            <div className="flex items-center gap-3 flex-wrap">
                 {entries.map(([outcomeLabel, prob]) => {
                     const isBest = best && outcomeLabel === best[0];
+                    const outcomeKey = backendOutcomeFor(outcomeLabel);
                     return (
                         <div key={outcomeLabel} className="flex items-center gap-1">
                             <span className={`mono text-[0.6rem] uppercase tracking-[0.1em] ${isBest ? 'text-accent' : 'text-ink-muted'}`}>
@@ -308,6 +469,21 @@ function MarketRow({ label, data }) {
                             <span className={`mono text-xs ${isBest ? 'text-ink font-medium' : 'text-ink-muted'}`}>
                                 {formatPercentage(prob)}
                             </span>
+                            {loggable && (
+                                <button
+                                    onClick={() => onLog(makePick({
+                                        match,
+                                        market: backendMarket,
+                                        outcomeKey,
+                                        outcomeLabel: `${label}: ${outcomeLabel}`,
+                                        prob,
+                                    }))}
+                                    title="Log this pick"
+                                    className="mono text-[0.6rem] text-ink-muted hover:text-paper hover:bg-ink border border-line hover:border-ink w-5 h-5 leading-none flex items-center justify-center transition-colors cursor-pointer ml-0.5"
+                                >
+                                    +
+                                </button>
+                            )}
                         </div>
                     );
                 })}
@@ -316,7 +492,7 @@ function MarketRow({ label, data }) {
     );
 }
 
-function ComboTable({ combos }) {
+function ComboTable({ combos, match, canLog = false, onLog }) {
     const groups = {
         'Result + BTTS': [],
         'Result + Over/Under': [],
@@ -341,15 +517,32 @@ function ComboTable({ combos }) {
                 return (
                     <div key={title}>
                         <div className="mono text-[0.62rem] uppercase tracking-[0.15em] text-accent mb-2">{title}</div>
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                             {items.map(combo => (
                                 <div key={combo.key}
-                                    className="flex items-center justify-between py-2 px-3 bg-paper border border-line"
+                                    className="flex items-center justify-between py-2 px-3 bg-paper border border-line gap-2"
                                 >
-                                    <span className="text-xs text-ink-soft truncate mr-2">{combo.description}</span>
+                                    <span className="text-xs text-ink-soft truncate min-w-0">{combo.description}</span>
                                     <div className="flex items-center gap-2 shrink-0">
                                         <span className="mono text-xs text-ink font-medium">{formatPercentage(combo.probability)}</span>
                                         <span className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted">@ {combo.odds || '-'}</span>
+                                        {canLog && (
+                                            <button
+                                                onClick={() => onLog(makePick({
+                                                    match,
+                                                    market: 'compound',
+                                                    // Backend lowercases outcome_key on insert; combo
+                                                    // keys come in capitalised ('H_btts_yes').
+                                                    outcomeKey: combo.key.toLowerCase(),
+                                                    outcomeLabel: combo.description,
+                                                    prob: combo.probability,
+                                                }))}
+                                                title="Log this compound bet"
+                                                className="mono text-[0.6rem] text-ink-muted hover:text-paper hover:bg-ink border border-line hover:border-ink w-5 h-5 leading-none flex items-center justify-center transition-colors cursor-pointer"
+                                            >
+                                                +
+                                            </button>
+                                        )}
                                     </div>
                                 </div>
                             ))}

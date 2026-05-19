@@ -85,10 +85,10 @@ function SegmentDetail({ segment, onClose, onSelectBet }) {
             className="fixed inset-0 z-50 bg-ink/40 flex justify-end animate-fade-in"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
-            <div className="bg-paper w-full max-w-3xl border-l border-line overflow-y-auto animate-slide-in">
+            <div className="bg-paper w-full max-w-3xl sm:border-l border-line overflow-y-auto animate-slide-in">
                 {/* Header */}
                 <div className="sticky top-0 bg-paper/95 backdrop-blur-md border-b border-line z-10">
-                    <div className="px-6 py-4 flex items-start justify-between gap-4">
+                    <div className="px-4 sm:px-6 py-4 flex items-start justify-between gap-4">
                         <div>
                             <button
                                 onClick={onClose}
@@ -99,19 +99,19 @@ function SegmentDetail({ segment, onClose, onSelectBet }) {
                             <div className="eyebrow mb-1">
                                 {segment.type === 'market' ? 'Market drill' : 'League drill'}
                             </div>
-                            <h2 className="display text-3xl text-ink">
+                            <h2 className="display text-2xl sm:text-3xl text-ink">
                                 {segment.label}<span className="text-accent">.</span>
                             </h2>
                         </div>
                         <button
                             onClick={onClose}
-                            className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer"
+                            className="text-ink-muted hover:text-ink text-2xl leading-none cursor-pointer p-2 -m-2"
                             aria-label="Close"
                         >×</button>
                     </div>
                 </div>
 
-                <div className="px-6 py-6 space-y-6">
+                <div className="px-4 sm:px-6 py-5 sm:py-6 space-y-6">
                     {error && (
                         <div className="bg-paper-tint border-l-2 border-danger p-4">
                             <p className="text-ink-soft text-sm">{error}</p>
@@ -161,6 +161,7 @@ function computeSegmentPerf(bets) {
     }
     const settled = bets.filter(b => b.status === 'won' || b.status === 'lost');
     const pending = bets.filter(b => b.status === 'pending');
+    const voids = bets.filter(b => b.status === 'void');
     const won = settled.filter(b => b.status === 'won');
     const totalStake = settled.reduce((s, b) => s + (b.stake || 0), 0);
     const totalPl = settled.reduce((s, b) => s + (b.profit_loss || 0), 0);
@@ -178,6 +179,7 @@ function computeSegmentPerf(bets) {
         total_bets: bets.length,
         settled_count: settled.length,
         pending_count: pending.length,
+        void_count: voids.length,
         won_count: won.length,
         total_stake: totalStake,
         total_profit_loss: totalPl,

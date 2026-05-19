@@ -519,12 +519,20 @@ function ValueBets({ onSelectMatch }) {
 export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged }) {
     const [stake, setStake] = useState(defaultStake);
     // Odds at-bet is editable so the user can override Pinnacle's median with
-    // the actual NT price they got. Default to NT odds if caller pre-filled
-    // them, otherwise the pick's best/median.
-    const [odds, setOdds] = useState(defaultOdds ?? pick.odds);
+    // the actual NT price they got. Round to 2 decimals on init so
+    // model-implied odds (1/0.828 = 1.207894...) don't render with 16
+    // decimal digits in the number input.
+    const [odds, setOdds] = useState(() => {
+        const initial = defaultOdds ?? pick.odds ?? 0;
+        return Math.round(initial * 100) / 100;
+    });
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState(null);
+    // Inline bet-token input — surfaces only when the backend rejects with
+    // Unauthorized. Saving here writes to the same localStorage slot api.js
+    // reads, so the next submit retry carries the header.
+    const [tokenInput, setTokenInput] = useState('');
 
     const handleSubmit = async () => {
         if (!stake || stake <= 0) {
@@ -586,10 +594,10 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged
 
     return (
         <div
-            className="fixed inset-0 z-50 bg-ink/60 flex items-center justify-center p-4"
+            className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
-            <div className="bg-paper w-full max-w-md border border-line">
+            <div className="bg-paper w-full max-w-md border-y sm:border border-line">
                 <div className="flex items-start justify-between px-5 py-4 border-b border-line">
                     <div>
                         <div className="eyebrow mb-1">Log paper bet</div>
@@ -668,6 +676,38 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged
 
                     {error && (
                         <div className="text-danger text-sm">{error}</div>
+                    )}
+
+                    {/* If the backend rejected on auth, give the operator an
+                        inline place to paste their X-Bet-Token. Saving writes
+                        to the same localStorage slot api.js reads, so the
+                        next Log bet click carries the header. Without this,
+                        the only fix is editing the URL with ?bet_token=… */}
+                    {error && /unauthor/i.test(error) && (
+                        <div className="bg-paper-tint border-l-2 border-danger px-3 py-3 space-y-2">
+                            <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-ink-muted">
+                                Paste your bet-write token
+                            </div>
+                            <input
+                                type="password"
+                                value={tokenInput}
+                                onChange={(e) => setTokenInput(e.target.value)}
+                                placeholder="X-Bet-Token value from backend .env"
+                                className="w-full bg-paper border border-line px-2 py-1.5 mono text-xs text-ink focus:outline-none focus:border-accent"
+                            />
+                            <button
+                                onClick={() => {
+                                    if (!tokenInput) return;
+                                    localStorage.setItem('fmp.bet_token', tokenInput);
+                                    setError(null);
+                                    setTokenInput('');
+                                }}
+                                disabled={!tokenInput}
+                                className="mono text-[0.65rem] uppercase tracking-[0.1em] px-3 py-1.5 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer disabled:opacity-40"
+                            >
+                                Save & retry
+                            </button>
+                        </div>
                     )}
                 </div>
 

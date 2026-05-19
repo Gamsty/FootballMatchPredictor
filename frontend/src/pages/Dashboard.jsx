@@ -22,7 +22,7 @@ import FilterBar from '../components/FilterBar';
 import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
-import ValueBets from '../components/ValueBets';
+import ValueBets, { LogBetModal } from '../components/ValueBets';
 import BestOfWeek, { LogComboModal } from '../components/BestOfWeek';
 import CalibrationView from '../components/CalibrationView';
 import PerformanceHub from '../components/PerformanceHub';
@@ -69,7 +69,19 @@ function Dashboard() {
     const [selectedMatch, setSelectedMatch] = useState(null);
     const [showAbout, setShowAbout] = useState(false);
     const [showCalibration, setShowCalibration] = useState(false);
-    const advancedMode = readAdvancedMode();
+    // Advanced mode is sticky to localStorage. Held in state so the toggle
+    // in the meta-links bar can flip it without a full page reload — the
+    // old read-once-on-mount pattern made the URL the only way to toggle.
+    const [advancedMode, setAdvancedMode] = useState(readAdvancedMode);
+    const toggleAdvanced = () => {
+        const next = !advancedMode;
+        if (next) {
+            localStorage.setItem(ADVANCED_STORAGE_KEY, '1');
+        } else {
+            localStorage.removeItem(ADVANCED_STORAGE_KEY);
+        }
+        setAdvancedMode(next);
+    };
     const [filters, setFilters] = useState({
         categories: [],
     });
@@ -80,6 +92,9 @@ function Dashboard() {
     // Holds the in-flight combo when user clicks "Log accumulator" — drives
     // the LogComboModal. null when no modal is open.
     const [comboToLog, setComboToLog] = useState(null);
+    // Same for the 1-leg case — accumulator with a single selection logs
+    // as a single bet via LogBetModal instead of /api/bets/combo.
+    const [pickToLog, setPickToLog] = useState(null);
     const [comboLogged, setComboLogged] = useState(false);
 
     // Fetch all matches for the next 7 days. Tab filtering happens client-side
@@ -209,22 +224,24 @@ function Dashboard() {
     const accResult = calculateAccumulator(accumulator, stake);
 
     return (
-        <div className="max-w-6xl mx-auto px-6 lg:px-10 py-10 sm:py-14">
-            {/* Hero */}
-            <section className="mb-10">
-                <div className="eyebrow mb-4">Today's slate</div>
-                <h1 className="display text-[2.5rem] sm:text-5xl md:text-6xl font-light leading-[0.95] mb-5">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-10 py-6 sm:py-14">
+            {/* Hero — display tightens on phone but keeps the editorial weight.
+                Lead paragraph reads as a single column on mobile vs ~60ch on
+                desktop. Meta-links bar uses flex-wrap so it doesn't overflow. */}
+            <section className="mb-8 sm:mb-10">
+                <div className="eyebrow mb-3 sm:mb-4">Today's slate</div>
+                <h1 className="display text-[2rem] sm:text-5xl md:text-6xl font-light leading-[0.95] mb-4 sm:mb-5">
                     Match
                     <span className="display-italic"> predictions</span>
                     <span className="text-accent">.</span>
                 </h1>
-                <p className="text-ink-soft text-base sm:text-lg max-w-2xl leading-relaxed font-light">
+                <p className="text-ink-soft text-sm sm:text-lg max-w-2xl leading-relaxed font-light">
                     Powered by a <span className="text-ink font-medium">stacked-ensemble</span> model
                     (XGBoost + RandomForest) trained on{' '}
                     <span className="text-ink font-medium">40,000+ historical matches</span> across nine
                     leagues. Retrained nightly on Azure with AUC validation against production.
                 </p>
-                <div className="flex items-center gap-3 mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
+                <div className="flex items-center flex-wrap gap-x-3 gap-y-2 mt-5 sm:mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
                     {/* The 'shown' counter is for the match-grid tabs only. Hide on Value,
                         Best Picks, and Performance because those have their own toolbars. */}
                     {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && (
@@ -257,6 +274,22 @@ function Dashboard() {
                     >
                         <span className="border-b border-ink-muted/40 hover:border-ink">Performance</span>
                         <span aria-hidden="true">→</span>
+                    </button>
+                    <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
+                    <button
+                        onClick={toggleAdvanced}
+                        title={advancedMode
+                            ? 'Advanced mode is ON — logging, Value tab, and Performance delete enabled. Click to turn off.'
+                            : 'Advanced mode is OFF — logging and bet management hidden. Click to turn on.'}
+                        className={
+                            'inline-flex items-center gap-1.5 px-2 py-0.5 border transition-colors cursor-pointer ' +
+                            (advancedMode
+                                ? 'bg-ink text-paper border-ink hover:bg-accent hover:border-accent'
+                                : 'border-line text-ink-muted hover:text-ink hover:border-ink-muted')
+                        }
+                    >
+                        <span>ADV</span>
+                        <span aria-hidden="true">{advancedMode ? '●' : '○'}</span>
                     </button>
                 </div>
             </section>
@@ -294,78 +327,111 @@ function Dashboard() {
             {/* Filters */}
             <FilterBar filters={filters} onFilterChange={setFilters} />
 
-            {/* Accumulator Bar */}
+            {/* Accumulator Bar — collapses tighter on mobile so it doesn't
+                eat the entire viewport while the user is still picking. */}
             {accumulator.length > 0 && (
-                <div className="bg-paper-tint border-l-2 border-accent p-5 mb-8">
-                    <div className="flex items-center justify-between mb-4">
+                <div className="bg-paper-tint border-l-2 border-accent p-3 sm:p-5 mb-6 sm:mb-8">
+                    <div className="flex items-center justify-between mb-3 sm:mb-4">
                         <div>
                             <div className="eyebrow">Accumulator</div>
-                            <div className="display text-base text-ink mt-1">
+                            <div className="display text-sm sm:text-base text-ink mt-1">
                                 {accumulator.length} {accumulator.length === 1 ? 'selection' : 'selections'} stacked.
                             </div>
                         </div>
                         <button
                             onClick={() => setAccumulator([])}
-                            className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted hover:text-accent transition-colors cursor-pointer"
+                            className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted hover:text-accent transition-colors cursor-pointer py-1"
                         >
                             Clear all
                         </button>
                     </div>
 
                     {/* Selections */}
-                    <div className="space-y-1.5 mb-4">
+                    <div className="space-y-1.5 mb-3 sm:mb-4">
                         {accumulator.map(sel => (
-                            <div key={sel.matchId} className="flex items-center justify-between py-2 px-3 bg-paper border border-line">
-                                <div className="flex items-center gap-3">
+                            <div key={sel.matchId} className="flex items-center justify-between py-2 px-3 bg-paper border border-line gap-2">
+                                <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
                                     <button
                                         onClick={() => setAccumulator(prev => prev.filter(s => s.matchId !== sel.matchId))}
-                                        className="text-ink-muted hover:text-accent text-base leading-none transition-colors cursor-pointer"
+                                        className="text-ink-muted hover:text-accent text-lg leading-none transition-colors cursor-pointer flex-shrink-0"
                                         aria-label="Remove selection"
                                     >×</button>
-                                    <span className="text-sm text-ink-soft">{sel.homeTeam} <span className="text-ink-muted">vs</span> {sel.awayTeam}</span>
+                                    <span className="text-xs sm:text-sm text-ink-soft truncate">
+                                        {sel.homeTeam} <span className="text-ink-muted">vs</span> {sel.awayTeam}
+                                    </span>
                                 </div>
-                                <div className="flex items-center gap-3">
-                                    <span className="text-sm text-ink font-medium">{sel.label}</span>
-                                    <span className="mono text-xs text-ink-muted">@ {formatOdds(sel.prob)}</span>
+                                <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
+                                    <span className="text-xs sm:text-sm text-ink font-medium">{sel.label}</span>
+                                    <span
+                                        className="mono text-[0.65rem] sm:text-xs text-ink-muted cursor-help border-b border-dotted border-ink-muted/30"
+                                        title="Model-implied odds (1/probability). The actual NT price is usually lower — log the bet to enter your real NT odds."
+                                    >
+                                        @ {formatOdds(sel.prob)}
+                                    </span>
                                 </div>
                             </div>
                         ))}
                     </div>
 
-                    {/* Stake + Returns */}
-                    <div className="flex items-center gap-3 pt-4 border-t border-line flex-wrap">
+                    {/* Stake + Returns. Single-selection drops the "combined"
+                        framing — it's just the leg odds — and labels the price
+                        as 'model' so the operator knows it's implied-from-prob,
+                        not their NT odds. */}
+                    <div className="flex items-center gap-3 pt-3 sm:pt-4 border-t border-line flex-wrap">
                         <div className="flex items-center gap-2">
                             <span className="eyebrow">Stake</span>
                             <input
                                 type="number"
+                                inputMode="numeric"
                                 value={stake}
                                 onChange={(e) => setStake(Math.max(0, Number(e.target.value)))}
-                                className="w-24 bg-paper border border-line px-2 py-1 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
+                                className="w-20 sm:w-24 bg-paper border border-line px-2 py-1 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                             />
                             <span className="mono text-xs text-ink-muted">NOK</span>
                         </div>
                         <div className="flex-1" />
                         <div className="text-right">
-                            <div className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
-                                Combined odds: <span className="text-ink">{accResult.totalOdds}</span>
+                            <div className="mono text-[0.6rem] sm:text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
+                                {accumulator.length === 1
+                                    ? <>Model odds: <span className="text-ink">{accResult.totalOdds}</span></>
+                                    : <>Combined odds: <span className="text-ink">{accResult.totalOdds}</span></>
+                                }
                             </div>
-                            <div className="display text-lg text-accent mt-0.5">
+                            <div className="display text-base sm:text-lg text-accent mt-0.5">
                                 {accResult.potentialReturn.toLocaleString()} NOK
-                                <span className="mono text-xs text-accent-soft ml-2">+{accResult.profit.toLocaleString()}</span>
+                                <span className="mono text-[0.65rem] sm:text-xs text-accent-soft ml-2">+{accResult.profit.toLocaleString()}</span>
                             </div>
                         </div>
-                        {/* Log as a real combo bet — only when advanced mode is on
-                            and we have 2+ legs. Every selection in `accumulator`
-                            now carries the backend-compatible market/outcomeKey
-                            (see toggleAccumulator). */}
-                        {advancedMode && accumulator.length >= 2 && (
+                        {/* Log button — advanced-mode only. Single leg routes to
+                            POST /api/bets via LogBetModal, 2+ legs routes to
+                            POST /api/bets/combo via LogComboModal. Every selection
+                            in `accumulator` carries the backend-compatible
+                            market/outcomeKey (see toggleAccumulator). */}
+                        {advancedMode && accumulator.length >= 1 && (
                             <button
                                 onClick={() => {
-                                    // Filter out any old selections that pre-date the
-                                    // market/outcomeKey wiring — they'd 400 on the backend.
                                     const loggable = accumulator.filter(s => s.market && s.outcomeKey);
-                                    if (loggable.length < 2) {
-                                        alert('Add 2+ picks via match cards to log as a combo.');
+                                    if (loggable.length === 0) {
+                                        alert('No loggable picks — re-add via match cards.');
+                                        return;
+                                    }
+                                    if (loggable.length === 1) {
+                                        const sel = loggable[0];
+                                        setPickToLog({
+                                            pick: {
+                                                match_id: sel.matchId,
+                                                market: sel.market,
+                                                outcome_key: sel.outcomeKey,
+                                                outcome: sel.label,
+                                                outcome_label: sel.label,
+                                                odds: sel.odds || (1 / sel.prob),
+                                                prob: sel.prob,
+                                                home_team: { name: sel.homeTeam },
+                                                away_team: { name: sel.awayTeam },
+                                            },
+                                            defaultStake: stake || 100,
+                                            defaultOdds: sel.odds || (1 / sel.prob),
+                                        });
                                         return;
                                     }
                                     const combinedProb = loggable.reduce((acc, s) => acc * s.prob, 1);
@@ -390,9 +456,9 @@ function Dashboard() {
                                     });
                                 }}
                                 className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer"
-                                title="Log this accumulator as a tracked combo bet"
+                                title="Log this selection as a tracked bet"
                             >
-                                Log accumulator
+                                {accumulator.length === 1 ? 'Log bet' : 'Log accumulator'}
                             </button>
                         )}
                     </div>
@@ -500,6 +566,7 @@ function Dashboard() {
                 <MatchDetail
                     match={selectedMatch}
                     onClose={() => setSelectedMatch(null)}
+                    canLog={advancedMode}
                 />
             )}
 
@@ -508,6 +575,22 @@ function Dashboard() {
 
             {/* Calibration Modal */}
             {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
+
+            {/* Single-leg log path — reused from ValueBets. */}
+            {pickToLog && (
+                <LogBetModal
+                    pick={pickToLog.pick}
+                    defaultStake={pickToLog.defaultStake}
+                    defaultOdds={pickToLog.defaultOdds}
+                    onClose={() => setPickToLog(null)}
+                    onLogged={() => {
+                        setComboLogged(true);  // reuse the toast — same UX
+                        setPickToLog(null);
+                        setAccumulator([]);
+                        setTimeout(() => setComboLogged(false), 3000);
+                    }}
+                />
+            )}
 
             {/* Reused from Best Picks — same modal, same POST endpoint. */}
             {comboToLog && (
@@ -525,7 +608,7 @@ function Dashboard() {
 
             {comboLogged && (
                 <div className="fixed bottom-6 right-6 z-50 bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive">
-                    Combo logged ✓
+                    Bet logged ✓
                 </div>
             )}
         </div>

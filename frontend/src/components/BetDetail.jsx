@@ -30,15 +30,15 @@ function BetDetail({ bet, onClose, onDelete }) {
 
     return (
         <div
-            className="fixed inset-0 z-[60] bg-ink/60 flex items-start sm:items-center justify-center p-4 overflow-y-auto animate-fade-in"
+            className="fixed inset-0 z-[60] bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto animate-fade-in"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
-            <div className="bg-paper w-full max-w-2xl my-8 border border-line animate-slide-in" style={{ boxShadow: 'var(--shadow-modal)' }}>
+            <div className="bg-paper w-full max-w-2xl sm:my-8 border-y sm:border border-line animate-slide-in" style={{ boxShadow: 'var(--shadow-modal)' }}>
                 {/* Header */}
-                <div className="flex items-start justify-between px-6 py-4 border-b border-line">
+                <div className="flex items-start justify-between px-4 sm:px-6 py-4 border-b border-line">
                     <div>
                         <div className="eyebrow mb-1">Bet #{bet.id} · {bet.status}</div>
-                        <h2 className="display text-2xl text-ink">
+                        <h2 className="display text-xl sm:text-2xl text-ink">
                             {isCombo
                                 ? <>{bet.combo_legs.length}-leg combo<span className="text-accent">.</span></>
                                 : <>{m?.home} <span className="text-ink-muted">vs</span> {m?.away}<span className="text-accent">.</span></>
@@ -63,7 +63,7 @@ function BetDetail({ bet, onClose, onDelete }) {
                 </div>
 
                 {/* Body */}
-                <div className="px-6 py-6 space-y-6">
+                <div className="px-4 sm:px-6 py-5 sm:py-6 space-y-5 sm:space-y-6">
                     {/* Pick */}
                     <Section label="Pick">
                         {isCombo ? (

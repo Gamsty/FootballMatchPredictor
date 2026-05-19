@@ -26,7 +26,7 @@ function FilterBar({ filters, onFilterChange }) {
                         key={key}
                         onClick={() => toggleCategory(key)}
                         className={
-                            "mono text-[0.65rem] uppercase tracking-[0.12em] px-3 py-1.5 border transition-all duration-150 cursor-pointer " +
+                            "mono text-[0.65rem] uppercase tracking-[0.12em] px-3 py-2 sm:py-1.5 border transition-all duration-150 cursor-pointer " +
                             (isActive
                                 ? "bg-ink text-paper border-ink"
                                 : "bg-transparent text-ink-muted border-line hover:border-ink hover:text-ink-soft")
