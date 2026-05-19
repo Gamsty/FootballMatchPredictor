@@ -23,9 +23,9 @@ import CategoryTabs from '../components/CategoryTabs';
 import MatchDetail from '../components/MatchDetail';
 import AboutModel from '../components/AboutModel';
 import ValueBets from '../components/ValueBets';
-import BestOfWeek from '../components/BestOfWeek';
+import BestOfWeek, { LogComboModal } from '../components/BestOfWeek';
 import CalibrationView from '../components/CalibrationView';
-import BetsView from '../components/BetsView';
+import PerformanceHub from '../components/PerformanceHub';
 import RecentROI from '../components/RecentROI';
 import {
     isToday, COMPETITION_LABELS, formatOdds,
@@ -69,7 +69,6 @@ function Dashboard() {
     const [selectedMatch, setSelectedMatch] = useState(null);
     const [showAbout, setShowAbout] = useState(false);
     const [showCalibration, setShowCalibration] = useState(false);
-    const [showBets, setShowBets] = useState(false);
     const advancedMode = readAdvancedMode();
     const [filters, setFilters] = useState({
         categories: [],
@@ -78,6 +77,10 @@ function Dashboard() {
     // Accumulator state
     const [accumulator, setAccumulator] = useState([]);
     const [stake, setStake] = useState(100);
+    // Holds the in-flight combo when user clicks "Log accumulator" — drives
+    // the LogComboModal. null when no modal is open.
+    const [comboToLog, setComboToLog] = useState(null);
+    const [comboLogged, setComboLogged] = useState(false);
 
     // Fetch all matches for the next 7 days. Tab filtering happens client-side
     // (see filteredMatches below), so the fetch itself doesn't depend on activeTab.
@@ -186,6 +189,18 @@ function Dashboard() {
                     awayTeam: match.away_team.short_name || match.away_team.name,
                     label: bet.label,
                     prob: bet.prob,
+                    // Backend-compatible market identifiers from collectCandidates.
+                    // The accumulator-as-bet log path on /api/bets/combo needs these;
+                    // older selections (before constants.js carried betMarket) won't
+                    // be loggable until re-added, but that's fine — they only live
+                    // in component state and die on reload.
+                    market: bet.betMarket,
+                    outcomeKey: bet.betOutcomeKey,
+                    // Implied odds from model probability — only fair if the picker
+                    // wants to track the model's own prediction. For real bets at
+                    // a bookmaker you'd want NT odds, but the log modal lets you
+                    // override per-leg stake (whole combo) so this is the baseline.
+                    odds: bet.prob ? 1 / bet.prob : null,
                 },
             ]);
         }
@@ -210,9 +225,9 @@ function Dashboard() {
                     leagues. Retrained nightly on Azure with AUC validation against production.
                 </p>
                 <div className="flex items-center gap-3 mt-6 mono text-[0.7rem] uppercase tracking-[0.12em] text-ink-muted">
-                    {/* The 'shown' counter is for the match-grid tabs only. Hide on Value
-                        and Best Picks because those have their own counters in their toolbars. */}
-                    {activeTab !== 'value' && activeTab !== 'best' && (
+                    {/* The 'shown' counter is for the match-grid tabs only. Hide on Value,
+                        Best Picks, and Performance because those have their own toolbars. */}
+                    {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && (
                         <>
                             <span>{filteredMatches.length} shown</span>
                             <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
@@ -236,11 +251,11 @@ function Dashboard() {
                     </button>
                     <span className="w-1 h-1 rounded-full bg-ink-muted/40" />
                     <button
-                        onClick={() => setShowBets(true)}
+                        onClick={() => setActiveTab('performance')}
                         className="text-ink-soft hover:text-ink transition-colors inline-flex items-center gap-1.5 cursor-pointer"
                         title="Bet log + ROI / CLV tracking. Read-only for visitors; advanced mode enables logging & deletion."
                     >
-                        <span className="border-b border-ink-muted/40 hover:border-ink">Bets</span>
+                        <span className="border-b border-ink-muted/40 hover:border-ink">Performance</span>
                         <span aria-hidden="true">→</span>
                     </button>
                 </div>
@@ -268,8 +283,13 @@ function Dashboard() {
                 <ValueBets onSelectMatch={setSelectedMatch} />
             )}
 
+            {/* Performance tab — bet tracking + ROI / CLV / segment breakdowns */}
+            {activeTab === 'performance' && (
+                <PerformanceHub canEdit={advancedMode} />
+            )}
+
             {/* Match-grid view (today + upcoming tabs) */}
-            {activeTab !== 'value' && activeTab !== 'best' && (
+            {activeTab !== 'value' && activeTab !== 'best' && activeTab !== 'performance' && (
             <>
             {/* Filters */}
             <FilterBar filters={filters} onFilterChange={setFilters} />
@@ -313,7 +333,7 @@ function Dashboard() {
                     </div>
 
                     {/* Stake + Returns */}
-                    <div className="flex items-center gap-3 pt-4 border-t border-line">
+                    <div className="flex items-center gap-3 pt-4 border-t border-line flex-wrap">
                         <div className="flex items-center gap-2">
                             <span className="eyebrow">Stake</span>
                             <input
@@ -334,6 +354,47 @@ function Dashboard() {
                                 <span className="mono text-xs text-accent-soft ml-2">+{accResult.profit.toLocaleString()}</span>
                             </div>
                         </div>
+                        {/* Log as a real combo bet — only when advanced mode is on
+                            and we have 2+ legs. Every selection in `accumulator`
+                            now carries the backend-compatible market/outcomeKey
+                            (see toggleAccumulator). */}
+                        {advancedMode && accumulator.length >= 2 && (
+                            <button
+                                onClick={() => {
+                                    // Filter out any old selections that pre-date the
+                                    // market/outcomeKey wiring — they'd 400 on the backend.
+                                    const loggable = accumulator.filter(s => s.market && s.outcomeKey);
+                                    if (loggable.length < 2) {
+                                        alert('Add 2+ picks via match cards to log as a combo.');
+                                        return;
+                                    }
+                                    const combinedProb = loggable.reduce((acc, s) => acc * s.prob, 1);
+                                    const combinedOdds = loggable.reduce((acc, s) => acc * (s.odds || (1 / s.prob)), 1);
+                                    setComboToLog({
+                                        legs: loggable.map(sel => ({
+                                            match_id: sel.matchId,
+                                            market: sel.market,
+                                            outcome_key: sel.outcomeKey,
+                                            outcome: sel.label,
+                                            odds: sel.odds || (1 / sel.prob),
+                                            prob: sel.prob,
+                                            // LogComboModal preview reads .name / .short_name,
+                                            // wrap the plain strings the accumulator stores.
+                                            home_team: { name: sel.homeTeam },
+                                            away_team: { name: sel.awayTeam },
+                                        })),
+                                        combinedOdds,
+                                        combinedProb,
+                                        combinedEdge: combinedProb * combinedOdds - 1,
+                                        defaultStake: stake || 100,
+                                    });
+                                }}
+                                className="mono text-[0.7rem] uppercase tracking-[0.1em] px-3 py-2 bg-ink text-paper border border-ink hover:bg-accent hover:border-accent transition-colors cursor-pointer"
+                                title="Log this accumulator as a tracked combo bet"
+                            >
+                                Log accumulator
+                            </button>
+                        )}
                     </div>
                 </div>
             )}
@@ -448,8 +509,25 @@ function Dashboard() {
             {/* Calibration Modal */}
             {showCalibration && <CalibrationView onClose={() => setShowCalibration(false)} />}
 
-            {/* Bets Modal — advanced mode only */}
-            {showBets && <BetsView onClose={() => setShowBets(false)} canEdit={advancedMode} />}
+            {/* Reused from Best Picks — same modal, same POST endpoint. */}
+            {comboToLog && (
+                <LogComboModal
+                    summary={comboToLog}
+                    onClose={() => setComboToLog(null)}
+                    onLogged={() => {
+                        setComboLogged(true);
+                        setComboToLog(null);
+                        setAccumulator([]);   // empty the slip after successful log
+                        setTimeout(() => setComboLogged(false), 3000);
+                    }}
+                />
+            )}
+
+            {comboLogged && (
+                <div className="fixed bottom-6 right-6 z-50 bg-paper border border-positive px-4 py-2 mono text-[0.7rem] uppercase tracking-[0.12em] text-positive">
+                    Combo logged ✓
+                </div>
+            )}
         </div>
     );
 }

@@ -38,3 +38,10 @@ dist/
 *.db
 *.sqlite
 *.dump
+
+# Claude Code — local agent state, skills, worktrees, memory, settings.
+# Project-level Claude config stays per-machine, not shared via git.
+.claude/
+CLAUDE.md
+.clauderc
+.claudeignore

@@ -250,7 +250,6 @@ function LogCompoundModal({ summary, onClose, onLogged }) {
     const { match, best, defaultOdds } = summary;
     const [odds, setOdds] = useState(defaultOdds);
     const [stake, setStake] = useState(100);
-    const [bookmaker, setBookmaker] = useState('Norsk Tipping');
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState(null);
@@ -268,7 +267,8 @@ function LogCompoundModal({ summary, onClose, onLogged }) {
                 outcome_label: best.description,
                 odds_at_bet: Number(odds),
                 stake: Number(stake),
-                bookmaker: bookmaker || null,
+                // Single-bookmaker operator — always NT.
+                bookmaker: 'Norsk Tipping',
                 model_prob_at_bet: best.probability,
                 edge_at_bet: (best.probability * Number(odds)) - 1,
                 notes: notes || null,
@@ -325,7 +325,7 @@ function LogCompoundModal({ summary, onClose, onLogged }) {
                     </div>
 
                     <div>
-                        <label className="eyebrow block mb-1">Odds (typically NT odds)</label>
+                        <label className="eyebrow block mb-1">NT odds</label>
                         <input
                             type="number"
                             min="1.01"
@@ -346,16 +346,6 @@ function LogCompoundModal({ summary, onClose, onLogged }) {
                             onChange={(e) => setStake(Number(e.target.value))}
                             className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                             autoFocus
-                        />
-                    </div>
-
-                    <div>
-                        <label className="eyebrow block mb-1">Bookmaker</label>
-                        <input
-                            type="text"
-                            value={bookmaker}
-                            onChange={(e) => setBookmaker(e.target.value)}
-                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                         />
                     </div>
 

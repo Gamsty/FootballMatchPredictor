@@ -593,7 +593,6 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                                                         // modal with those — that's the actual price they're
                                                         // betting on. Falls back to Pinnacle median odds.
                                                         defaultOdds: ntOdds[logKey] ?? p.odds,
-                                                        defaultBookmaker: ntOdds[logKey] != null ? 'Norsk Tipping' : p.bookmaker,
                                                     })}
                                                     className="mono text-[0.65rem] uppercase tracking-[0.12em] px-2 py-1 border border-line text-ink-soft hover:text-ink hover:border-ink-muted transition-colors cursor-pointer"
                                                 >
@@ -620,7 +619,6 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                     pick={pickToLog.pick}
                     defaultStake={pickToLog.defaultStake}
                     defaultOdds={pickToLog.defaultOdds}
-                    defaultBookmaker={pickToLog.defaultBookmaker}
                     onClose={() => setPickToLog(null)}
                     onLogged={() => {
                         setLogStatus(prev => ({ ...prev, [pickKey(pickToLog.pick)]: 'logged' }));
@@ -670,12 +668,12 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
 // ---------------------------------------------------------------------------
 // LogComboModal — confirms a multi-leg combo before POSTing to /api/bets/combo.
 // Stake defaults to ¼-Kelly recommendation from the parent; user can override.
+// Exported so Dashboard's legacy accumulator can reuse the same modal.
 // ---------------------------------------------------------------------------
 
-function LogComboModal({ summary, onClose, onLogged }) {
+export function LogComboModal({ summary, onClose, onLogged }) {
     const { legs, combinedOdds, combinedProb, combinedEdge, defaultStake } = summary;
     const [stake, setStake] = useState(defaultStake);
-    const [bookmaker, setBookmaker] = useState('Norsk Tipping');
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState(null);
@@ -698,7 +696,9 @@ function LogComboModal({ summary, onClose, onLogged }) {
                     prob: l.prob,
                 })),
                 stake: Number(stake),
-                bookmaker: bookmaker || null,
+                // Single-bookmaker operator — always NT. Field removed from
+                // the UI; if a non-NT bet needs logging, do it via API.
+                bookmaker: 'Norsk Tipping',
                 notes: notes || null,
                 placed_via: 'frontend',
             });
@@ -771,17 +771,6 @@ function LogComboModal({ summary, onClose, onLogged }) {
                             onChange={(e) => setStake(Number(e.target.value))}
                             className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                             autoFocus
-                        />
-                    </div>
-
-                    <div>
-                        <label className="eyebrow block mb-1">Bookmaker</label>
-                        <input
-                            type="text"
-                            value={bookmaker}
-                            onChange={(e) => setBookmaker(e.target.value)}
-                            placeholder="Norsk Tipping"
-                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                         />
                     </div>
 

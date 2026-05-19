@@ -179,17 +179,23 @@ const collectCandidates = (match) => {
     const candidates = [];
     const p = match.prediction.probabilities;
 
+    // Each candidate carries BOTH the display field `market` (used for the
+    // bet-reason copy-writing) AND `betMarket` / `betOutcomeKey` — the
+    // backend-compatible identifiers from _BET_OUTCOME_RESOLVERS. The
+    // Dashboard accumulator passes betMarket/betOutcomeKey straight to
+    // POST /api/bets/combo so the operator can log the assembled coupon.
+
     // Match result
-    candidates.push({ label: 'Home Win', prob: p.home_win, market: 'result' });
-    candidates.push({ label: 'Away Win', prob: p.away_win, market: 'result' });
-    candidates.push({ label: 'Draw', prob: p.draw, market: 'result' });
+    candidates.push({ label: 'Home Win', prob: p.home_win, market: 'result', betMarket: 'h2h',     betOutcomeKey: 'home' });
+    candidates.push({ label: 'Away Win', prob: p.away_win, market: 'result', betMarket: 'h2h',     betOutcomeKey: 'away' });
+    candidates.push({ label: 'Draw',     prob: p.draw,     market: 'result', betMarket: 'h2h',     betOutcomeKey: 'draw' });
 
     // Double chance
     if (match.double_chance) {
         const dc = match.double_chance;
-        if (dc['1X']?.probability) candidates.push({ label: 'Home or Draw', prob: dc['1X'].probability, market: 'double_chance' });
-        if (dc['X2']?.probability) candidates.push({ label: 'Draw or Away', prob: dc['X2'].probability, market: 'double_chance' });
-        if (dc['12']?.probability) candidates.push({ label: 'Home or Away', prob: dc['12'].probability, market: 'double_chance' });
+        if (dc['1X']?.probability) candidates.push({ label: 'Home or Draw', prob: dc['1X'].probability, market: 'double_chance', betMarket: 'double_chance', betOutcomeKey: '1x' });
+        if (dc['X2']?.probability) candidates.push({ label: 'Draw or Away', prob: dc['X2'].probability, market: 'double_chance', betMarket: 'double_chance', betOutcomeKey: 'x2' });
+        if (dc['12']?.probability) candidates.push({ label: 'Home or Away', prob: dc['12'].probability, market: 'double_chance', betMarket: 'double_chance', betOutcomeKey: '12' });
     }
 
     // BTTS
@@ -197,19 +203,21 @@ const collectCandidates = (match) => {
     if (markets.btts?.probabilities) {
         const yp = markets.btts.probabilities['Yes'] || 0;
         const np = markets.btts.probabilities['No'] || 0;
-        if (yp > 0) candidates.push({ label: 'BTTS Yes', prob: yp, market: 'btts' });
-        if (np > 0) candidates.push({ label: 'BTTS No', prob: np, market: 'btts' });
+        if (yp > 0) candidates.push({ label: 'BTTS Yes', prob: yp, market: 'btts', betMarket: 'btts', betOutcomeKey: 'yes' });
+        if (np > 0) candidates.push({ label: 'BTTS No',  prob: np, market: 'btts', betMarket: 'btts', betOutcomeKey: 'no'  });
     }
 
-    // Over/Under goals
-    for (const key of ['over_1_5', 'over_2_5', 'over_3_5', 'over_4_5']) {
+    // Over/Under goals — emit BOTH Over and Under, at every line the model
+    // outputs. Backend supports 0.5 through 5.5 in 1-goal increments.
+    for (const key of ['over_0_5', 'over_1_5', 'over_2_5', 'over_3_5', 'over_4_5', 'over_5_5']) {
         const m = markets[key];
         if (m?.probabilities) {
-            const line = key.replace('over_', '').replace('_', '.');
+            const lineDashed = key.replace('over_', '');             // '2_5'
+            const lineDot    = lineDashed.replace('_', '.');          // '2.5'
             const op = m.probabilities['Over'] || 0;
             const up = m.probabilities['Under'] || 0;
-            if (op > 0) candidates.push({ label: `Over ${line} Goals`, prob: op, market: key });
-            if (up > 0) candidates.push({ label: `Under ${line} Goals`, prob: up, market: key });
+            if (op > 0) candidates.push({ label: `Over ${lineDot} Goals`,  prob: op, market: key, betMarket: `totals_${lineDashed}`, betOutcomeKey: 'over'  });
+            if (up > 0) candidates.push({ label: `Under ${lineDot} Goals`, prob: up, market: key, betMarket: `totals_${lineDashed}`, betOutcomeKey: 'under' });
         }
     }
 

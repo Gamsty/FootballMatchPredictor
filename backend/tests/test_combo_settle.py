@@ -14,11 +14,22 @@ import pytest
 
 
 def _match(**kwargs):
-    """Build a fake Match-like object with the attributes the resolvers touch."""
+    """Build a fake Match-like object with the attributes the resolvers touch.
+
+    All optional Match columns default to None so resolvers can detect missing
+    data the same way the SQLAlchemy model would. Override what each test
+    actually needs.
+    """
     defaults = dict(
         status='FINISHED',
-        home_score=0, away_score=0,
-        winner=None,
+        home_score=0, away_score=0, winner=None,
+        # Halftime data
+        home_ht_score=None, away_ht_score=None,
+        # Cards
+        home_yellow_cards=None, home_red_cards=None,
+        away_yellow_cards=None, away_red_cards=None,
+        # Corners
+        home_corners=None, away_corners=None,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -82,6 +93,147 @@ class TestCompoundMarketCoverage:
         for k in ('h_btts_yes', 'd_btts_yes', 'a_btts_yes',
                   'h_btts_no', 'd_btts_no', 'a_btts_no'):
             assert k in r, f"missing compound resolver: {k}"
+
+
+# ---------------------------------------------------------------------------
+# Expanded market resolvers — totals at every line, double chance, HT, cards,
+# corners. Each is a simple > / < check on a derived total, so we test
+# representative lines + edge cases (exact line = lost, missing data = lost).
+# ---------------------------------------------------------------------------
+
+class TestTotalsAtVariousLines:
+    @pytest.mark.parametrize('home,away,line,expected_over', [
+        (0, 0, 0.5, False),  # 0 goals, under 0.5
+        (1, 0, 0.5, True),   # 1 goal, over 0.5
+        (1, 1, 1.5, True),   # 2 goals, over 1.5
+        (1, 0, 1.5, False),  # 1 goal, under 1.5
+        (3, 0, 2.5, True),
+        (1, 1, 2.5, False),  # 2 goals exactly = under (line is half so unambiguous)
+        (5, 0, 4.5, True),
+        (2, 2, 4.5, False),
+        (3, 3, 5.5, True),
+        (6, 0, 5.5, True),
+    ])
+    def test_totals_over_under(self, home, away, line, expected_over):
+        line_str = str(line).replace('.', '_')
+        market = f'totals_{line_str}'
+        r = _resolvers()[market]
+        m = _match(home_score=home, away_score=away)
+        assert r['over'](m) == expected_over
+        assert r['under'](m) == (not expected_over)
+
+
+class TestDoubleChance:
+    @pytest.mark.parametrize('winner,expected', [
+        ('HOME_TEAM', {'1x': True, 'x2': False, '12': True}),
+        ('DRAW',      {'1x': True, 'x2': True,  '12': False}),
+        ('AWAY_TEAM', {'1x': False, 'x2': True, '12': True}),
+    ])
+    def test_double_chance_outcomes(self, winner, expected):
+        r = _resolvers()['double_chance']
+        m = _match(winner=winner)
+        for outcome, want in expected.items():
+            assert r[outcome](m) == want, f"{outcome} for {winner}"
+
+
+class TestHalftimeMarkets:
+    def test_ht_result_home_wins(self):
+        r = _resolvers()['ht_result']
+        m = _match(home_ht_score=2, away_ht_score=0)
+        assert r['home'](m) is True
+        assert r['draw'](m) is False
+        assert r['away'](m) is False
+
+    def test_ht_result_draw(self):
+        r = _resolvers()['ht_result']
+        m = _match(home_ht_score=1, away_ht_score=1)
+        assert r['draw'](m) is True
+        assert r['home'](m) is False
+        assert r['away'](m) is False
+
+    def test_ht_result_loses_when_ht_data_missing(self):
+        """Match without halftime data → all HT picks settle as lost (operator can void)."""
+        r = _resolvers()['ht_result']
+        m = _match(home_ht_score=None, away_ht_score=None)
+        assert r['home'](m) is False
+        assert r['draw'](m) is False
+        assert r['away'](m) is False
+
+    def test_ht_totals_under_with_goalless_first_half(self):
+        r = _resolvers()['ht_totals_0_5']
+        m = _match(home_ht_score=0, away_ht_score=0)
+        assert r['under'](m) is True
+        assert r['over'](m) is False
+
+
+class TestCardsMarket:
+    def test_cards_over_with_busy_match(self):
+        r = _resolvers()['cards_4_5']
+        m = _match(
+            home_yellow_cards=3, home_red_cards=0,
+            away_yellow_cards=2, away_red_cards=0,
+        )
+        # Total = 5 cards, over 4.5 ✓
+        assert r['over'](m) is True
+
+    def test_cards_under_with_clean_match(self):
+        r = _resolvers()['cards_3_5']
+        m = _match(
+            home_yellow_cards=1, home_red_cards=0,
+            away_yellow_cards=2, away_red_cards=0,
+        )
+        # Total = 3 cards, under 3.5 ✓
+        assert r['under'](m) is True
+
+    def test_cards_voids_when_data_missing(self):
+        r = _resolvers()['cards_3_5']
+        m = _match(home_yellow_cards=None)  # other fields not set
+        # Missing data → both over and under False (operator voids manually)
+        assert r['over'](m) is False
+        assert r['under'](m) is False
+
+
+class TestCornersMarket:
+    def test_corners_over(self):
+        r = _resolvers()['corners_9_5']
+        m = _match(home_corners=7, away_corners=4)
+        # Total = 11, over 9.5
+        assert r['over'](m) is True
+        assert r['under'](m) is False
+
+    def test_corners_under(self):
+        r = _resolvers()['corners_8_5']
+        m = _match(home_corners=3, away_corners=4)
+        # Total = 7, under 8.5
+        assert r['under'](m) is True
+        assert r['over'](m) is False
+
+    def test_corners_voids_when_data_missing(self):
+        r = _resolvers()['corners_8_5']
+        m = _match(home_corners=None, away_corners=None)
+        assert r['over'](m) is False
+        assert r['under'](m) is False
+
+
+class TestMarketsCoverage:
+    """Snapshot: catches accidental removal of supported markets."""
+
+    def test_all_supported_markets_have_at_least_one_outcome(self):
+        r = _resolvers()
+        for market, outcomes in r.items():
+            assert outcomes, f"market {market} has no outcomes"
+
+    def test_totals_present_at_every_common_line(self):
+        for line in ('0_5', '1_5', '2_5', '3_5', '4_5', '5_5'):
+            assert f'totals_{line}' in _resolvers(), f"missing totals_{line}"
+
+    def test_corners_present_at_every_common_line(self):
+        for line in ('7_5', '8_5', '9_5', '10_5', '11_5'):
+            assert f'corners_{line}' in _resolvers(), f"missing corners_{line}"
+
+    def test_cards_present_at_every_common_line(self):
+        for line in ('2_5', '3_5', '4_5', '5_5', '6_5'):
+            assert f'cards_{line}' in _resolvers(), f"missing cards_{line}"
 
 
 # ---------------------------------------------------------------------------

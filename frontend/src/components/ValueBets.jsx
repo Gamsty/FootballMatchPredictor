@@ -511,17 +511,17 @@ function ValueBets({ onSelectMatch }) {
 
 // ----------------------------------------------------------------------------
 // LogBetModal — confirms a picked bet before POSTing to /api/bets.
-// Pre-filled from the picked outcome; user can override stake + bookmaker.
+// Pre-filled from the picked outcome; user can override stake + odds.
+// Bookmaker is always Norsk Tipping — single-bookmaker operator.
 // Exported so BestOfWeek can reuse the same modal.
 // ----------------------------------------------------------------------------
 
-export function LogBetModal({ pick, defaultStake, defaultOdds, defaultBookmaker, onClose, onLogged }) {
+export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged }) {
     const [stake, setStake] = useState(defaultStake);
     // Odds at-bet is editable so the user can override Pinnacle's median with
-    // the actual price they got at their book (typically NT). Default to NT
-    // odds if caller pre-filled them, otherwise the pick's best/median.
+    // the actual NT price they got. Default to NT odds if caller pre-filled
+    // them, otherwise the pick's best/median.
     const [odds, setOdds] = useState(defaultOdds ?? pick.odds);
-    const [bookmaker, setBookmaker] = useState(defaultBookmaker ?? pick.bookmaker ?? '');
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState(null);
@@ -550,7 +550,8 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, defaultBookmaker,
                 outcome_label: pick.outcome,
                 odds_at_bet: Number(odds),
                 stake: Number(stake),
-                bookmaker: bookmaker || pick.bookmaker || null,
+                // Single-bookmaker operator — always NT.
+                bookmaker: 'Norsk Tipping',
                 model_prob_at_bet: pick.prob,
                 edge_at_bet: actualEdge,
                 notes: notes || null,
@@ -617,7 +618,7 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, defaultBookmaker,
                     </div>
 
                     <div>
-                        <label className="eyebrow block mb-1">Odds at bet</label>
+                        <label className="eyebrow block mb-1">NT odds at bet</label>
                         <input
                             type="number"
                             min="1.01"
@@ -625,7 +626,7 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, defaultBookmaker,
                             value={odds}
                             onChange={(e) => setOdds(Number(e.target.value))}
                             className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
-                            title="Actual odds you got — typically NT odds, not Pinnacle. Edge above recalculates from this."
+                            title="Actual odds you got at NT. Edge above recalculates from this."
                         />
                     </div>
 
@@ -639,17 +640,6 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, defaultBookmaker,
                             onChange={(e) => setStake(Number(e.target.value))}
                             className="w-full bg-paper border border-line px-3 py-2 mono text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                             autoFocus
-                        />
-                    </div>
-
-                    <div>
-                        <label className="eyebrow block mb-1">Bookmaker (optional)</label>
-                        <input
-                            type="text"
-                            value={bookmaker}
-                            onChange={(e) => setBookmaker(e.target.value)}
-                            placeholder={pick.bookmaker || 'Where you placed the bet'}
-                            className="w-full bg-paper border border-line px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent transition-colors"
                         />
                     </div>
 

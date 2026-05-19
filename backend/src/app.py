@@ -1471,21 +1471,104 @@ def get_prediction_calibration():
 # (winner, totals) into single keys so we can settle them without modelling a
 # separate market for every combo. Keep `outcome_key` lowercase — frontend sends
 # capital prefix ('H_btts_yes') and we lowercase on insert.
+# Helpers used by lambdas below. Inline to avoid forward-reference issues —
+# Python evaluates default-args / closures at class-build time.
+def _total_goals(m):
+    return (m.home_score or 0) + (m.away_score or 0)
+
+def _ht_total_goals(m):
+    if m.home_ht_score is None or m.away_ht_score is None:
+        return None
+    return m.home_ht_score + m.away_ht_score
+
+def _ht_winner(m):
+    """Returns 'HOME_TEAM' / 'DRAW' / 'AWAY_TEAM' or None if HT data missing."""
+    if m.home_ht_score is None or m.away_ht_score is None:
+        return None
+    if m.home_ht_score > m.away_ht_score:
+        return 'HOME_TEAM'
+    if m.home_ht_score < m.away_ht_score:
+        return 'AWAY_TEAM'
+    return 'DRAW'
+
+def _total_cards(m):
+    if any(getattr(m, c) is None for c in
+           ('home_yellow_cards', 'home_red_cards', 'away_yellow_cards', 'away_red_cards')):
+        return None
+    return (m.home_yellow_cards + m.home_red_cards
+            + m.away_yellow_cards + m.away_red_cards)
+
+def _total_corners(m):
+    if m.home_corners is None or m.away_corners is None:
+        return None
+    return m.home_corners + m.away_corners
+
+def _ou(getter, line):
+    """Build (over, under) resolver pair for any total-goals/cards/corners line.
+    `getter` returns the total (int) or None if data is missing. None → void."""
+    return {
+        'over':  lambda m: (getter(m) is not None) and getter(m) > line,
+        'under': lambda m: (getter(m) is not None) and getter(m) < line,
+    }
+
+
 _BET_OUTCOME_RESOLVERS = {
     'h2h': {
         'home': lambda m: m.winner == 'HOME_TEAM',
         'draw': lambda m: m.winner == 'DRAW',
         'away': lambda m: m.winner == 'AWAY_TEAM',
     },
-    'totals_2_5': {
-        'over':  lambda m: (m.home_score or 0) + (m.away_score or 0) > 2.5,
-        'under': lambda m: (m.home_score or 0) + (m.away_score or 0) < 2.5,
-    },
+
+    # ---- Totals (goals) at every common line --------------------------------
+    'totals_0_5': _ou(_total_goals, 0.5),
+    'totals_1_5': _ou(_total_goals, 1.5),
+    'totals_2_5': _ou(_total_goals, 2.5),
+    'totals_3_5': _ou(_total_goals, 3.5),
+    'totals_4_5': _ou(_total_goals, 4.5),
+    'totals_5_5': _ou(_total_goals, 5.5),
+
+    # ---- BTTS ---------------------------------------------------------------
     'btts': {
         'yes': lambda m: (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
         'no':  lambda m: (m.home_score or 0) == 0 or (m.away_score or 0) == 0,
     },
-    # Compound markets: result + BTTS. Each predicate must be true.
+
+    # ---- Double chance ------------------------------------------------------
+    # 1X = home or draw; X2 = away or draw; 12 = home or away (no draw).
+    'double_chance': {
+        '1x': lambda m: m.winner in ('HOME_TEAM', 'DRAW'),
+        'x2': lambda m: m.winner in ('AWAY_TEAM', 'DRAW'),
+        '12': lambda m: m.winner in ('HOME_TEAM', 'AWAY_TEAM'),
+    },
+
+    # ---- Halftime markets ---------------------------------------------------
+    # Returns False (not None) when HT data is missing so unsupported matches
+    # settle as 'lost' — better than hanging pending forever. Operator can
+    # manually void if they really want that match excluded.
+    'ht_result': {
+        'home': lambda m: _ht_winner(m) == 'HOME_TEAM',
+        'draw': lambda m: _ht_winner(m) == 'DRAW',
+        'away': lambda m: _ht_winner(m) == 'AWAY_TEAM',
+    },
+    'ht_totals_0_5': _ou(_ht_total_goals, 0.5),
+    'ht_totals_1_5': _ou(_ht_total_goals, 1.5),
+    'ht_totals_2_5': _ou(_ht_total_goals, 2.5),
+
+    # ---- Cards totals (yellow + red, both teams) ----------------------------
+    'cards_2_5': _ou(_total_cards, 2.5),
+    'cards_3_5': _ou(_total_cards, 3.5),
+    'cards_4_5': _ou(_total_cards, 4.5),
+    'cards_5_5': _ou(_total_cards, 5.5),
+    'cards_6_5': _ou(_total_cards, 6.5),
+
+    # ---- Corners totals -----------------------------------------------------
+    'corners_7_5':  _ou(_total_corners, 7.5),
+    'corners_8_5':  _ou(_total_corners, 8.5),
+    'corners_9_5':  _ou(_total_corners, 9.5),
+    'corners_10_5': _ou(_total_corners, 10.5),
+    'corners_11_5': _ou(_total_corners, 11.5),
+
+    # ---- Compound markets: result + BTTS ------------------------------------
     'compound': {
         'h_btts_yes': lambda m: m.winner == 'HOME_TEAM' and (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
         'd_btts_yes': lambda m: m.winner == 'DRAW'      and (m.home_score or 0) > 0 and (m.away_score or 0) > 0,
@@ -1531,24 +1614,23 @@ def _combo_legs_closing(legs: list[dict]) -> float | None:
     return product
 
 
-def _resolve_leg(leg: dict) -> str | None:
+def _resolve_leg_for_match(leg: dict, match: Match | None) -> str | None:
     """
-    Resolve one combo leg against the current DB state.
+    Resolve one combo leg given an already-loaded Match (or None if missing).
     Returns 'won', 'lost', 'void', or None if the leg's match isn't finished.
 
     Status semantics:
       - FINISHED with scores → won/lost via the resolver
-      - CANCELLED → void (matches Pinnacle's rule: cancelled leg voids the leg
-        which in turn voids the combo here since we don't model partial-stake
-        reduction). Without this, a cancelled match would leave the combo
-        pending forever.
-      - Anything else (SCHEDULED/TIMED/IN_PLAY/POSTPONED/...) → None (pending)
+      - CANCELLED/POSTPONED/SUSPENDED → void. Mirrors single-bet settle;
+        otherwise an indefinitely-postponed leg would hang the whole combo.
+      - Anything else (SCHEDULED/TIMED/IN_PLAY/...) → None (pending)
+
+    Caller is responsible for loading the match — keeps this function reusable
+    by both the per-leg path (`_resolve_leg`) and the bulk-enrichment path
+    (`_enrich_combo_legs`) without redundant DB hits.
     """
-    match = db.session.query(Match).filter_by(id=leg.get('match_id')).first()
     if not match:
         return None
-    # Mirror single-bet settle: postponed/cancelled/suspended legs void the
-    # combo. Otherwise an indefinitely-postponed leg would hang the whole combo.
     if match.status in ('CANCELLED', 'POSTPONED', 'SUSPENDED'):
         return 'void'
     if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
@@ -1557,6 +1639,14 @@ def _resolve_leg(leg: dict) -> str | None:
     if resolver is None:
         return 'void'
     return 'won' if resolver(match) else 'lost'
+
+
+def _resolve_leg(leg: dict) -> str | None:
+    """One-shot leg resolution — loads the match and delegates. Used by the
+    settle path where we hit one leg at a time. For bulk paths (rendering
+    a combo bet) prefer `_resolve_leg_for_match` after a bulk match lookup."""
+    match = db.session.query(Match).filter_by(id=leg.get('match_id')).first()
+    return _resolve_leg_for_match(leg, match)
 
 
 def _settle_one_bet(bet: Bet, match: Match) -> bool:
@@ -1662,6 +1752,37 @@ def _settle_pending_bets(match_ids: list[int] | None = None) -> int:
     return settled
 
 
+def _enrich_combo_legs(legs: list[dict] | None) -> list[dict] | None:
+    """
+    Augment each combo leg's snapshot with current match state — score, status,
+    and per-leg resolved result (won/lost/void/pending). Lets the UI show a
+    finished leg's outcome alongside the snapshot odds without an extra
+    per-leg request from the frontend.
+
+    Bulk-fetches all leg matches in one IN-query so an N-leg combo costs ONE
+    extra DB hit, not N. Returns a new list (doesn't mutate the JSON column).
+    """
+    if not legs:
+        return legs
+    ids = [L.get('match_id') for L in legs if L.get('match_id')]
+    if not ids:
+        return legs
+    matches = {m.id: m for m in db.session.query(Match).filter(Match.id.in_(ids)).all()}
+    enriched: list[dict] = []
+    for leg in legs:
+        out = dict(leg)
+        m = matches.get(leg.get('match_id'))
+        out['home_score'] = m.home_score if m else None
+        out['away_score'] = m.away_score if m else None
+        out['match_status'] = m.status if m else None
+        # Reuse the settle-time resolver so leg-result matches what the
+        # combo would settle to. Pass the already-loaded match so we don't
+        # re-query — None becomes 'pending' for the UI.
+        out['result'] = _resolve_leg_for_match(leg, m) or 'pending'
+        enriched.append(out)
+    return enriched
+
+
 def _bet_to_dict(bet: Bet) -> dict:
     match = bet.match
     return {
@@ -1692,9 +1813,11 @@ def _bet_to_dict(bet: Bet) -> dict:
         'settled_at': iso_utc(bet.settled_at),
         'profit_loss': bet.profit_loss,
         'notes': bet.notes,
-        # NULL for singles; list of leg dicts for combos. Frontend uses presence
-        # of legs to switch the bet-log row layout.
-        'combo_legs': bet.combo_legs,
+        # NULL for singles; list of leg dicts for combos. Each leg gets the
+        # snapshot fields (home_team/away_team/odds/prob/outcome) PLUS live
+        # match state (home_score/away_score/match_status/result) so the UI
+        # can show how each leg finished without an extra per-leg fetch.
+        'combo_legs': _enrich_combo_legs(bet.combo_legs) if bet.market == 'combo' else bet.combo_legs,
     }
 
 

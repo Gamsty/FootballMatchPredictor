@@ -17,6 +17,10 @@ function CategoryTabs({ activeTab, onTabChange, matchCounts, showValueTab = fals
         ...(showValueTab ? [
             { id: 'value', label: 'Value', count: matchCounts.value },
         ] : []),
+        // Performance tab — public read-only tracking hub. Always visible so
+        // visitors can see the operator's track record (parity with the existing
+        // RecentROI public strip and the "Bets" hero link).
+        { id: 'performance', label: 'Performance' },
     ];
 
     return (
