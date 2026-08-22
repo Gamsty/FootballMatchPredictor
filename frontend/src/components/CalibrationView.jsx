@@ -12,7 +12,8 @@ says 70% but only wins 55% will systematically chase fake value. ECE
 */
 
 import { useState, useEffect } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 const OUTCOMES = [
     { id: 'predicted', label: 'Predicted side',
@@ -29,6 +30,9 @@ const PLOT_SIZE = 320;
 const PLOT_PADDING = 32;
 
 function CalibrationView({ onClose }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     const [outcome, setOutcome] = useState('predicted');
     // '' = all model versions (default). Otherwise restricts to a specific version
     // so we don't average over v1 + v2 predictions after a retrain.
@@ -37,17 +41,28 @@ function CalibrationView({ onClose }) {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
-    useEffect(() => {
-        const controller = new AbortController();
+    // Reset for a new request DURING render, not inside the effect. Setting
+    // state in an effect body schedules a second render pass for something React
+    // can apply immediately, and react-hooks/set-state-in-effect flags it. The
+    // key-comparison form below is React's documented way to adjust state when
+    // inputs change.
+    const calibrationKey = `${outcome}|${modelVersion}`;
+    const [requestKey, setRequestKey] = useState(calibrationKey);
+    if (requestKey !== calibrationKey) {
+        setRequestKey(calibrationKey);
         setLoading(true);
         setError(null);
+    }
+
+    useEffect(() => {
+        const controller = new AbortController();
         const params = { outcome, bins: 10 };
         if (modelVersion) params.model_version = modelVersion;
         footballAPI.getCalibration(params, { signal: controller.signal })
             .then(res => setData(res))
             .catch(err => {
                 if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return;
-                setError(err.message || 'Failed to load calibration');
+                setError(describeApiError(err, 'Failed to load calibration'));
             })
             .finally(() => setLoading(false));
         return () => controller.abort();
@@ -57,6 +72,9 @@ function CalibrationView({ onClose }) {
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Model calibration"
             className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >

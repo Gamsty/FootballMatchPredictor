@@ -45,6 +45,19 @@ function PerfSummary({ perf, size = 'md', showFootnote = true }) {
                   : perf.total_profit_loss < 0 ? 'text-danger'
                   : 'text-ink';
 
+    // avg_clv_fair strips the bookmaker margin out of the closing line before
+    // comparing, so it stays meaningful for bets priced at NT. avg_clv is the
+    // legacy best-sharp-book comparison, kept as a fallback.
+    // SegmentDetail computes its perf object client-side and doesn't produce
+    // win_rate_singles, so gating on that field alone silently switched this
+    // whole comparison off for every segment drill-down. Fall back to the
+    // all-bets rate there — less precise, but present.
+    const settledWinRate = perf.win_rate_singles ?? perf.win_rate ?? null;
+
+    const clvIsFair = perf.avg_clv_fair != null;
+    const clv = clvIsFair ? perf.avg_clv_fair : perf.avg_clv;
+    const clvSample = clvIsFair ? perf.clv_fair_sample_size : perf.clv_sample_size;
+
     return (
         <div>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -57,14 +70,21 @@ function PerfSummary({ perf, size = 'md', showFootnote = true }) {
                       valueClass={noSettled ? 'text-ink-muted' : roiClass}
                       hint={noSettled ? `${perf.pending_count} pending` : null} />
                 <Card size={size} label="Win rate"
-                      value={noSettled ? '—' : pct(perf.win_rate)}
+                      value={noSettled ? '—' : pct(settledWinRate)}
                       valueClass={noSettled ? 'text-ink-muted' : 'text-ink'}
                       hint={noSettled
                           ? (perf.expected_win_rate != null ? `model expects ${pct(perf.expected_win_rate)}` : null)
                           : (perf.expected_win_rate != null ? `model expected ${pct(perf.expected_win_rate)}` : null)} />
+                {/* Prefer the de-vigged comparison. avg_clv prices the bet against the
+                    best sharp book, which no NT bettor could have taken — it reads
+                    negative regardless of whether the bet was good. avg_clv_fair strips
+                    the margin out of the closing line first. Falls back to the legacy
+                    field for backends that predate it. */}
                 <Card size={size} label="Avg CLV"
-                      value={perf.avg_clv != null ? pct(perf.avg_clv) : '—'}
-                      hint={perf.clv_sample_size ? `n=${perf.clv_sample_size}` : 'no closing odds yet'} />
+                      value={clv != null ? pct(clv) : '—'}
+                      hint={clvSample
+                          ? `n=${clvSample}${clvIsFair ? ' · vs fair line' : ' · vs best book'}`
+                          : 'no closing odds yet'} />
             </div>
             {showFootnote && (
                 <p className="mono text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted mt-3 leading-relaxed">
@@ -85,11 +105,15 @@ function PerfSummary({ perf, size = 'md', showFootnote = true }) {
                     >
                         {perf.avg_edge_at_bet != null ? pct(perf.avg_edge_at_bet) : 'n/a'}
                     </span>
+                    {/* expected_win_rate averages model probability over SINGLES, so
+                        compare it against the singles win rate — the all-bets figure is
+                        dragged down by combos the expectation never included. */}
                     {perf.expected_win_rate != null
+                        && settledWinRate != null
                         && perf.settled_count >= 10
-                        && perf.win_rate < perf.expected_win_rate - 0.05 && (
+                        && settledWinRate < perf.expected_win_rate - 0.05 && (
                         <span className="text-warning ml-2">
-                            ← winning {pct(perf.expected_win_rate - perf.win_rate)} less than model predicted
+                            ← winning {pct(perf.expected_win_rate - settledWinRate)} less than model predicted
                         </span>
                     )}
                 </p>

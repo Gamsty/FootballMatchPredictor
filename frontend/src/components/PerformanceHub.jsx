@@ -18,7 +18,7 @@ No backend changes needed. since= param is computed from the selected period.
 */
 
 import { useState, useEffect, useMemo } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
 import PerfSummary from './PerfSummary';
 import BetRow from './BetRow';
 import SegmentDetail from './SegmentDetail';
@@ -94,7 +94,7 @@ function PerformanceHub({ canEdit = false }) {
             .then(setPerf)
             .catch(err => {
                 if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return;
-                setError(err.message || 'Failed to load performance');
+                setError(describeApiError(err, 'Failed to load performance'));
             })
             .finally(() => setLoading(false));
         return () => controller.abort();

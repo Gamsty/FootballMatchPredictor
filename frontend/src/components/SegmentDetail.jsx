@@ -13,11 +13,15 @@ client-side from the filtered bet list since the endpoint doesn't support
 */
 
 import { useState, useEffect, useMemo } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
 import PerfSummary from './PerfSummary';
 import BetRow from './BetRow';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 function SegmentDetail({ segment, onClose, onSelectBet }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     // canEdit not used here — delete actions live in BetDetail so segment rows
     // stay clean. The parent (PerformanceHub) owns the delete cascade.
     const [perf, setPerf] = useState(null);
@@ -25,10 +29,21 @@ function SegmentDetail({ segment, onClose, onSelectBet }) {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
-    useEffect(() => {
-        const controller = new AbortController();
+    // Reset for a new request DURING render, not inside the effect. Setting
+    // state in an effect body schedules a second render pass for something React
+    // can apply immediately, and react-hooks/set-state-in-effect flags it. The
+    // key-comparison form below is React's documented way to adjust state when
+    // inputs change.
+    const segmentKey = `${segment.type}|${segment.key}`;
+    const [requestKey, setRequestKey] = useState(segmentKey);
+    if (requestKey !== segmentKey) {
+        setRequestKey(segmentKey);
         setLoading(true);
         setError(null);
+    }
+
+    useEffect(() => {
+        const controller = new AbortController();
 
         // Always fetch the bet list — segment filter is applied client-side.
         const promises = [
@@ -51,7 +66,7 @@ function SegmentDetail({ segment, onClose, onSelectBet }) {
             })
             .catch(err => {
                 if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return;
-                setError(err.message || 'Failed to load segment');
+                setError(describeApiError(err, 'Failed to load segment'));
             })
             .finally(() => setLoading(false));
         return () => controller.abort();
@@ -82,6 +97,9 @@ function SegmentDetail({ segment, onClose, onSelectBet }) {
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Segment detail"
             className="fixed inset-0 z-50 bg-ink/40 flex justify-end animate-fade-in"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >

@@ -8,22 +8,65 @@ import axios from "axios";
 // Use environment variable, with fallback
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
 
+// Request timeout. The backend runs on Azure Container Apps with scale-to-zero,
+// so the first request after an idle period waits on a cold start — normally a
+// few seconds, occasionally 30+. Without a ceiling a hung request never settles,
+// axios never rejects, and any caller's `finally { setLoading(false) }` never
+// runs: the UI sits on a spinner forever. 45s is past a realistic cold start and
+// well short of "the user has given up".
+const REQUEST_TIMEOUT_MS = 45000;
+
+// A handful of endpoints do real work per request rather than reading a table:
+// /value-bets walks a week of fixtures and fetches live odds per league, and
+// /predictions/calibration replays every evaluated prediction. Both can
+// legitimately run past the default. gunicorn's worker timeout is 120s, so
+// there is no point waiting longer than the server will work.
+const SLOW_ENDPOINT_TIMEOUT_MS = 120000;
+
 // Create axios instance
 const api = axios.create({
     baseURL: API_BASE_URL,
+    timeout: REQUEST_TIMEOUT_MS,
     headers: {
         'Content-Type': 'application/json',
     },
 });
 
-// Response interceptor — logs API errors and passes them through
+// Response interceptor — logs API errors and passes them through.
+// Timeouts and cold starts are indistinguishable from a dead backend at the
+// axios level, so tag them: callers render a "waking up" message rather than
+// "failed to load", which is the difference between waiting and giving up.
 api.interceptors.response.use(
     (response) => response,
     (error) => {
         console.error('API Error:', error.response?.data || error.message);
+        if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+            error.isTimeout = true;
+        }
         return Promise.reject(error);
     }
 );
+
+// Message for a failed request, distinguishing the cases a user can act on.
+// Canceled requests (AbortController, e.g. rapid filter changes) are not errors
+// and callers should skip them entirely — see isCanceled below.
+export function describeApiError(err, fallback = 'Something went wrong.') {
+    if (err?.isTimeout) {
+        return 'The backend is waking up (it sleeps when idle). Give it a moment and try again.';
+    }
+    if (err?.response?.data?.error) return err.response.data.error;
+    if (!err?.response) {
+        return 'Could not reach the backend. Check your connection, or that the API is running.';
+    }
+    if (err.response.status === 503) {
+        return 'The backend is starting up. Try again shortly.';
+    }
+    return fallback;
+}
+
+export function isCanceled(err) {
+    return axios.isCancel(err) || err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError';
+}
 
 // Bet-write token — gates POST/DELETE on /api/bets and /api/bets/combo when
 // the backend has BET_WRITE_TOKEN set. Stored per-device in localStorage.
@@ -110,13 +153,17 @@ export const footballAPI = {
     // change rapidly. Without this, switching books=sharp ↔ all 3x fires 3
     // parallel requests; we want only the latest to land.
     getValueBets: async (params = {}, { signal } = {}) => {
-        const response = await api.get('/value-bets', { params, signal });
+        const response = await api.get('/value-bets', {
+            params, signal, timeout: SLOW_ENDPOINT_TIMEOUT_MS,
+        });
         return response.data;
     },
 
     // Model calibration — bucketed prediction probability vs actual outcome rate
     getCalibration: async (params = {}, { signal } = {}) => {
-        const response = await api.get('/predictions/calibration', { params, signal });
+        const response = await api.get('/predictions/calibration', {
+            params, signal, timeout: SLOW_ENDPOINT_TIMEOUT_MS,
+        });
         return response.data;
     },
 
@@ -154,7 +201,8 @@ export const footballAPI = {
         // Drop the odds cache so the next value-bets / best-picks fetch
         // pulls fresh prices from The Odds API. Costs ~18 quota credits
         // on the cold refetch — use sparingly.
-        const response = await api.post('/admin/odds-refresh', {}, withBetTokenHeader());
+        const response = await api.post('/admin/odds-refresh', {},
+            withBetTokenHeader({ timeout: SLOW_ENDPOINT_TIMEOUT_MS }));
         return response.data;
     },
 

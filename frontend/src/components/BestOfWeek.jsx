@@ -25,11 +25,12 @@ Reuses LogBetModal from ValueBets to avoid duplication.
 */
 
 import { useState, useEffect, useRef } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
 import { formatTime, formatMatchDate, COMPETITION_LABELS } from '../utils/constants';
 import { LogBetModal, RefreshOddsControl } from './ValueBets';
 import ComboPresets from './ComboPresets';
 import CompoundMarkets from './CompoundMarkets';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const FRACTIONAL_KELLY = 0.25;
@@ -138,7 +139,7 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
                     retryTimer = setTimeout(() => fetchOnce(1), 3000);
                     return;
                 }
-                setError(err.message || 'Failed to load picks');
+                setError(describeApiError(err, 'Failed to load picks'));
             } finally {
                 setLoading(false);
             }
@@ -700,6 +701,9 @@ function BestOfWeek({ onSelectMatch, canLog = false }) {
 // ---------------------------------------------------------------------------
 
 export function LogComboModal({ summary, onClose, onLogged }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     const { legs, combinedOdds, combinedProb, combinedEdge, defaultStake } = summary;
     const [stake, setStake] = useState(defaultStake);
     const [notes, setNotes] = useState('');
@@ -745,6 +749,9 @@ export function LogComboModal({ summary, onClose, onLogged }) {
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Log combo bet"
             className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
@@ -755,11 +762,25 @@ export function LogComboModal({ summary, onClose, onLogged }) {
                         <div className="display text-xl text-ink">
                             {legs.length}-leg combo<span className="text-accent">.</span>
                         </div>
+                        {/* combinedEdge is null when the legs are priced at model-implied
+                            odds (1/p) rather than a bookmaker's — the Dashboard accumulator
+                            does that, and the edge then works out to exactly 0.0% by
+                            construction. Showing "+0.0% edge" there reads as a measurement
+                            when it is an identity, so omit it and say where the price came
+                            from instead. */}
                         <div className="mono text-[0.65rem] text-ink-muted mt-1">
-                            Combined odds {combinedOdds.toFixed(2)} ·{' '}
-                            hit {(combinedProb * 100).toFixed(1)}% ·{' '}
-                            edge {combinedEdge >= 0 ? '+' : ''}{(combinedEdge * 100).toFixed(1)}%
+                            {combinedEdge == null ? 'Model odds' : 'Combined odds'}{' '}
+                            {combinedOdds.toFixed(2)} ·{' '}
+                            hit {(combinedProb * 100).toFixed(1)}%
+                            {combinedEdge != null && (
+                                <> ·{' '}edge {combinedEdge >= 0 ? '+' : ''}{(combinedEdge * 100).toFixed(1)}%</>
+                            )}
                         </div>
+                        {combinedEdge == null && (
+                            <div className="mono text-[0.6rem] text-warning mt-1 leading-snug">
+                                Priced at 1/probability — override with your real NT odds below.
+                            </div>
+                        )}
                     </div>
                     <button
                         onClick={onClose}

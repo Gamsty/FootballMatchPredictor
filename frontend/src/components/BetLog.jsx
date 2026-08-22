@@ -9,10 +9,11 @@ the modal state and refresh cascade).
 */
 
 import { useState, useEffect, useMemo } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
 import BetRow from './BetRow';
 import { COMPETITION_LABELS } from '../utils/constants';
 import { MARKET_BADGE } from '../utils/marketBadges';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 const STATUS_OPTIONS = [
     { id: '',        label: 'All' },
@@ -32,6 +33,9 @@ const SORTS = [
 ];
 
 function BetLog({ onClose, canEdit = false, onSelectBet, onChange }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     const [bets, setBets] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -40,17 +44,27 @@ function BetLog({ onClose, canEdit = false, onSelectBet, onChange }) {
     const [league, setLeague] = useState('');
     const [sortId, setSortId] = useState('placed_desc');
 
-    useEffect(() => {
-        const controller = new AbortController();
+    // Reset for a new request DURING render, not inside the effect. Setting
+    // state in an effect body schedules a second render pass for something React
+    // can apply immediately, and react-hooks/set-state-in-effect flags it. The
+    // key-comparison form below is React's documented way to adjust state when
+    // inputs change.
+    const [requestKey, setRequestKey] = useState(status);
+    if (requestKey !== status) {
+        setRequestKey(status);
         setLoading(true);
         setError(null);
+    }
+
+    useEffect(() => {
+        const controller = new AbortController();
         const params = { limit: 500 };
         if (status) params.status = status;
         footballAPI.listBets(params, { signal: controller.signal })
             .then(setBets)
             .catch(err => {
                 if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return;
-                setError(err.message || 'Failed to load bets');
+                setError(describeApiError(err, 'Failed to load bets'));
             })
             .finally(() => setLoading(false));
         return () => controller.abort();
@@ -99,6 +113,9 @@ function BetLog({ onClose, canEdit = false, onSelectBet, onChange }) {
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Bet log"
             className="fixed inset-0 z-50 bg-ink/40 flex justify-end animate-fade-in"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >

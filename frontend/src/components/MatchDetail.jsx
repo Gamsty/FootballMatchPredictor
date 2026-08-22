@@ -18,7 +18,8 @@ Features:
 */
 
 import { useState, useEffect, useRef } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 import {
     formatPercentage, formatTime, formatMatchDate, formatOdds,
     getRecommendedBets,
@@ -106,7 +107,7 @@ function MatchDetail({ match, onClose, canLog = false,
                 );
                 setMarketData(data);
             } catch (err) {
-                setError('Failed to load market predictions');
+                setError(describeApiError(err, 'Failed to load market predictions'));
                 console.error(err);
             } finally {
                 setLoading(false);
@@ -115,12 +116,11 @@ function MatchDetail({ match, onClose, canLog = false,
         fetchMarkets();
     }, [match]);
 
-    // Close on Escape
-    useEffect(() => {
-        const handleEscape = (e) => { if (e.key === 'Escape') onClose(); };
-        window.addEventListener('keydown', handleEscape);
-        return () => window.removeEventListener('keydown', handleEscape);
-    }, [onClose]);
+    // Close on Escape. Uses the shared hook rather than its own listener: this
+    // view can have LogBetModal stacked on top of it, and two independent
+    // listeners meant one Escape closed both — dumping the reader all the way
+    // back to the match list instead of just cancelling the log.
+    useModalDismiss(onClose);
 
     // Close on click outside
     const handleBackdropClick = (e) => {
@@ -139,6 +139,9 @@ function MatchDetail({ match, onClose, canLog = false,
         // and close MatchDetail mid-submit, killing the POST without UI feedback.
         <>
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Match detail"
             className="fixed inset-0 z-50 flex items-stretch sm:items-start justify-center bg-ink/40 backdrop-blur-sm overflow-y-auto sm:p-4 animate-fade-in"
             onClick={handleBackdropClick}
         >
