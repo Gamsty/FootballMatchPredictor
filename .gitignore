@@ -45,3 +45,8 @@ dist/
 CLAUDE.md
 .clauderc
 .claudeignore
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

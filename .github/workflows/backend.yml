@@ -48,18 +48,18 @@ jobs:
           pip install -r requirements.txt
           pip install ruff pytest
 
+      # jobs/ and tests/ are linted too. They were excluded, so a broken import
+      # or unused name in a cron job or a test only surfaced when it ran in
+      # production — which for a weekly job means up to a week later.
       - name: Lint
         working-directory: backend
-        run: ruff check src/
+        run: ruff check src/ jobs/ tests/
 
       - name: Run tests
         working-directory: backend
         env:
           DATABASE_URL: postgresql://postgres:password@localhost:5432/football_predictor_test
-        # --passed=0 disabled so pytest exits 0 if no tests are collected (avoids
-        # "no tests collected" failure during early bootstrap), but any actual
-        # test failure or error WILL fail the job.
-        run: pytest -q --no-header || ([ $? -eq 5 ] && echo "No tests collected yet" || exit $?)
+        run: pytest -q --no-header
 
   build-and-deploy:
     needs: test
@@ -92,28 +92,85 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Remember what is live before we replace it. Rollback needs an image
+      # reference, not a revision name: the app runs in single-revision mode, so
+      # reactivating an old revision is not available — redeploying the previous
+      # image is.
+      - name: Record currently deployed image
+        id: previous
+        run: |
+          PREV=$(az containerapp show \
+            --name ${{ secrets.AZURE_CA_NAME }} \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --query "properties.template.containers[0].image" -o tsv)
+          # Only our own images are rollback targets. A never-deployed app still
+          # carries the Container Apps quickstart image, and "rolling back" to
+          # that would replace a broken API with no API at all.
+          case "$PREV" in
+            *"/fotballpred-backend:"*) ;;
+            *) echo "Not a fotballpred image ($PREV) — rollback disabled."; PREV="" ;;
+          esac
+          # The image tag IS the commit sha, so GIT_SHA can be restored with it.
+          echo "image=$PREV" >> "$GITHUB_OUTPUT"
+          echo "sha=${PREV##*:}" >> "$GITHUB_OUTPUT"
+          echo "Currently live: ${PREV:-<none usable>}"
+
+      # GIT_SHA travels with the image so /api/health can report which build is
+      # answering. Without it the smoke test below cannot distinguish "the new
+      # revision is healthy" from "the old revision is still serving traffic".
       - name: Deploy to Container Apps
         run: |
           az containerapp update \
             --name ${{ secrets.AZURE_CA_NAME }} \
             --resource-group ${{ secrets.AZURE_RG }} \
-            --image ${{ secrets.AZURE_ACR_NAME }}.azurecr.io/fotballpred-backend:${{ github.sha }}
+            --image ${{ secrets.AZURE_ACR_NAME }}.azurecr.io/fotballpred-backend:${{ github.sha }} \
+            --set-env-vars GIT_SHA=${{ github.sha }}
 
+      # Readiness, not liveness. /api/health is deliberately process-only — it
+      # answers 200 "healthy" with no database and no model loaded, so the old
+      # smoke test passed on a deployment that could not serve a single request.
+      # /api/health/ready returns 503 until both are usable, and reports the
+      # build sha so we know it is the revision we just pushed.
       - name: Smoke test
+        id: smoke
         run: |
           APP_URL=$(az containerapp show \
             --name ${{ secrets.AZURE_CA_NAME }} \
             --resource-group ${{ secrets.AZURE_RG }} \
             --query properties.configuration.ingress.fqdn -o tsv)
 
+          EXPECTED="${{ github.sha }}"
           for i in {1..30}; do
-            if curl -sf "https://$APP_URL/api/health" | grep -q '"status":"healthy"'; then
-              echo "Smoke test passed"
+            BODY=$(curl -sf --max-time 30 "https://$APP_URL/api/health/ready" || true)
+            SERVED=$(echo "$BODY" | python3 -c \
+              'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)
+            STATUS=$(echo "$BODY" | python3 -c \
+              'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)
+
+            if [ "$STATUS" = "ready" ] && [ "$SERVED" = "$EXPECTED" ]; then
+              echo "Smoke test passed — $EXPECTED is ready"
               exit 0
             fi
-            echo "Attempt $i: not healthy yet, waiting..."
+            echo "Attempt $i: status='${STATUS:-no response}' version='${SERVED:0:12}' (want ready/${EXPECTED:0:12})"
             sleep 10
           done
 
-          echo "Smoke test failed"
+          echo "Smoke test failed after 5 minutes"
           exit 1
+
+      # A failed smoke test used to leave the broken revision serving traffic
+      # while the job turned red. Put the last known-good image back before
+      # failing the run.
+      - name: Roll back on failed smoke test
+        if: failure() && steps.smoke.outcome == 'failure' && steps.previous.outputs.image != ''
+        run: |
+          echo "Rolling back to ${{ steps.previous.outputs.image }}"
+          # GIT_SHA goes back with the image. Leaving the new sha stamped on the
+          # old build would make /api/health lie about what is running, exactly
+          # when someone is trying to work out what happened.
+          az containerapp update \
+            --name ${{ secrets.AZURE_CA_NAME }} \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --image ${{ steps.previous.outputs.image }} \
+            --set-env-vars GIT_SHA=${{ steps.previous.outputs.sha }}
+          echo "Rolled back. The failing image is still in ACR tagged ${{ github.sha }}."

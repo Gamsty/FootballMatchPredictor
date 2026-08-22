@@ -1,0 +1,49 @@
+name: Frontend CI
+
+# The frontend deploys straight from git via Vercel, so until now nothing ran
+# lint or a production build before it went live: a syntax error or a failed
+# `vite build` was only discovered by Vercel after the push, and a lint
+# regression was never discovered at all.
+#
+# This job does not deploy — Vercel still owns that. It exists so a broken
+# frontend fails on the pull request instead of in production.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+  pull_request:
+    paths:
+      - 'frontend/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` rather than `npm install` so the lockfile is authoritative —
+      # CI must build what Vercel builds, not a freshly resolved dependency tree.
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build

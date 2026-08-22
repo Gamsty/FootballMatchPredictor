@@ -20,6 +20,9 @@ param footballApiKey string
 @description('Image tag for the backend container')
 param backendImageTag string = 'latest'
 
+@description('Commit sha the backend image was built from. Passed through to the container as GIT_SHA and reported at /api/health. Left empty when deploying the `latest` tag, where the sha is genuinely unknown.')
+param backendGitSha string = ''
+
 var prefix = '${projectName}-${env}'
 var prefixNoDash = '${projectName}${env}'
 
@@ -112,6 +115,7 @@ module containerApp 'modules/containerApp.bicep' = {
     keyVaultName: keyVault.outputs.name
     appInsightsConnectionString: appInsights.outputs.connectionString
     imageTag: backendImageTag
+    gitSha: backendGitSha
     oddsCacheStorageName: cae.outputs.oddsCacheStorageName
   }
 }
