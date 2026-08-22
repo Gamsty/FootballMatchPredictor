@@ -16,7 +16,7 @@ Data flow:
 */
 
 import { useState, useEffect, useCallback } from 'react';
-import { footballAPI, getBetToken } from '../services/api';
+import { footballAPI, getBetToken, describeApiError, isCanceled } from '../services/api';
 import MatchCard from '../components/MatchCard';
 import FilterBar from '../components/FilterBar';
 import CategoryTabs from '../components/CategoryTabs';
@@ -65,6 +65,12 @@ function Dashboard() {
     const [matches, setMatches] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    // Background auto-refresh state, kept apart from `loading` so a poll never
+    // takes the slate off screen. `staleSince` is set when a background refresh
+    // fails, so the header can say the numbers may be out of date instead of
+    // silently showing old ones.
+    const [refreshing, setRefreshing] = useState(false);
+    const [staleSince, setStaleSince] = useState(null);
 
     // UI state
     const [activeTab, setActiveTab] = useState('today');
@@ -100,26 +106,46 @@ function Dashboard() {
 
     // Fetch all matches for the next 7 days. Tab filtering happens client-side
     // (see filteredMatches below), so the fetch itself doesn't depend on activeTab.
-    const fetchPredictions = useCallback(async () => {
-        setLoading(true);
-        setError(null);
+    //
+    // `background` separates the 5-minute auto-refresh from the first load. A
+    // background pass must not raise the loading flag (the whole slate is behind
+    // `!loading`, so every refresh collapsed the page to a spinner and threw the
+    // reader's scroll position away) and must not clear the list on failure —
+    // one flaky poll should not wipe good data off the screen.
+    const fetchPredictions = useCallback(async ({ background = false } = {}) => {
+        if (!background) {
+            setLoading(true);
+            setError(null);
+        } else {
+            setRefreshing(true);
+        }
         try {
             const params = { days: 7, sort_by: 'date' };
             const data = await footballAPI.getUpcomingPredictions(params);
             setMatches(data.matches || []);
+            setError(null);
         } catch (err) {
-            setError('Failed to load predictions. Make sure the backend is running.');
+            if (isCanceled(err)) return;
             console.error(err);
+            if (background) {
+                // Keep what's on screen; the next tick will try again.
+                setStaleSince((prev) => prev ?? Date.now());
+            } else {
+                setError(describeApiError(err, 'Failed to load predictions. Make sure the backend is running.'));
+            }
+            return;
         } finally {
-            setLoading(false);
+            if (background) setRefreshing(false);
+            else setLoading(false);
         }
+        setStaleSince(null);
     }, []);
 
     useEffect(() => { fetchPredictions(); }, [fetchPredictions]);
 
     // Auto-refresh every 5 minutes
     useEffect(() => {
-        const interval = setInterval(fetchPredictions, 5 * 60 * 1000);
+        const interval = setInterval(() => fetchPredictions({ background: true }), 5 * 60 * 1000);
         return () => clearInterval(interval);
     }, [fetchPredictions]);
 
@@ -230,7 +256,25 @@ function Dashboard() {
                 Lead paragraph reads as a single column on mobile vs ~60ch on
                 desktop. Meta-links bar uses flex-wrap so it doesn't overflow. */}
             <section className="mb-8 sm:mb-10">
-                <div className="eyebrow mb-3 sm:mb-4">Today's slate</div>
+                <div className="eyebrow mb-3 sm:mb-4 flex items-center gap-3 flex-wrap">
+                    <span>Today's slate</span>
+                    {/* Background refresh is deliberately quiet — a subtle marker
+                        rather than swapping the page for a spinner. A failed poll
+                        keeps the last good slate on screen and says so. */}
+                    {refreshing && (
+                        <span className="mono text-[0.6rem] normal-case tracking-normal text-ink-muted">
+                            refreshing…
+                        </span>
+                    )}
+                    {staleSince && !refreshing && (
+                        <span
+                            className="mono text-[0.6rem] normal-case tracking-normal text-warning cursor-help border-b border-dotted border-warning/40"
+                            title={`Last successful update ${new Date(staleSince).toLocaleTimeString()}. Showing the most recent data that loaded.`}
+                        >
+                            couldn't refresh — showing last known
+                        </span>
+                    )}
+                </div>
                 <h1 className="display text-[2rem] sm:text-5xl md:text-6xl font-light leading-[0.95] mb-4 sm:mb-5">
                     Match
                     <span className="display-italic"> predictions</span>
@@ -434,15 +478,25 @@ function Dashboard() {
                         </div>
                         <div className="flex-1" />
                         <div className="text-right">
+                            {/* Every leg is priced at 1/probability, so the combined
+                                figure is the model's own fair price with no margin in
+                                it. A bookmaker takes its cut on EVERY leg, so the gap
+                                compounds: at NT's typical 8-12% per leg a four-fold
+                                pays roughly 28-40% less than the number below. The
+                                single-leg case already said "model odds"; the multi-leg
+                                case dropped that framing exactly where it matters most. */}
                             <div className="mono text-[0.6rem] sm:text-[0.65rem] uppercase tracking-[0.12em] text-ink-muted">
-                                {accumulator.length === 1
-                                    ? <>Model odds: <span className="text-ink">{accResult.totalOdds}</span></>
-                                    : <>Combined odds: <span className="text-ink">{accResult.totalOdds}</span></>
-                                }
+                                Model odds: <span className="text-ink">{accResult.totalOdds}</span>
                             </div>
                             <div className="display text-base sm:text-lg text-accent mt-0.5">
                                 {accResult.potentialReturn.toLocaleString()} NOK
                                 <span className="mono text-[0.65rem] sm:text-xs text-accent-soft ml-2">+{accResult.profit.toLocaleString()}</span>
+                            </div>
+                            <div
+                                className="mono text-[0.55rem] sm:text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-1 cursor-help border-b border-dotted border-ink-muted/30 inline-block"
+                                title="Legs are priced at 1/probability — the model's fair odds, with no bookmaker margin. Norsk Tipping takes 8-12% per leg, which compounds across a combo, so the real payout is materially lower. Log the bet to enter the price you actually got."
+                            >
+                                at fair odds · NT pays less
                             </div>
                         </div>
                         {/* Log button — advanced-mode only. Single leg routes to
@@ -494,7 +548,10 @@ function Dashboard() {
                                         })),
                                         combinedOdds,
                                         combinedProb,
-                                        combinedEdge: combinedProb * combinedOdds - 1,
+                                        // Legs are priced at 1/prob, so prob x odds - 1
+                                        // is exactly 0 — an identity, not a measurement.
+                                        // null tells LogComboModal to omit the field.
+                                        combinedEdge: null,
                                         defaultStake: stake || 100,
                                     });
                                 }}

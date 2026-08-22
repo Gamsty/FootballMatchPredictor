@@ -15,7 +15,7 @@ A full-stack machine learning application that predicts football match outcomes 
 
 - **Frontend**: [football-match-predictor-pearl.vercel.app](https://football-match-predictor-pearl.vercel.app)
 - **API**: Azure Container Apps (scale-to-zero — first request after idle takes ~5–10 sec to spin up)
-- **Model**: Stacked ensemble (XGBoost + Random Forest + Logistic Regression) — AUC 0.79 on 90-day holdout, ~56% accuracy on the 3-class match outcome
+- **Model**: Stacked ensemble (XGBoost + Random Forest + Logistic Regression) — AUC 0.638, 49.8% accuracy on the 3-class match outcome, measured on a chronological 15% holdout (6,396 matches to 2026-05)
 
 ![Match Predictions dashboard](docs/screenshots/football-predictor-dashboard.png)
 
@@ -26,7 +26,7 @@ A full-stack machine learning application that predicts football match outcomes 
 - **Infrastructure as Code** — full Bicep, `az deployment group create` rebuilds the entire stack
 - **CI/CD via GitHub Actions + OIDC** — no long-lived credentials in GitHub
 - **MLOps with validation gates** — nightly retraining job trains the same stacked-ensemble architecture as production; new model must hold AUC within 0.02 of the deployed model before promotion
-- **Leakage-safe training** — chronological train/test split, TimeSeriesSplit CV for stacking meta-features, constant rest-day imputation, Elo computed only from past matches
+- **Leakage-safe training** — chronological train/test split; expanding-window stacking so the meta-learner only sees out-of-time base predictions; **point-in-time league tables** rebuilt from results before each kickoff; constant rest-day imputation; Elo computed only from past matches
 - **Model audit trail** — rejected candidates preserved in `models/candidate/` with timestamps; promoted models versioned as `best_model_YYYYMMDDTHHMMSS.pkl` with manifest (`latest.json`) recording AUC before/after, holdout size, and training set size
 - **Defensive API surface** — admin endpoints (model reload, fixture refresh) gated by constant-time token check; sanitized error responses (no stack traces or SQL fragments leak to clients); request body capped at 256 KB; query params clamped
 - **Observability** — Application Insights with structured logs and custom metrics
@@ -49,7 +49,7 @@ A full-stack machine learning application that predicts football match outcomes 
 - **Combo presets** — auto-generated Safest / Best-edge / Treble suggestions with combined margin drag and Kelly-adjusted stake
 - **Compound markets** — BTTS & Win combinations priced from the model, with manual NT odds entry for edge discovery
 - **Paper bet logging + automatic settlement** — `POST /api/bets` and `/api/bets/combo` record single and multi-leg bets; settler runs on read so finished matches resolve in-place. Tri-state resolution (won / lost / **void**) prevents auto-LOSS when half-time, corners, or cards data is missing
-- **Performance hub** — ROI, hit rate, CLV vs closing odds, edge calibration, segment breakdowns by market / league / month, activity feed of recently settled bets
+- **Performance hub** — ROI, hit rate, CLV vs the de-vigged closing line, edge calibration, segment breakdowns by market / league / month, activity feed of recently settled bets
 - **Bet-write auth** — `X-Bet-Token` shared-secret header on writes; read endpoints stay public. Frontend bootstraps the token from a `?bet_token=` URL param into localStorage
 
 ### Quota- and infra-aware design
@@ -90,6 +90,37 @@ graph TB
     Job --> AI
     Job -->|hot reload webhook| CA
 ```
+
+### A note on the reported metrics
+
+An earlier version of this README quoted AUC 0.79. That figure came from a pipeline
+with two defects, both since fixed:
+
+- **League-table leakage.** Standings were stored as end-of-season tables and read
+  with no date filter, so a match played in September was featurised with the table
+  from the following May. Measured cost: the same model scored **AUC 0.666** on its
+  own holdout but **0.607** when fed the standings production actually supplies — a
+  0.059 illusion. With point-in-time tables the pipeline reports **0.638**, which is
+  0.032 *better* than what was really being served.
+- **Fragmented club identities.** Synthetic CSV team IDs were derived from Python's
+  per-process-randomised `hash()`, so re-loads minted new identities; clubs present
+  in both data sources also got one row per source. Features key on `team_id`, so a
+  club with four identities had its form and head-to-head built from a quarter of its
+  history. 3,537 team rows collapsed to 434 after repair
+  (`jobs/remap_synthetic_team_ids.py`).
+
+The lower number is the honest one. Combo probabilities remain products of marginal
+probabilities and are flagged `independence_assumed` in the API — real outcomes are
+correlated, so combo edges are indicative, not measured.
+
+Closing line value had a matching problem. Every bet in this log is priced at Norsk
+Tipping, whose 8-12% margin does not compare to the 2-3% on the sharp books the
+snapshot job records: `placed_odds / best_closing_odds - 1` was negative for
+essentially every bet regardless of merit, so it measured the bookmaker rather than
+the bet. `/api/bets/performance` now also reports **`avg_clv_fair`**, which de-vigs
+the closing market before comparing — a bet taken at NT 2.05 against a fair line of
+1.98 reads +3.5% there, where the old metric reported -6.8%. `avg_clv` is retained
+unchanged for continuity and is still the best-book comparison.
 
 ## Prediction Markets
 
@@ -176,7 +207,8 @@ python src/model_training.py       # train models (optional — pre-trained .pkl
 ### Core
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/health` | API status and model info |
+| GET | `/api/health` | Liveness — process + model status. Never touches the DB, so a Postgres blip can't restart-loop the container (this is what the Container Apps *liveness* probe polls) |
+| GET | `/api/health/ready` | Readiness — 503 when the model failed to load or the database is unreachable. Polled by the *readiness* probe so an unusable replica leaves rotation instead of serving 500s |
 | GET | `/api/teams` | List all teams |
 | GET | `/api/teams/:id` | Team details with stats and recent form |
 | GET | `/api/competitions` | List of leagues in database |
@@ -213,7 +245,7 @@ python src/model_training.py       # train models (optional — pre-trained .pkl
 | GET    | `/api/bets/:id` | Single-bet detail including per-leg resolution for combos |
 | DELETE | `/api/bets/:id` | Remove a bet (operator override; primarily for fat-finger fixes) |
 | POST   | `/api/bets/settle` | Force-settle pending bets whose matches have finished — same logic that runs implicitly on list, but explicit for UI feedback |
-| GET    | `/api/bets/performance` | Aggregated ROI, hit rate, CLV vs closing odds, edge calibration, segment breakdowns |
+| GET    | `/api/bets/performance` | Aggregated ROI, hit rate, CLV vs the de-vigged closing line, edge calibration, segment breakdowns |
 
 ### Admin (require `X-Reload-Token` header unless noted)
 | Method | Endpoint | Description |
@@ -272,7 +304,10 @@ FootballMatchPredictor/
 │   │   └── sofascore_scraper.py    # (understat scraper is deprecated — see file header)
 │   ├── jobs/
 │   │   ├── Dockerfile              # Retrain / backfill / snapshot job container
-│   │   └── retrain.py              # Nightly retrain + AUC validation gate
+│   │   ├── retrain.py              # Nightly retrain + AUC validation gate
+│   │   └── remap_synthetic_team_ids.py  # One-time repair for CSV team IDs minted
+│   │                               # by the old randomised-hash scheme (dry-run
+│   │                               # by default; see docs/azure-runbook.md §6.2)
 │   ├── tests/                      # pytest — odds API, value bets, bet endpoints, combo settle, calibrator
 │   ├── requirements.txt
 │   ├── wsgi.py
@@ -373,13 +408,24 @@ az storage blob upload ...
 # 5. Vercel: set VITE_API_URL=https://<container-app-fqdn>/api, redeploy
 ```
 
-### Continuous deployment
+### CI, and a deliberately manual deploy
 
-Push to `main` triggers `.github/workflows/backend.yml`:
-1. Lint + test against ephemeral Postgres
-2. Build Docker image, push to ACR with commit SHA tag
-3. Update Container App revision
-4. Smoke-test `/api/health`
+`.github/workflows/backend.yml` runs on every push and pull request:
+1. Lint (`src/`, `jobs/`, `tests/`) + test against an ephemeral Postgres
+
+Deploying is a separate, **manually triggered** job — Actions → Backend CI/CD →
+Run workflow, from `main`. It is not wired to a merge: this project is developed
+and run locally, and a merge should not be able to replace the running
+production image on its own. `needs: test` still applies, so a manual run cannot
+skip the suite.
+
+2. Build the Docker image, push to ACR tagged with the commit SHA
+3. Update the Container App revision, stamping `GIT_SHA` on it
+4. Smoke-test `/api/health/ready` and require the reported `version` to match the
+   commit being deployed — the previous image is restored automatically if not
+
+`.github/workflows/frontend.yml` runs lint + `vite build` on pull requests. It
+does not deploy; Vercel builds from `main` itself.
 
 ## Author
 

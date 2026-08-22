@@ -17,8 +17,9 @@ reports enabled=false (ODDS_API_KEY missing).
 */
 
 import { useState, useEffect, useRef } from 'react';
-import { footballAPI, getBetToken } from '../services/api';
+import { footballAPI, getBetToken, describeApiError } from '../services/api';
 import { formatTime, formatMatchDate, COMPETITION_LABELS } from '../utils/constants';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const FRACTIONAL_KELLY = 0.25;
@@ -95,7 +96,7 @@ function ValueBets({ onSelectMatch }) {
                     retryTimer = setTimeout(() => fetchOnce(1), 3000);
                     return;
                 }
-                setError(err.message || 'Failed to load value bets');
+                setError(describeApiError(err, 'Failed to load value bets'));
             } finally {
                 setLoading(false);
             }
@@ -540,6 +541,9 @@ function ValueBets({ onSelectMatch }) {
 // ----------------------------------------------------------------------------
 
 export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     const [stake, setStake] = useState(defaultStake);
     // Odds at-bet is editable so the user can override Pinnacle's median with
     // the actual NT price they got. Round to 2 decimals on init so
@@ -617,6 +621,9 @@ export function LogBetModal({ pick, defaultStake, defaultOdds, onClose, onLogged
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Log bet"
             className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >

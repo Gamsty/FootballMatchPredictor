@@ -48,7 +48,7 @@ except ImportError:
 
 from sqlalchemy import and_
 
-from database import DatabaseManager, Match, Team
+from database import DatabaseManager, Match
 from understat_scraper import LEAGUE_SLUGS, scrape_season_xg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

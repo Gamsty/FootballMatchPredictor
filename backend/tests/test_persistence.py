@@ -10,12 +10,11 @@ These tests prove the schema and the persister actually agree.
 
 from __future__ import annotations
 
-import importlib
 import sys
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import Column, Index, Integer, inspect
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 
 @pytest.fixture
@@ -23,26 +22,13 @@ def db_session(monkeypatch):
     """
     Build an in-memory SQLite session bound to fresh metadata.
 
-    database.py's module-level `create_engine` call uses Postgres-specific pool
-    args (max_overflow, pool_timeout) that SQLite rejects. We patch create_engine
-    on the SQLAlchemy module before import so those args become no-ops on sqlite.
-    Then we rebuild the engine fresh and bind a new session factory.
+    database.py picks its pool arguments per dialect (_engine_options), so a
+    sqlite URL just works — this fixture used to monkeypatch create_engine to
+    strip Postgres-only kwargs that SQLite rejects at import.
     """
     monkeypatch.setenv('DATABASE_URL', 'sqlite:///:memory:')
 
-    # Wrap create_engine to silently drop Postgres-only kwargs when targeting sqlite
-    import sqlalchemy
-    real_create_engine = sqlalchemy.create_engine
-
-    def _patched_create_engine(url, *args, **kwargs):
-        if str(url).startswith('sqlite'):
-            for k in ('max_overflow', 'pool_timeout', 'pool_size', 'pool_recycle', 'pool_pre_ping'):
-                kwargs.pop(k, None)
-        return real_create_engine(url, *args, **kwargs)
-
-    monkeypatch.setattr(sqlalchemy, 'create_engine', _patched_create_engine)
-
-    # Force fresh import so the patched create_engine is used
+    # Fresh import so the engine binds to the sqlite URL set above.
     for mod in ('database',):
         if mod in sys.modules:
             del sys.modules[mod]
@@ -142,7 +128,6 @@ class TestPersistPrediction:
     def _persist(self, db_mod, session, match, prediction_data, model_data):
         """Inline copy of _persist_prediction stripped of app.py's globals.
         Keeps the test self-contained while still exercising the SQL path."""
-        from datetime import datetime
         result = prediction_data.get('match_result') or {}
         probs = result.get('probabilities') or {}
         if not probs.get('home_win'):
@@ -274,7 +259,8 @@ class TestPersistPrediction:
         session.commit()
 
         # Simulate the settler logic (mirrors _settle_one_bet in app.py)
-        resolver = lambda match: match.winner == 'HOME_TEAM'
+        def resolver(match):
+            return match.winner == 'HOME_TEAM'
         won = resolver(m)
         bet.status = 'won' if won else 'lost'
         bet.profit_loss = bet.stake * (bet.odds_at_bet - 1) if won else -bet.stake
@@ -354,3 +340,88 @@ class TestPersistPrediction:
         assert len(snaps) == 2
         versions = {s.model_version for s in snaps}
         assert versions == {'v1', 'v2'}
+
+
+# ---------------------------------------------------------------------------
+# Schema migrations — indexes declared after a table already exists
+# ---------------------------------------------------------------------------
+
+class TestIndexSync:
+    """
+    Regression cover for the class of bug that left ix_matches_home_date_status
+    missing in production: create_all() skips existing tables entirely, so an
+    Index added to __table_args__ later is never emitted, and nothing errors.
+    """
+
+    def test_create_all_alone_does_not_add_index_to_existing_table(self, db_session):
+        db_mod, _ = db_session
+        base = declarative_base()
+
+        class _T1(base):  # noqa: N801
+            __tablename__ = 'idxprobe'
+            id = Column(Integer, primary_key=True)
+            a = Column(Integer)
+
+        base.metadata.create_all(bind=db_mod.engine)
+
+        # Same table, now declaring an index — i.e. a later code change.
+        base2 = declarative_base()
+
+        class _T2(base2):  # noqa: N801
+            __tablename__ = 'idxprobe'
+            id = Column(Integer, primary_key=True)
+            a = Column(Integer)
+            __table_args__ = (Index('ix_idxprobe_a', 'a'),)
+
+        base2.metadata.create_all(bind=db_mod.engine)
+
+        names = {i['name'] for i in inspect(db_mod.engine).get_indexes('idxprobe')}
+        assert 'ix_idxprobe_a' not in names, (
+            "create_all grew the ability to add indexes to existing tables — "
+            "the _sync_indexes pass may no longer be needed"
+        )
+
+    def test_sync_indexes_creates_the_missing_index(self, db_session):
+        db_mod, _ = db_session
+        base = declarative_base()
+
+        class _T(base):  # noqa: N801
+            __tablename__ = 'idxprobe2'
+            id = Column(Integer, primary_key=True)
+            a = Column(Integer)
+
+        base.metadata.create_all(bind=db_mod.engine)
+
+        # Declare the index after the fact, against database.py's own metadata,
+        # then run the sync the way init_db() does.
+        table = _T.__table__.to_metadata(db_mod.Base.metadata)
+        Index('ix_idxprobe2_a', table.c.a)
+        try:
+            engine_inspector = inspect(db_mod.engine)
+            db_mod._sync_indexes(engine_inspector, set(engine_inspector.get_table_names()))
+            names = {i['name'] for i in inspect(db_mod.engine).get_indexes('idxprobe2')}
+            assert 'ix_idxprobe2_a' in names
+        finally:
+            db_mod.Base.metadata.remove(table)
+
+    def test_declared_indexes_exist_after_init(self, db_session):
+        """The composite indexes the feature queries rely on must be present."""
+        db_mod, _ = db_session
+        names = {i['name'] for i in inspect(db_mod.engine).get_indexes('matches')}
+        assert 'ix_matches_home_date_status' in names
+        assert 'ix_matches_away_date_status' in names
+
+    def test_standings_uniqueness_is_enforced(self, db_session):
+        """add_standing upserts on (team_id, season, competition) — duplicates must fail."""
+        from sqlalchemy.exc import IntegrityError
+
+        db_mod, session = db_session
+        team = _make_team(session, db_mod, 9001, 'Index Test FC')
+        session.add(db_mod.Standing(team_id=team.id, season=2025,
+                                    competition='Premier League', position=1))
+        session.commit()
+        session.add(db_mod.Standing(team_id=team.id, season=2025,
+                                    competition='Premier League', position=7))
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()

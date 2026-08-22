@@ -35,6 +35,9 @@ def client(monkeypatch):
     """
     from app import app as flask_app
     monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
+    # The gate only fails open outside production, so pin the environment
+    # rather than inheriting whatever the developer's .env happens to say.
+    monkeypatch.setenv('FLASK_ENV', 'development')
     flask_app.config['TESTING'] = True
     return flask_app.test_client()
 

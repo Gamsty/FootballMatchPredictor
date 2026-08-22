@@ -584,54 +584,95 @@ const ordinal = (n) => {
     return 'th';
 };
 
+// Upper bound on what counts as a recommendation.
+//
+// collectCandidates emits every Over/Under line from 0.5 through 5.5, so the
+// pool always contains near-certainties: "Under 4.5 Goals" and "Over 0.5 Goals"
+// sit at 85-95% on almost every fixture. Ranking by probability alone therefore
+// handed the "Safest bet" slot to a totals line on most matches — measured on a
+// real slate, "Under 4.5 Goals" filled it on 6 of 12 fixtures, and the card read
+// identically match after match.
+//
+// Those outcomes are also not bettable in any useful sense: a bookmaker prices
+// 90% at about 1.03-1.05 after margin, against the 1.11 the model's fair price
+// implies. Capping the pool keeps the slot on outcomes where the model is saying
+// something a reader could act on.
+const MAX_RECOMMENDABLE_PROB = 0.85;
+
+// Markets that describe the same underlying quantity. Best and Safest picking
+// "Under 3.5 Goals" and "Under 4.5 Goals" are two labels for one opinion, so the
+// slots are deduplicated by family rather than by label.
+const marketFamily = (market) => {
+    if (!market) return 'other';
+    if (market.startsWith('over_') || market.startsWith('under_')) return 'totals';
+    if (market === 'result' || market === 'double_chance') return 'result';
+    return market;
+};
+
 // Get two recommended bets for a match:
-//   - Best Bet: picks from the 60-80% probability "sweet spot" for best value
-//     (highest odds within a confident range). Falls back to any bet above 60%.
-//   - Safest Bet: the single highest probability bet above 60%.
-// If both pick the same bet, an alternative is found for the safest slot.
+//   - Best Bet: the longest price (lowest probability) still inside the 60-80%
+//     confident band. Note this is the model's own fair price — no bookmaker odds
+//     are involved, so it is "the boldest call we still believe", not measured
+//     value. Value against real prices lives in the Value tab.
+//   - Safest Bet: the highest probability that is still a real proposition
+//     (see MAX_RECOMMENDABLE_PROB).
+// The two slots must come from different market families; if they collide, the
+// safest slot falls back to the next-best candidate elsewhere.
 // Each bet includes a generated reason (array of bullet-point strings).
 export const getRecommendedBets = (match) => {
     if (!match.prediction?.probabilities) return null;
 
-    const candidates = collectCandidates(match);
+    const candidates = collectCandidates(match).filter(c => c.prob <= MAX_RECOMMENDABLE_PROB);
     const qualified = candidates.filter(c => c.prob >= 0.60);
 
-    // --- BEST BET: 60-80% range, pick highest odds (lowest prob) for best value ---
+    // --- BEST BET: 60-80% range, pick highest odds (lowest prob) ---
     const sweetSpot = candidates.filter(c => c.prob >= 0.60 && c.prob <= 0.80);
     let bestBet;
     if (sweetSpot.length > 0) {
-        sweetSpot.sort((a, b) => a.prob - b.prob);
-        bestBet = { ...sweetSpot[0], type: 'best' };
+        const sorted = [...sweetSpot].sort((a, b) => a.prob - b.prob);
+        bestBet = { ...sorted[0], type: 'best' };
     } else if (qualified.length > 0) {
-        qualified.sort((a, b) => a.prob - b.prob);
-        bestBet = { ...qualified[0], type: 'best' };
+        const sorted = [...qualified].sort((a, b) => a.prob - b.prob);
+        bestBet = { ...sorted[0], type: 'best' };
     }
 
-    // --- SAFEST BET: highest probability overall (at least 60%) ---
+    // --- SAFEST BET: highest probability that's still a real proposition ---
     let safestBet;
     if (qualified.length > 0) {
         const sorted = [...qualified].sort((a, b) => b.prob - a.prob);
         safestBet = { ...sorted[0], type: 'safest' };
     }
 
-    // Deduplicate: if both picked the same bet, find an alternative for safest
-    const used = new Set();
+    // Deduplicate by market family, not just label — "Under 3.5" and "Under 4.5"
+    // are the same opinion stated twice.
+    //
+    // The fallback holds the same 60% floor as the primary selection. Dropping
+    // it to 55% (as an earlier version did) meant a collision could fill the
+    // "Safest bet" slot with a coin-flip. One honest recommendation beats two
+    // where the second contradicts its own label.
+    const usedLabels = new Set();
+    const usedFamilies = new Set();
     const result = [];
 
     for (const bet of [bestBet, safestBet]) {
         if (!bet) continue;
-        if (used.has(bet.label)) {
-            const alt = candidates
-                .filter(c => c.prob >= 0.55 && !used.has(c.label))
-                .sort((a, b) => b.prob - a.prob)[0];
-            if (alt) {
-                result.push({ ...alt, type: bet.type, reason: generateBetReason(alt, match) });
-                used.add(alt.label);
-            }
-        } else {
-            result.push({ ...bet, reason: generateBetReason(bet, match) });
-            used.add(bet.label);
+        const collides = usedLabels.has(bet.label) || usedFamilies.has(marketFamily(bet.market));
+        const chosen = collides
+            ? candidates
+                .filter(c => c.prob >= 0.60
+                    && !usedLabels.has(c.label)
+                    && !usedFamilies.has(marketFamily(c.market)))
+                .sort((a, b) => b.prob - a.prob)[0]
+            : bet;
+        if (!chosen) continue;
+        // "Safest" has to actually be the safer of the two, or the label lies.
+        if (bet.type === 'safest') {
+            const best = result.find(r => r.type === 'best');
+            if (best && chosen.prob < best.prob) continue;
         }
+        result.push({ ...chosen, type: bet.type, reason: generateBetReason(chosen, match) });
+        usedLabels.add(chosen.label);
+        usedFamilies.add(marketFamily(chosen.market));
     }
 
     return result.length > 0 ? result : null;

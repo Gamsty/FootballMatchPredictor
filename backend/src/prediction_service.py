@@ -73,7 +73,19 @@ def compute_features(home_team, away_team, feature_engineer, model_data,
         val = features.get(k)
         raw_stats[k] = round(val, 2) if val is not None else None
 
-    # Replace None values with 0 (upcoming matches often have None for many features)
+    # Rest days must be imputed BEFORE the blanket zero-fill below. Training fills
+    # a missing gap with 7 days (_build_xy_from_csv), deliberately — a constant so
+    # no holdout statistics leak into the train set. Serving used to let the
+    # zero-fill win, so a club with no prior fixture in the DB (season openers,
+    # promoted sides, any coverage gap) was served rest_days=0 against a model
+    # that learned on 7. The `g(..., 7)` defaults in _compute_derived_features
+    # never fired either, because by then the value was 0 rather than None.
+    for key in ('days_since_home_last_match', 'days_since_away_last_match'):
+        if features.get(key) is None:
+            features[key] = 7
+
+    # Replace remaining None values with 0 (upcoming matches often have None for
+    # many features)
     for key in list(features.keys()):
         if features[key] is None:
             features[key] = 0
@@ -216,7 +228,10 @@ def predict_match_result(features_dict, model_data, apply_calibration: bool = Tr
     raw_draw = float(proba[1])
     raw_away = float(proba[0])
 
-    # Apply calibration if available — single-T rescaling preserves argmax
+    # Apply calibration if available. Temperature scaling is monotone, so the
+    # ranking survives it. An isotonic calibrator is fitted per class and then
+    # renormalised, which can reorder outcomes — so nothing downstream may
+    # assume the calibrated argmax matches the raw one.
     calibrator = model_data.get('calibrator') if apply_calibration else None
     if calibrator is not None:
         # Calibrator expects same class order as `proba`
@@ -229,7 +244,10 @@ def predict_match_result(features_dict, model_data, apply_calibration: bool = Tr
         home_prob, draw_prob, away_prob = raw_home, raw_draw, raw_away
         is_calibrated = False
 
-    # Argmax doesn't change under temperature scaling — compute from either
+    # Recomputed from the CALIBRATED probabilities. This was previously
+    # justified with "argmax doesn't change under temperature scaling" — true of
+    # temperature, false of the isotonic calibrator that was actually in
+    # service, which flipped the pick on two of six fixtures sampled.
     pred_idx = int(np.argmax([away_prob, draw_prob, home_prob]))
     outcome_map = {0: 'AWAY_WIN', 1: 'DRAW', 2: 'HOME_WIN'}
 
@@ -366,8 +384,30 @@ def predict_all_markets(features_dict, model_data, multi_market_models):
     }
 
 
+# Combo probabilities are products of marginals, i.e. they assume the two
+# markets are independent. They are not: a home win co-occurs with "no BTTS"
+# far more often than P(home) x P(no BTTS) implies, and a draw with over 2.5
+# far less. The error has a sign that varies by combination, so it cannot be
+# corrected with a single fudge factor — pricing these properly needs a joint
+# scoreline model (bivariate Poisson / Dixon-Coles) that yields mutually
+# consistent 1X2, BTTS and totals probabilities.
+#
+# Until then every combo carries `independence_assumed: True` so consumers can
+# label the number honestly rather than treating it as a modelled joint
+# probability. Edges computed from these are indicative, not measured.
+COMBO_INDEPENDENCE_NOTE = (
+    "Combined probability is the product of two market probabilities and assumes "
+    "they are independent. Real football outcomes are correlated, so treat combo "
+    "edges as indicative only."
+)
+
+
 def _build_combos(home_prob, draw_prob, away_prob, markets):
-    """Build all combo bet probabilities."""
+    """Build all combo bet probabilities.
+
+    See COMBO_INDEPENDENCE_NOTE — these are products of marginals, not modelled
+    joint probabilities.
+    """
     combos = {}
 
     def get_prob(market, label):
@@ -386,6 +426,7 @@ def _build_combos(home_prob, draw_prob, away_prob, markets):
                     'description': f'{label} & {desc}',
                     'probability': cp,
                     'odds': round(1 / cp, 2) if cp > 0 else None,
+                    'independence_assumed': True,
                 }
 
     # Result + Over/Under
@@ -401,11 +442,13 @@ def _build_combos(home_prob, draw_prob, away_prob, markets):
                     'description': f'{label} & Over {line}',
                     'probability': co,
                     'odds': round(1 / co, 2) if co > 0 else None,
+                    'independence_assumed': True,
                 }
                 combos[f'{key}_under_{ou[-3:]}'] = {
                     'description': f'{label} & Under {line}',
                     'probability': cu,
                     'odds': round(1 / cu, 2) if cu > 0 else None,
+                    'independence_assumed': True,
                 }
 
     # BTTS + Over/Under
@@ -421,11 +464,13 @@ def _build_combos(home_prob, draw_prob, away_prob, markets):
                     'description': f'Both Score & Over {line}',
                     'probability': cbo,
                     'odds': round(1 / cbo, 2) if cbo > 0 else None,
+                    'independence_assumed': True,
                 }
                 combos[f'btts_yes_under_{ou[-3:]}'] = {
                     'description': f'Both Score & Under {line}',
                     'probability': cbu,
                     'odds': round(1 / cbu, 2) if cbu > 0 else None,
+                    'independence_assumed': True,
                 }
 
     return combos

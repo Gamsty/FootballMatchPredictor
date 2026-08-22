@@ -22,6 +22,7 @@ Display:
 import { useEffect, useState } from 'react';
 import { footballAPI } from '../services/api';
 import { formatTime, formatMatchDate, COMPETITION_LABELS } from '../utils/constants';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 const NT_COMPOUND_STORAGE_KEY = 'fmp.nt_compound_odds.v1';
@@ -247,6 +248,9 @@ function CompoundMarkets({ canLog = false }) {
 // ---------------------------------------------------------------------------
 
 function LogCompoundModal({ summary, onClose, onLogged }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     const { match, best, defaultOdds } = summary;
     const [odds, setOdds] = useState(defaultOdds);
     const [stake, setStake] = useState(100);
@@ -289,6 +293,9 @@ function LogCompoundModal({ summary, onClose, onLogged }) {
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Log compound bet"
             className="fixed inset-0 z-50 bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >

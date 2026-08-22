@@ -10,6 +10,9 @@ param imageTag string = 'latest'
 @description('Name of the CAE-scoped storage definition for the Odds API cache file share. When empty, no volume is mounted and the cache falls back to in-memory only.')
 param oddsCacheStorageName string = ''
 
+@description('Commit sha of the running image, surfaced at /api/health as `version`. The backend deploy workflow sets this alongside the image; an infra-only deploy pins the image to `latest`, where the sha genuinely is unknown, so the default is empty rather than stale.')
+param gitSha string = ''
+
 resource ca 'Microsoft.App/containerApps@2024-03-01' = {
   name: name
   location: location
@@ -103,6 +106,17 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
             // matches the default the client constructs, but setting it here
             // makes the intent visible in the manifest.
             { name: 'ODDS_API_CACHE_FILE', value: empty(oddsCacheStorageName) ? '' : '/app/data/odds_cache.json' }
+            // Cross-replica model reload. A POST to /api/admin/reload-model only
+            // reaches ONE gunicorn worker in ONE replica; the marker file is how
+            // the others learn to re-read the model. With maxReplicas 2 it has to
+            // live on the shared Azure Files mount to work at all — on a local
+            // container filesystem each replica would only ever see its own
+            // writes and the peer would keep serving the old model indefinitely.
+            // Left unset without a mount so the backend falls back to its
+            // per-container default rather than pointing at a path that isn't there.
+            { name: 'RELOAD_MARKER_FILE', value: empty(oddsCacheStorageName) ? '' : '/app/data/model_reload.json' }
+            // Build identity. See the gitSha param for why this can be empty.
+            { name: 'GIT_SHA', value: gitSha }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
           ]
           probes: [
@@ -115,8 +129,12 @@ resource ca 'Microsoft.App/containerApps@2024-03-01' = {
               failureThreshold: 3
             }
             {
+              // Readiness gets the DB-probing endpoint, liveness above does not:
+              // an unreachable database should pull the replica out of rotation,
+              // not restart-loop the container. /api/health stays process-only so
+              // a Burstable-tier Postgres blip can't kill a healthy app.
               type: 'Readiness'
-              httpGet: { path: '/api/health', port: 5000 }
+              httpGet: { path: '/api/health/ready', port: 5000 }
               initialDelaySeconds: 30
               periodSeconds: 10
               timeoutSeconds: 5

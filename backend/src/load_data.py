@@ -56,14 +56,20 @@ def load_csv_to_database(csv_path):
         teams.add((row['home_team_id'], row['home_team_name'], row['home_team_short'], comp))
         teams.add((row['away_team_id'], row['away_team_name'], row['away_team_short'], comp))
 
+    # commit=False throughout: one transaction per batch instead of one per row.
+    # At tens of thousands of rows the per-row commit *was* the load time.
     for team_id, team_name, team_short, competition in teams:
         db.add_team(
             api_id=int(team_id),
             name=team_name,
             short_name=team_short,
-            competition=competition
+            competition=competition,
+            commit=False,
         )
         teams_added += 1
+
+    # Matches FK to teams, so this has to land before the match loop starts.
+    db.session.commit()
 
     print(f"Added {teams_added} teams")
 
@@ -90,14 +96,18 @@ def load_csv_to_database(csv_path):
             'winner': row['winner'] if pd.notna(row['winner']) else None
         }
 
-        db.add_match(match_data)
+        db.add_match(match_data, commit=False)
         matches_added += 1
 
-        # Progress log every 100 matches
+        # Progress log every 100 matches; commit in chunks so a long load never
+        # holds one enormous transaction open, and progress survives a crash.
         if (idx + 1) % 100 == 0:
+            db.session.commit()
             print(f"    Processed {idx + 1}/{len(df)} matches...")
 
     print(f"\nAdded {matches_added} matches")
+
+    db.session.commit()  # trailing partial chunk
 
     # Close database connection
     db.close()
@@ -139,7 +149,7 @@ def load_standings_to_database(standings_path):
             ).first()
 
             if team:
-                db.add_standing(team.id, season, competition, {
+                db.add_standing(team.id, season, competition, commit=False, data={
                     'position': entry['position'],
                     'played': entry['playedGames'],
                     'won': entry['won'],
@@ -151,6 +161,7 @@ def load_standings_to_database(standings_path):
                     'points': entry['points'],
                 })
                 count += 1
+    db.session.commit()
     db.close()
     print(f"Loaded {count} standing entries")
 
@@ -227,7 +238,7 @@ def compute_cl_standings_from_matches():
         )
 
         for position, (team_id, stats) in enumerate(sorted_teams, 1):
-            db.add_standing(team_id, season, 'UEFA Champions League', {
+            db.add_standing(team_id, season, 'UEFA Champions League', commit=False, data={
                 'position': position,
                 'played': stats['played'],
                 'won': stats['won'],
@@ -240,6 +251,7 @@ def compute_cl_standings_from_matches():
             })
             total += 1
 
+        db.session.commit()
         print(f"    CL {season}: {len(sorted_teams)} teams, top 3: ", end="")
         for pos, (tid, s) in enumerate(sorted_teams[:3], 1):
             team = db.session.query(Team).filter_by(id=tid).first()

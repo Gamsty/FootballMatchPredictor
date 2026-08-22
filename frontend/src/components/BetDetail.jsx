@@ -5,7 +5,7 @@ Sections:
   - Match summary (single) or "N-leg combo" header + leg list (combo)
   - Pick + odds + stake
   - Status + P/L + settle time
-  - CLV breakdown if closing odds exist
+  - CLV breakdown against the de-vigged closing line when one exists
   - Notes + bookmaker + model version
   - Delete (canEdit only)
 
@@ -14,22 +14,41 @@ Reads from the bet dict already loaded by the parent — no extra fetch.
 
 import { formatMatchDate } from '../utils/constants';
 import { MARKET_BADGE } from '../utils/marketBadges';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 
 const pct = (v) => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
 const nok = (v) => v == null ? '—' : `${v >= 0 ? '+' : ''}${Math.round(v).toLocaleString()} NOK`;
 
 function BetDetail({ bet, onClose, onDelete }) {
+    // Escape closes the topmost dialog only — see the hook for why that matters
+    // when a log-bet modal is stacked over a detail view.
+    useModalDismiss(onClose);
     if (!bet) return null;
     const m = bet.match;
     const isCombo = bet.market === 'combo' && Array.isArray(bet.combo_legs) && bet.combo_legs.length > 0;
     const marketBadge = MARKET_BADGE[bet.market];
     const settled = bet.status === 'won' || bet.status === 'lost';
-    const clv = (bet.closing_odds && bet.odds_at_bet)
-        ? bet.odds_at_bet / bet.closing_odds - 1
-        : null;
+    // Two references, and they answer different questions. `closing_odds` is the
+    // best price across trusted sharp books, so for a bet placed at Norsk Tipping
+    // this reads negative whether the bet was good or not — it measures the
+    // margin gap, not the call. `fair_closing_odds` is the same market with the
+    // margin removed, which is what the Performance summary reports. Prefer it,
+    // and label whichever one is on screen.
+    // A settled combo pays the product of the legs that stood; a void leg is
+    // set to 1.00 rather than killing the coupon.
+    const reducedCombo = bet.effective_odds != null
+        && bet.odds_at_bet != null
+        && Math.abs(bet.effective_odds - bet.odds_at_bet) > 0.005;
+
+    const clvRef = bet.fair_closing_odds ?? bet.closing_odds ?? null;
+    const clvIsFair = bet.fair_closing_odds != null;
+    const clv = (clvRef && bet.odds_at_bet) ? bet.odds_at_bet / clvRef - 1 : null;
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Bet detail"
             className="fixed inset-0 z-[60] bg-ink/60 flex items-stretch sm:items-center justify-center sm:p-4 overflow-y-auto animate-fade-in"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
@@ -93,7 +112,16 @@ function BetDetail({ bet, onClose, onDelete }) {
 
                     {/* Numbers grid */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                        <StatBox label="Odds"   value={bet.odds_at_bet?.toFixed(2) ?? '—'} />
+                        {/* A combo with a void leg settles on the legs that stood,
+                            so the price it paid is lower than the price it was
+                            quoted. Showing only the quote left a P/L that didn't
+                            reconcile with the odds next to it. */}
+                        <StatBox
+                            label={reducedCombo ? 'Odds (paid)' : 'Odds'}
+                            value={(reducedCombo ? bet.effective_odds : bet.odds_at_bet)?.toFixed(2) ?? '—'}
+                            hint={reducedCombo
+                                ? `quoted ${bet.odds_at_bet?.toFixed(2)} — a void leg dropped to 1.00`
+                                : null} />
                         <StatBox label="Stake"  value={`${bet.stake} NOK`} />
                         <StatBox
                             label="P/L"
@@ -116,7 +144,7 @@ function BetDetail({ bet, onClose, onDelete }) {
                     </div>
 
                     {/* CLV */}
-                    {bet.closing_odds && (
+                    {clvRef && (
                         <Section label="Closing line value">
                             <div className="bg-paper-tint border border-line px-4 py-3">
                                 <div className="grid grid-cols-3 gap-3">
@@ -125,8 +153,10 @@ function BetDetail({ bet, onClose, onDelete }) {
                                         <div className="mono text-sm text-ink">{bet.odds_at_bet?.toFixed(2)}</div>
                                     </div>
                                     <div>
-                                        <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-ink-muted">Closing odds</div>
-                                        <div className="mono text-sm text-ink">{bet.closing_odds.toFixed(2)}</div>
+                                        <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-ink-muted">
+                                            {clvIsFair ? 'Fair closing' : 'Closing odds'}
+                                        </div>
+                                        <div className="mono text-sm text-ink">{clvRef.toFixed(2)}</div>
                                     </div>
                                     <div>
                                         <div className="mono text-[0.6rem] uppercase tracking-[0.12em] text-ink-muted">CLV</div>
@@ -139,7 +169,9 @@ function BetDetail({ bet, onClose, onDelete }) {
                                     </div>
                                 </div>
                                 <p className="mono text-[0.6rem] uppercase tracking-[0.1em] text-ink-muted mt-3">
-                                    CLV = bet odds / closing odds − 1. Positive = beat the closing line.
+                                    {clvIsFair
+                                        ? <>CLV = bet odds / fair closing odds − 1, with the bookmaker margin removed from the closing market. Positive = beat the true line.</>
+                                        : <>CLV = bet odds / best closing odds − 1. No de-vigged line available for this bet, so this compares an NT price to the sharpest book — expect it to read low.</>}
                                 </p>
                             </div>
                         </Section>
@@ -227,11 +259,14 @@ function Section({ label, children }) {
     );
 }
 
-function StatBox({ label, value, valueClass = 'text-ink' }) {
+function StatBox({ label, value, valueClass = 'text-ink', hint }) {
     return (
         <div className="bg-paper-tint border border-line px-3 py-2.5">
             <div className="eyebrow">{label}</div>
             <div className={'mono text-base mt-0.5 font-semibold ' + valueClass}>{value}</div>
+            {hint && (
+                <div className="mono text-[0.55rem] text-ink-muted mt-0.5 leading-snug">{hint}</div>
+            )}
         </div>
     );
 }

@@ -159,6 +159,26 @@ class IsotonicCalibrator:
     probs that sum to 1.
     """
 
+    def resolution(self) -> int:
+        """Smallest number of distinct outputs any class can produce.
+
+        Isotonic regression is a step function: every input inside a step maps
+        to the same output. Fit on too few samples it has very few steps, and
+        the probability space collapses — distinct fixtures come out with
+        byte-identical probabilities, and an edge computed against a bookmaker
+        price becomes meaningless because the model can only express ~20 values.
+
+        Observed on a calibrator fit to 1,067 samples: 18/19/21 distinct outputs
+        per class, which turned six different fixtures into three predictions.
+        """
+        counts = []
+        for m in self.models:
+            ys = getattr(m, 'y_thresholds_', None)
+            if ys is None:
+                return 0
+            counts.append(len({round(float(y), 6) for y in ys}))
+        return min(counts) if counts else 0
+
     def __init__(self, models: list | None = None, class_names: list[str] | None = None):
         # `models` is a list of fitted IsotonicRegression instances, one per class.
         # Wrapped this way so we can serialize via joblib's standard pkl path.

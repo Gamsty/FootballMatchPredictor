@@ -33,6 +33,7 @@ import pandas as pd
 import os
 import sys
 import time
+import zlib
 from database import DatabaseManager, Team
 
 # ============================================================
@@ -40,6 +41,9 @@ from database import DatabaseManager, Team
 # ============================================================
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
+
+# How stale the current season's CSV may get before we re-download it.
+CURRENT_SEASON_MAX_AGE_DAYS = float(os.getenv('EXTERNAL_CSV_MAX_AGE_DAYS', '3'))
 
 # All leagues with their competition names and football-data.co.uk codes
 # Format: code -> (competition name, country)
@@ -341,7 +345,7 @@ TEAM_NAME_MAP = {
 # Helper functions
 # ============================================================
 
-def download_csv(league_code, season_code, save_dir="../data/external"):
+def download_csv(league_code, season_code, save_dir="../data/external", max_age_days=None):
     """
     Download a single league/season CSV from football-data.co.uk
 
@@ -349,6 +353,10 @@ def download_csv(league_code, season_code, save_dir="../data/external"):
         league_code (str): League code (e.g., "E0", "D1")
         season_code (str): Season code (e.g., "2324")
         save_dir (str): Directory to save downloaded files
+        max_age_days (float|None): Re-download when the cached file is older than
+            this. None means "keep whatever is on disk forever", which is right
+            for completed seasons and wrong for the current one — that file gains
+            rows every week upstream, so once downloaded it was frozen for good.
 
     Returns:
         str: Path to saved CSV file, or None if download failed
@@ -358,10 +366,14 @@ def download_csv(league_code, season_code, save_dir="../data/external"):
     url = f"{BASE_URL}/{season_code}/{league_code}.csv"
     save_path = os.path.join(save_dir, f"{league_code}_{season_code}.csv")
 
-    # Skip if already downloaded
+    # Reuse what's on disk unless it's older than the caller's freshness budget
     if os.path.exists(save_path):
-        print(f"      Already downloaded: {league_code}_{season_code}.csv")
-        return save_path
+        age_days = (time.time() - os.path.getmtime(save_path)) / 86400
+        if max_age_days is None or age_days <= max_age_days:
+            print(f"      Already downloaded: {league_code}_{season_code}.csv")
+            return save_path
+        print(f"      Refreshing {league_code}_{season_code}.csv "
+              f"({age_days:.1f}d old, max {max_age_days}d)")
 
     print(f"      Downloading {league_code} {season_code}...")
     try:
@@ -395,15 +407,58 @@ def normalize_team_name(name):
     return name
 
 
+# Teams whose generated ID collides with another club in the same league.
+# Map "Team Name" -> explicit offset-relative slot (0..48999) to break the tie.
+# Empty today: verified collision-free across every checked-in CSV season.
+TEAM_ID_OVERRIDES: dict[str, int] = {}
+
+# (league_code, generated_id) -> team_name, populated as IDs are handed out so a
+# collision surfaces at load time instead of silently merging two clubs.
+_TEAM_ID_SEEN: dict[tuple[str, int], str] = {}
+
+
 def generate_team_id(team_name, league_code):
-    """Generate a consistent synthetic API ID from team name and league"""
+    """Deterministic synthetic API ID for a club that only exists in the CSVs.
+
+    Must be stable across processes: this ID is the identity teams are matched
+    on (DatabaseManager.add_team keys on api_id), and match rows point at the
+    resulting primary key. It previously used the builtin hash(), whose string
+    hashing is randomised per interpreter — so the same club got a different ID
+    on every run, every re-load inserted a fresh set of Team rows, and each
+    club's history fragmented across the duplicates. crc32 is stable across
+    processes, versions and platforms.
+
+    Raises on a genuine collision rather than letting two clubs share an ID,
+    which add_team would resolve by overwriting one with the other.
+    """
     team_offset = LEAGUE_ID_OFFSETS[league_code][0]
-    # Use abs(hash()) to get a positive consistent ID
-    return team_offset + (abs(hash(team_name)) % 49000)
+    if team_name in TEAM_ID_OVERRIDES:
+        slot = TEAM_ID_OVERRIDES[team_name]
+    else:
+        slot = zlib.crc32(team_name.encode('utf-8')) % 49000
+    team_id = team_offset + slot
+
+    seen = _TEAM_ID_SEEN.get((league_code, team_id))
+    if seen is not None and seen != team_name:
+        raise ValueError(
+            f"Synthetic team-ID collision in {league_code}: {seen!r} and "
+            f"{team_name!r} both map to {team_id}. Add one of them to "
+            "TEAM_ID_OVERRIDES with an unused slot (0-48999)."
+        )
+    _TEAM_ID_SEEN[(league_code, team_id)] = team_name
+    return team_id
 
 
 def generate_match_id(league_code, season, idx):
-    """Generate unique match ID from league, season, and row index"""
+    """Synthetic match ID from league, season and CSV row index.
+
+    Row index is not a stable identity: if football-data.co.uk revises a file —
+    which happens mid-season when a postponed fixture is slotted in — every row
+    after the insertion shifts and re-loading would mint new IDs for matches we
+    already hold. The loader therefore upserts on the natural key
+    (competition, season, date, home, away) and only uses this ID when inserting
+    a genuinely new row, so a shifted index no longer duplicates anything.
+    """
     match_offset = LEAGUE_ID_OFFSETS[league_code][1]
     return match_offset + (season * 1000) + idx
 
@@ -618,9 +673,16 @@ def load_league_data(db, league_code, competition_name, seasons_dict):
     total_matches = 0
     total_standings = 0
 
+    # Only the most recent season is still being written upstream; older
+    # seasons are final, so re-fetching them is pure waste.
+    latest_season = max(seasons_dict) if seasons_dict else None
+
     for season, code in seasons_dict.items():
         # Download CSV
-        csv_path = download_csv(league_code, code)
+        csv_path = download_csv(
+            league_code, code,
+            max_age_days=CURRENT_SEASON_MAX_AGE_DAYS if season == latest_season else None,
+        )
         if not csv_path:
             continue
 
@@ -639,9 +701,16 @@ def load_league_data(db, league_code, competition_name, seasons_dict):
                         api_id=int(row[f'{prefix}_team_id']),
                         name=row[f'{prefix}_team_name'],
                         short_name=row[f'{prefix}_team_short'],
-                        competition=competition_name
+                        competition=competition_name,
+                        commit=False,
+                        # Reuse the club's existing row (usually carrying its real
+                        # football-data.org api_id) instead of minting a second
+                        # identity under a synthetic ID.
+                        match_by_name=True,
                     )
                     teams_seen.add(team_key)
+        # Matches FK to teams — flush the batch before inserting any.
+        db.session.commit()
 
         # Add matches (including stats + odds if present)
         extra_cols = [
@@ -657,6 +726,10 @@ def load_league_data(db, league_code, competition_name, seasons_dict):
                 'api_id': int(row['match_id']),
                 'home_team_api_id': int(row['home_team_id']),
                 'away_team_api_id': int(row['away_team_id']),
+                # Carried so add_match can fall back to a name lookup when the
+                # club was resolved by name and kept a different api_id.
+                'home_team_name': row['home_team_name'],
+                'away_team_name': row['away_team_name'],
                 'season': int(row['season']),
                 'matchday': None,
                 'competition': row['competition'],
@@ -671,8 +744,9 @@ def load_league_data(db, league_code, competition_name, seasons_dict):
             for col in extra_cols:
                 if col in row and pd.notna(row[col]):
                     match_data[col] = row[col]
-            db.add_match(match_data)
+            db.add_match(match_data, commit=False, natural_key=True)
 
+        db.session.commit()
         total_matches += len(season_df)
 
         # Compute and load standings
@@ -683,7 +757,7 @@ def load_league_data(db, league_code, competition_name, seasons_dict):
             ).first()
 
             if team:
-                db.add_standing(team.id, season, competition_name, {
+                db.add_standing(team.id, season, competition_name, commit=False, data={
                     'position': entry['position'],
                     'played': entry['played'],
                     'won': entry['won'],
@@ -695,6 +769,8 @@ def load_league_data(db, league_code, competition_name, seasons_dict):
                     'points': entry['points'],
                 })
                 total_standings += 1
+
+        db.session.commit()
 
         print(f"      Season {season}: {len(season_df)} matches, {len(standings)} standings")
 

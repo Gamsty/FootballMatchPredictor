@@ -20,7 +20,7 @@ Headings end with the signature accent period.
 */
 
 import { useState, useEffect } from 'react';
-import { footballAPI } from '../services/api';
+import { footballAPI, describeApiError } from '../services/api';
 
 function MethodNote() {
     return (
@@ -121,10 +121,14 @@ function MethodNote() {
                     later inspection. The previous champion stays serving.
                 </p>
                 <p>
-                    A separate cron snapshots bookmaker closing odds 15
-                    minutes before kickoff and applies them to any logged
-                    bet on that match — that's how CLV gets computed in the
-                    Performance tab.
+                    A separate cron runs every 30 minutes and snapshots
+                    bookmaker odds for any match kicking off within two hours,
+                    so the last write before kickoff is the closing price. CLV
+                    in the Performance tab compares the price a bet was placed
+                    at against that market with the bookmaker margin stripped
+                    out — every bet here is priced at Norsk Tipping, whose
+                    8&ndash;12% margin would otherwise make the comparison
+                    negative regardless of whether the bet was any good.
                 </p>
             </Section>
 
@@ -216,7 +220,7 @@ function InlineCalibration() {
             .then(setData)
             .catch(err => {
                 if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return;
-                setError(err.message || 'Failed to load calibration');
+                setError(describeApiError(err, 'Failed to load calibration'));
             })
             .finally(() => setLoading(false));
         return () => controller.abort();

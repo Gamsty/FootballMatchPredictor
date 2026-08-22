@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.orm import joinedload
+
 from database import Bet, Match, OddsSnapshot
 
 logger = logging.getLogger("odds_snapshot")
@@ -77,6 +79,9 @@ def run_snapshot(
     # waste API credits on dead fixtures.
     matches = (
         db.session.query(Match)
+        # Both team names are read per match below; without this each fixture
+        # costs two extra SELECTs on a job that walks the whole upcoming window.
+        .options(joinedload(Match.home_team), joinedload(Match.away_team))
         .filter(~Match.status.in_(('FINISHED', 'CANCELLED')))
         .filter(Match.date >= lower)
         .filter(Match.date <= upper)

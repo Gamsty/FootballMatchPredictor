@@ -47,7 +47,9 @@ function RecentROI() {
     const roi = data.roi ?? 0;
     const pl = data.total_profit_loss ?? 0;
     const winRate = data.win_rate ?? 0;
-    const clv = data.avg_clv;
+    // Fair-line CLV when the backend offers it: avg_clv compares an NT price to
+    // the best sharp book and is negative on principle, not on merit.
+    const clv = data.avg_clv_fair ?? data.avg_clv;
 
     // Top 3 leagues by ROI, requiring ≥3 bets per league for meaning.
     const leagueRows = Object.entries(data.by_league || {})
