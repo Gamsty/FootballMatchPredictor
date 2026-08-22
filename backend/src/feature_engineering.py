@@ -22,6 +22,41 @@ from collections import defaultdict
 from database import DatabaseManager, Match, Team, MatchFeatures, Standing
 from sqlalchemy import and_, or_
 
+# Bump whenever the meaning of any stored feature changes — a new column, a
+# different imputation, a corrected lookup. create_features_for_all_matches
+# rebuilds any row not carrying the current value, so a pipeline change
+# propagates on the next run instead of waiting for someone to remember
+# `force=True`. Without this the skip only ever noticed changes to the MATCH,
+# and the weekly retrain kept training on rows built by an older definition.
+#
+# 2 — point-in-time league tables (was: end-of-season standings on every
+#     historical row) and rest days imputed to 7 rather than 0.
+FEATURE_PIPELINE_VERSION = '2'
+
+
+def feature_row_is_current(entry, match) -> bool:
+    """Can this match's stored feature row be reused?
+
+    `entry` is (created_at, pipeline_version) for the stored row, or None when
+    there isn't one. Two independent ways to be stale, and the second is the one
+    that used to be missed entirely:
+
+      1. The MATCH changed after the features were computed — a score arriving,
+         a status moving SCHEDULED -> FINISHED.
+      2. The PIPELINE changed. Nothing about the match record moves when the
+         meaning of a feature does, so a row built under an older definition
+         looked permanently up to date and the weekly retrain kept training on it.
+    """
+    if not entry:
+        return False
+    created_at, version = entry
+    if created_at is None or version != FEATURE_PIPELINE_VERSION:
+        return False
+    match_updated = getattr(match, 'updated_at', None) or getattr(match, 'created_at', None)
+    if match_updated is None:
+        return True
+    return created_at >= match_updated
+
 
 # ============================================================================
 # Point-in-time Elo computation — for honest backtests
@@ -163,6 +198,14 @@ class FeatureEngineer:
         self._team_all_matches = defaultdict(list)
         self._h2h_matches = defaultdict(list)  # (team1, team2) sorted key -> [(date, match)]
         self._standings_cache = {}  # (team_id, season, competition) -> Standing
+        self._date_index = {}       # id(match_list) -> [dates], see _dates_for
+        # match_id -> {'home': {...}, 'away': {...}} — league table as it stood at
+        # kickoff. See _build_pit_standings for why the stored Standing rows can't
+        # be used for this.
+        self._pit_standings = {}
+        self._group_matches = defaultdict(list)   # (competition, season) -> matches
+        self._group_teams = defaultdict(set)      # (competition, season) -> team ids
+        self._table_cache = {}                    # (comp, season, date) -> table
 
     def close(self):
         """Close database connection"""
@@ -187,6 +230,10 @@ class FeatureEngineer:
             # H2H key: sorted tuple so (A,B) and (B,A) map to same list
             h2h_key = tuple(sorted([m.home_team_id, m.away_team_id]))
             self._h2h_matches[h2h_key].append(m)
+            group = (m.competition, m.season)
+            self._group_matches[group].append(m)
+            self._group_teams[group].add(m.home_team_id)
+            self._group_teams[group].add(m.away_team_id)
 
         # Sort all lists by date (should already be sorted, but ensure it)
         for tid in self._team_all_matches:
@@ -203,16 +250,131 @@ class FeatureEngineer:
         for s in all_standings:
             self._standings_cache[(s.team_id, s.season, s.competition)] = s
 
-        print(f"Cache built: {len(all_matches)} matches, {len(all_standings)} standings")
+        self._build_pit_standings()
+
+        print(f"Cache built: {len(all_matches)} matches, {len(all_standings)} standings, "
+              f"{len(self._pit_standings)} point-in-time tables")
         self._cache_built = True
 
+    # ------------------------------------------------------------------
+    # Point-in-time league tables
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _table_entry(table, positions, team_id):
+        row = table.get(team_id) or {'points': 0, 'gf': 0, 'ga': 0}
+        return {
+            'league_position': positions.get(team_id, len(positions) + 1),
+            'points': row['points'],
+            'goal_difference': row['gf'] - row['ga'],
+        }
+
+    @staticmethod
+    def _rank(table):
+        ranked = sorted(
+            table.items(),
+            key=lambda kv: (kv[1]['points'], kv[1]['gf'] - kv[1]['ga'], kv[1]['gf'], -kv[0]),
+            reverse=True,
+        )
+        return {tid: i + 1 for i, (tid, _row) in enumerate(ranked)}
+
+    @staticmethod
+    def _apply_result(table, m):
+        if m.home_score is None or m.away_score is None or not m.winner:
+            return
+        h, a = table[m.home_team_id], table[m.away_team_id]
+        h['gf'] += m.home_score
+        h['ga'] += m.away_score
+        a['gf'] += m.away_score
+        a['ga'] += m.home_score
+        h['played'] += 1
+        a['played'] += 1
+        if m.winner == 'HOME_TEAM':
+            h['points'] += 3
+        elif m.winner == 'AWAY_TEAM':
+            a['points'] += 3
+        else:
+            h['points'] += 1
+            a['points'] += 1
+
+    def _build_pit_standings(self):
+        """Snapshot every league table as it stood BEFORE each match.
+
+        The stored `standings` rows hold one entry per (team, season, competition)
+        — the FINAL table, since compute_standings_from_matches walks the whole
+        season. Reading them with no date filter meant a match played in September
+        was featurised with the table from the following May, so league position,
+        points and goal difference (and position_diff, points_diff, gd_diff,
+        points_from_top, points_from_relegation, motivation_diff, the dead-rubber
+        and safety flags derived from them) all encoded how the season finished —
+        including the result being predicted.
+
+        Every other feature here is strictly point-in-time; this makes the table
+        features match. One chronological pass per (competition, season).
+        """
+        for group, matches in self._group_matches.items():
+            matches.sort(key=lambda m: (m.date, m.id))
+            table = {tid: {'points': 0, 'gf': 0, 'ga': 0, 'played': 0}
+                     for tid in self._group_teams[group]}
+            for m in matches:
+                positions = self._rank(table)
+                self._pit_standings[m.id] = {
+                    'home': self._table_entry(table, positions, m.home_team_id),
+                    'away': self._table_entry(table, positions, m.away_team_id),
+                }
+                self._apply_result(table, m)
+
+    def _table_as_of(self, competition, season, date):
+        """League table for one (competition, season) as of `date`.
+
+        Used for upcoming fixtures — which have no stored match to snapshot — and
+        for European ties, where we want a club's domestic table rather than its
+        group position. Memoised because a batch of upcoming matches shares both
+        the group and, effectively, the date.
+        """
+        key = (competition, season, date)
+        cached = self._table_cache.get(key)
+        if cached is not None:
+            return cached
+        group = (competition, season)
+        table = {tid: {'points': 0, 'gf': 0, 'ga': 0, 'played': 0}
+                 for tid in self._group_teams.get(group, ())}
+        for m in self._group_matches.get(group, ()):
+            if m.date >= date:
+                break  # list is date-sorted
+            self._apply_result(table, m)
+        positions = self._rank(table)
+        built = {tid: self._table_entry(table, positions, tid) for tid in table}
+        if len(self._table_cache) > 512:
+            self._table_cache.clear()
+        self._table_cache[key] = built
+        return built
+
+    def _domestic_competition(self, team_id, season):
+        """The league this club played in that season, ignoring European ties."""
+        for (comp, comp_season), teams in self._group_teams.items():
+            if comp_season == season and team_id in teams and 'UEFA' not in (comp or ''):
+                return comp
+        return None
+
+    def _dates_for(self, match_list):
+        """Memoised date list for a cached match list, keyed by list identity.
+
+        _get_before rebuilt [m.date for m in match_list] on every call, so the
+        O(log n) bisect sat behind an O(n) list build — and it is called about ten
+        times per match across tens of thousands of matches. The length check
+        rebuilds if a list ever grows.
+        """
+        key = id(match_list)
+        cached = self._date_index.get(key)
+        if cached is None or len(cached) != len(match_list):
+            cached = [m.date for m in match_list]
+            self._date_index[key] = cached
+        return cached
+
     def _get_before(self, match_list, before_date, last_n):
-        """Get last N matches before a date from a sorted list (binary search)."""
-        # Find insertion point using binary search
-        import bisect
-        # Create a key list for bisect (dates only)
-        idx = bisect.bisect_left([m.date for m in match_list], before_date)
-        # Take last_n items before idx
+        """Get last N matches strictly before a date from a sorted list."""
+        idx = bisect.bisect_left(self._dates_for(match_list), before_date)
         start = max(0, idx - last_n)
         return match_list[start:idx]
 
@@ -1092,35 +1254,57 @@ class FeatureEngineer:
         }
 
     def _get_standing_from_cache(self, team_id, season, match):
-        """Get standing features from cache, with same CL/domestic fallback logic."""
-        defaults = {'league_position': 10, 'points': 0, 'goal_difference': 0}
+        """League-table features for one club, as the table stood at kickoff.
 
-        if self.is_european_competition(match):
-            # Try CL standing first
-            cl = self._standings_cache.get((team_id, season, 'UEFA Champions League'))
-            if cl:
-                return {'league_position': cl.position, 'points': cl.points, 'goal_difference': cl.goal_difference}
-            # Fall back to any non-European standing
-            for key, s in self._standings_cache.items():
-                if key[0] == team_id and key[1] == season and key[2] != 'UEFA Champions League':
-                    return {'league_position': s.position, 'points': s.points, 'goal_difference': s.goal_difference}
-            return defaults
-        else:
-            s = self._standings_cache.get((team_id, season, getattr(match, 'competition', '')))
-            if s:
-                return {'league_position': s.position, 'points': s.points, 'goal_difference': s.goal_difference}
-            # Try any standing for this team/season
-            for key, st in self._standings_cache.items():
-                if key[0] == team_id and key[1] == season:
-                    return {'league_position': st.position, 'points': st.points, 'goal_difference': st.goal_difference}
-            return defaults
+        Resolution order:
+          1. the snapshot taken for this exact match (bulk feature engineering),
+          2. the table computed as of the match date (upcoming fixtures, and
+             European ties, which use the club's DOMESTIC table),
+          3. the stored Standing row — final-table data, so a last resort only,
+             kept for competitions we can't reconstruct (e.g. a club whose league
+             isn't in our match history).
+        """
+        defaults = {'league_position': 10, 'points': 0, 'goal_difference': 0}
+        match_comp = getattr(match, 'competition', '') or ''
+        date = getattr(match, 'date', None)
+        european = self.is_european_competition(match)
+
+        # A club's Champions League group position says little about its strength;
+        # its domestic table is the meaningful signal, as before.
+        comp = (self._domestic_competition(team_id, season) or match_comp) if european else match_comp
+
+        if not european:
+            snapshot = self._pit_standings.get(getattr(match, 'id', None))
+            if snapshot:
+                if team_id == match.home_team_id:
+                    return snapshot['home']
+                if team_id == match.away_team_id:
+                    return snapshot['away']
+
+        if date is not None and comp:
+            entry = self._table_as_of(comp, season, date).get(team_id)
+            if entry:
+                return entry
+
+        stored = (self._standings_cache.get((team_id, season, comp))
+                  or self._standings_cache.get((team_id, season, match_comp)))
+        if stored:
+            return {'league_position': stored.position, 'points': stored.points,
+                    'goal_difference': stored.goal_difference}
+        return defaults
     
-    def create_features_for_all_matches(self, save_to_db=True):
+    def create_features_for_all_matches(self, save_to_db=True, force=False):
         """
         Create features for all matches in database
 
         Args:
             save_to_db (bool): Whether to save features to database
+            force (bool): Recompute every match, even ones that look current
+                AND carry the current pipeline version. Rarely needed now —
+                a pipeline change should bump FEATURE_PIPELINE_VERSION instead,
+                which makes every stale row rebuild itself on the next run.
+                Keep this for the case where the stored values are suspect for
+                some reason the version stamp can't express.
 
         Returns:
             pd.DataFrame: Features dataframe
@@ -1145,27 +1329,24 @@ class FeatureEngineer:
         existing_features = {}
         if save_to_db:
             existing_features = {
-                row[0]: row[1]
+                row[0]: (row[1], row[2])
                 for row in self.db.session.query(
-                    MatchFeatures.match_id, MatchFeatures.created_at
+                    MatchFeatures.match_id, MatchFeatures.created_at,
+                    MatchFeatures.pipeline_version,
                 ).all()
             }
+            stale_version = sum(1 for _c, v in existing_features.values()
+                                if v != FEATURE_PIPELINE_VERSION)
             if existing_features:
-                print(f"Found {len(existing_features)} previously-processed matches (will skip those still up-to-date)...")
+                print(f"Found {len(existing_features)} previously-processed matches "
+                      f"({stale_version} on an older pipeline — rebuilding those)...")
 
         skipped_count = 0
 
         for idx, match in enumerate(matches):
-            features_created_at = existing_features.get(match.id)
-            if features_created_at is not None:
-                # Skip if features were computed AFTER the match was last updated.
-                # match.updated_at has onupdate=datetime.utcnow so it advances whenever
-                # any column changes (e.g. score or status). If match has never been
-                # touched since features were computed, no need to recompute.
-                match_updated = match.updated_at or match.created_at
-                if match_updated is None or features_created_at >= match_updated:
-                    skipped_count += 1
-                    continue
+            if not force and feature_row_is_current(existing_features.get(match.id), match):
+                skipped_count += 1
+                continue
 
             # Create features
             features = self.create_match_features(match)
@@ -1188,10 +1369,12 @@ class FeatureEngineer:
                     for key, value in features.items():
                         if key != 'match_id' and key != 'target' and hasattr(existing, key):
                             setattr(existing, key, value)
+                    existing.pipeline_version = FEATURE_PIPELINE_VERSION
                 else:
                     # Create new features — map all feature dict keys to MatchFeatures columns
                     feature_kwargs = {k: v for k, v in features.items()
                                       if k not in ('target',) and hasattr(MatchFeatures, k)}
+                    feature_kwargs['pipeline_version'] = FEATURE_PIPELINE_VERSION
                     match_features = MatchFeatures(**feature_kwargs)
                     self.db.session.add(match_features)
 

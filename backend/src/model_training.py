@@ -33,6 +33,7 @@ from sklearn.metrics import (
 )
 import xgboost as xgb
 import joblib
+from stacking import TimeSeriesStack
 from datetime import datetime
 from collections import defaultdict
 import os
@@ -1176,9 +1177,15 @@ def train_market_model(market_name, market_def, df, feature_cols, elo_ratings=No
     print(f"  Target distribution: {dict(y.value_counts().sort_index())}")
 
     # Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Chronological split, matching the main model. A random stratified split over
+    # a temporally ordered feed lets a model be scored on matches that happened
+    # BEFORE rows it trained on, and every feature here (form, Elo, league
+    # position) is built from history — so the reported accuracy was optimistic.
+    # These are the models behind BTTS/over-under/HT and therefore behind the
+    # combo bets, so the honest number matters.
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
     # Scale
     scaler = StandardScaler()
@@ -1276,6 +1283,12 @@ def train_all_markets(csv_path='../data/processed/match_features.csv',
     # Load data
     print(f"\nLoading data from {csv_path}...")
     df = pd.read_csv(csv_path)
+    # Sort before anything else: compute_elo_ratings walks the frame in row order
+    # and assumes it is chronological, and the market split takes a trailing
+    # slice. The export arrives in whatever order the database returned, so
+    # without this the Elo column was accumulated in arbitrary order.
+    if 'date' in df.columns:
+        df = df.sort_values('date', kind='stable').reset_index(drop=True)
     print(f"Loaded {len(df)} records")
 
     # Compute Elo ratings
@@ -1519,7 +1532,7 @@ def _build_xy_from_csv(csv_path, include_odds=False, binary_mode=False):
 def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5):
     """
     Train the SAME architecture used in production (stacked ensemble: XGBoost + RandomForest
-    with a LogisticRegression meta-learner). Time-based holdout split and TimeSeriesSplit CV
+    with a LogisticRegression meta-learner). Time-based holdout split and expanding-window CV
     so the validation gate in the retrain job compares apples-to-apples against the deployed
     model — previously the gate compared a freshly-trained plain XGBoost against a production
     stacked ensemble, which forced the AUC tolerance to be widened until the gate became a
@@ -1530,7 +1543,7 @@ def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5)
         2. Export to a temp CSV, build (X, y) with leakage-safe imputation
         3. Time-based split on `holdout_days`
         4. Fit StandardScaler on TRAIN only, transform both
-        5. Stack XGBoost + RandomForest via 5-fold TimeSeriesSplit CV → LR meta-learner
+        5. Stack XGBoost + RandomForest over expanding time blocks → LR meta-learner
         6. Return model_data dict + scaled holdout for the caller's validation gate
 
     Returns:
@@ -1591,34 +1604,25 @@ def train_production_model(db, holdout_days=90, include_odds=False, cv_splits=5)
                 random_state=42, n_jobs=-1,
             )
 
-            # NOTE: We previously used TimeSeriesSplit here to give the LR
-            # meta-learner only past-data fold predictions (less optimistic
-            # than StratifiedKFold for the temporally-ordered match feed).
-            # That broke in sklearn 1.5+ because StackingClassifier calls
-            # `cross_val_predict` internally, which requires the CV scheme to
-            # PARTITION the input (every sample in exactly one test fold).
-            # TimeSeriesSplit by design leaves the earliest samples train-only
-            # so it doesn't partition → ValueError("cross_val_predict only
-            # works for partitions").
+            # Expanding-window stacking: block k's meta-features come from base
+            # models fitted only on blocks 0..k-1, so the meta-learner never
+            # trains on predictions informed by later matches.
             #
-            # We fall back to plain StratifiedKFold(5). The honest out-of-
-            # sample check is still the time-based HOLDOUT split that's done
-            # before training, so reported holdout AUC remains trustworthy.
-            # The leakage is confined to the meta-learner's training inputs,
-            # which is a smaller concern than zero retraining.
-            from sklearn.model_selection import StratifiedKFold
-            cv_strategy = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
-
-            stacking = StackingClassifier(
+            # sklearn's StackingClassifier can't express this — it builds meta
+            # features with cross_val_predict, which requires the CV scheme to
+            # partition the data, and TimeSeriesSplit deliberately doesn't. The
+            # previous code fell back to StratifiedKFold(shuffle=True), which
+            # leaked future matches into the meta-learner's inputs while the
+            # docstring, the log line below and the README all still claimed
+            # TimeSeriesSplit. See src/stacking.py.
+            stacking = TimeSeriesStack(
                 estimators=[('xgb', xgb_est), ('rf', rf_est)],
                 final_estimator=LogisticRegression(max_iter=1000, C=1.0, random_state=42),
-                cv=cv_strategy,
-                stack_method='predict_proba',
-                passthrough=False,
-                n_jobs=1,  # base estimators already use n_jobs=-1 internally; nesting hangs on some CI runners
+                n_blocks=cv_splits,
             )
 
-            print(f"[train_production_model] Fitting stacked ensemble (CV={cv_splits} time-series folds)...")
+            print(f"[train_production_model] Fitting stacked ensemble "
+                  f"({cv_splits} expanding-window blocks)...")
             start = datetime.now()
             stacking.fit(X_train_scaled, y_train)
             print(f"[train_production_model] Trained in {(datetime.now() - start).total_seconds():.1f}s")
