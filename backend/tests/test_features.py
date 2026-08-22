@@ -319,3 +319,65 @@ class TestEarlySeasonPositionSeeding:
     def test_no_previous_season_leaves_the_entry_alone(self, engineer):
         entry = {'league_position': 17, 'points': 0, 'goal_difference': 0, 'played': 0}
         assert engineer._seed_early_position(entry, 1, 'Unknown League', 2024) is entry
+
+
+class TestMotivationFeatures:
+    """
+    points_from_top and points_from_relegation measured the gap against the
+    STORED standings rows — the final table. A club ten points off the pace in
+    November was described as trailing by whatever the eventual champion
+    finished on, so the feature carried the end of the season inside it. Moving
+    the standings lookup to point-in-time tables did not fix this; the gap was
+    still measured against a number from the future.
+    """
+
+    TABLE = {
+        1: {'league_position': 1, 'points': 30, 'goal_difference': 20, 'played': 12},
+        2: {'league_position': 2, 'points': 24, 'goal_difference': 10, 'played': 12},
+        3: {'league_position': 3, 'points': 12, 'goal_difference': 0, 'played': 12},
+        4: {'league_position': 4, 'points': 4, 'goal_difference': -18, 'played': 12},
+    }
+
+    def _prime(self, engineer, monkeypatch):
+        monkeypatch.setattr(engineer, '_table_for',
+                            lambda comp, season, date: dict(self.TABLE))
+
+    def test_gap_is_measured_against_the_table_at_kickoff(self, engineer, monkeypatch):
+        from feature_engineering import LEAGUE_CONFIG
+        comp = next(iter(LEAGUE_CONFIG))
+        self._prime(engineer, monkeypatch)
+        standing = {'league_position': 3, 'points': 12, 'goal_difference': 0, 'played': 12}
+        got = engineer._calc_points_from_top(standing, 2025, comp, datetime(2025, 11, 29))
+        assert got == 18      # leader on 30 at that moment, not at season end
+
+    def test_a_leader_is_never_behind_itself(self, engineer, monkeypatch):
+        from feature_engineering import LEAGUE_CONFIG
+        comp = next(iter(LEAGUE_CONFIG))
+        self._prime(engineer, monkeypatch)
+        leader = {'league_position': 1, 'points': 30, 'goal_difference': 20, 'played': 12}
+        assert engineer._calc_points_from_top(leader, 2025, comp, datetime(2025, 11, 29)) == 0
+
+    def test_no_points_yet_means_no_gap(self, engineer, monkeypatch):
+        """Matchday one: the question isn't meaningful and the answer isn't 0."""
+        from feature_engineering import LEAGUE_CONFIG
+        comp = next(iter(LEAGUE_CONFIG))
+        self._prime(engineer, monkeypatch)
+        fresh = {'league_position': 8, 'points': 0, 'goal_difference': 0, 'played': 0}
+        assert engineer._calc_points_from_top(fresh, 2025, comp, datetime(2025, 8, 15)) is None
+
+    def test_relegation_cushion_uses_the_current_drop_zone(self, engineer, monkeypatch):
+        from feature_engineering import LEAGUE_CONFIG
+        comp = next(iter(LEAGUE_CONFIG))
+        rel_pos = LEAGUE_CONFIG[comp]['relegation_start']
+        table = {i: {'league_position': i, 'points': 40 - i * 2,
+                     'goal_difference': 0, 'played': 12}
+                 for i in range(1, LEAGUE_CONFIG[comp]['teams'] + 1)}
+        monkeypatch.setattr(engineer, '_table_for', lambda c, s, d: table)
+        standing = {'league_position': 5, 'points': 30, 'goal_difference': 0, 'played': 12}
+        got = engineer._calc_points_from_relegation(standing, 2025, comp, datetime(2025, 11, 29))
+        assert got == 30 - (40 - rel_pos * 2)
+
+    def test_unknown_competition_stays_none(self, engineer):
+        standing = {'league_position': 5, 'points': 30, 'goal_difference': 0, 'played': 12}
+        assert engineer._calc_points_from_top(
+            standing, 2025, 'Not A League', datetime(2025, 11, 29)) is None

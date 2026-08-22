@@ -36,7 +36,9 @@ from sqlalchemy import and_, or_
 #     historical row) and rest days imputed to 7 rather than 0.
 # 3 — early-season league position seeded from the previous season's final
 #     table. See EARLY_SEASON_MATCHES.
-FEATURE_PIPELINE_VERSION = '3'
+# 4 — points_from_top and points_from_relegation measured against the table as
+#     it stood at kickoff, not against the final one.
+FEATURE_PIPELINE_VERSION = '4'
 
 # How many matches a club must have played before this season's table is taken
 # at face value.
@@ -437,6 +439,19 @@ class FeatureEngineer:
         if entry:
             return entry['league_position']
         return len(final) + 1
+
+    def _table_for(self, competition, season, date):
+        """Point-in-time table, from whichever source this process has.
+
+        Bulk feature engineering holds every match in memory; a live prediction
+        does not, and reaches SQL instead. Both produce the same shape, so
+        everything derived from a table can go through here and cannot drift.
+        """
+        if not competition or season is None or date is None:
+            return {}
+        if (competition, season) in self._group_teams:
+            return self._table_as_of(competition, season, date)
+        return self._table_as_of_db(competition, season, date)
 
     def _domestic_competition_db(self, team_id, season):
         """The league this club played in that season, from SQL.
@@ -905,13 +920,30 @@ class FeatureEngineer:
         vals = [v for v in vals if v is not None]
         return float(np.mean(vals)) if vals else None
 
-    def _calc_points_from_top(self, standing, season, competition):
-        """Calculate points gap to league leader."""
+    def _calc_points_from_top(self, standing, season, competition, date=None):
+        """Points behind the league leader, as the table stood at kickoff.
+
+        This used to read the leader's total from the stored `standings` rows —
+        the FINAL table. A club 10 points off the pace in November was described
+        as trailing by whatever the eventual champion finished on, so the feature
+        carried the end of the season inside it. Moving the standings LOOKUP onto
+        point-in-time tables did not fix this: the gap was still being measured
+        against a number from the future, and it left the two feature paths
+        disagreeing (55 vs 79 on the same November fixture) because one scanned
+        the cache for a maximum and the other queried position=1.
+
+        Falls back to the old behaviour only when there is no date to place the
+        match in time.
+        """
         config = LEAGUE_CONFIG.get(competition)
         if not config or standing['points'] == 0:
             return None
-        # Find max points in this competition/season from standings cache or DB
-        max_pts = standing['points']  # default to own points
+        table = self._table_for(competition, season, date)
+        if table:
+            max_pts = max(e['points'] for e in table.values())
+            return max(0, max_pts - standing['points'])
+        # No date context — cannot place this in time.
+        max_pts = standing['points']
         if self._cache_built:
             for key, s in self._standings_cache.items():
                 if key[1] == season and key[2] == competition and s.points > max_pts:
@@ -924,12 +956,23 @@ class FeatureEngineer:
                 max_pts = top.points
         return max_pts - standing['points']
 
-    def _calc_points_from_relegation(self, standing, season, competition):
-        """Calculate points above the relegation zone."""
+    def _calc_points_from_relegation(self, standing, season, competition, date=None):
+        """Points above the relegation zone, as the table stood at kickoff.
+
+        Same defect as _calc_points_from_top: the relegation line was read from
+        the stored end-of-season table, so a club's cushion in October was
+        measured against where the drop zone finished in May.
+        """
         config = LEAGUE_CONFIG.get(competition)
         if not config or standing['points'] == 0:
             return None
         rel_pos = config['relegation_start']
+        table = self._table_for(competition, season, date)
+        if table:
+            for entry in table.values():
+                if entry['league_position'] == rel_pos:
+                    return standing['points'] - entry['points']
+            return None
         # Find points at relegation position
         if self._cache_built:
             for key, s in self._standings_cache.items():
@@ -1144,10 +1187,10 @@ class FeatureEngineer:
             'avg_draw_prob': getattr(match, 'avg_draw_prob', None),
             'avg_away_prob': getattr(match, 'avg_away_prob', None),
             # Motivation
-            'home_points_from_top': self._calc_points_from_top(home_standing, season, getattr(match, 'competition', '')),
-            'away_points_from_top': self._calc_points_from_top(away_standing, season, getattr(match, 'competition', '')),
-            'home_points_from_relegation': self._calc_points_from_relegation(home_standing, season, getattr(match, 'competition', '')),
-            'away_points_from_relegation': self._calc_points_from_relegation(away_standing, season, getattr(match, 'competition', '')),
+            'home_points_from_top': self._calc_points_from_top(home_standing, season, getattr(match, 'competition', ''), getattr(match, 'date', None)),
+            'away_points_from_top': self._calc_points_from_top(away_standing, season, getattr(match, 'competition', ''), getattr(match, 'date', None)),
+            'home_points_from_relegation': self._calc_points_from_relegation(home_standing, season, getattr(match, 'competition', ''), getattr(match, 'date', None)),
+            'away_points_from_relegation': self._calc_points_from_relegation(away_standing, season, getattr(match, 'competition', ''), getattr(match, 'date', None)),
             'season_progress': self._calc_season_progress(match),
             # --- v2 motivation features (additive — get used after next retrain) ---
             # `is_safe` = both far from relegation AND far from the European places.
@@ -1347,10 +1390,10 @@ class FeatureEngineer:
             'avg_draw_prob': getattr(match, 'avg_draw_prob', None),
             'avg_away_prob': getattr(match, 'avg_away_prob', None),
             # Motivation
-            'home_points_from_top': self._calc_points_from_top(home_standing, season, competition),
-            'away_points_from_top': self._calc_points_from_top(away_standing, season, competition),
-            'home_points_from_relegation': self._calc_points_from_relegation(home_standing, season, competition),
-            'away_points_from_relegation': self._calc_points_from_relegation(away_standing, season, competition),
+            'home_points_from_top': self._calc_points_from_top(home_standing, season, competition, getattr(match, 'date', None)),
+            'away_points_from_top': self._calc_points_from_top(away_standing, season, competition, getattr(match, 'date', None)),
+            'home_points_from_relegation': self._calc_points_from_relegation(home_standing, season, competition, getattr(match, 'date', None)),
+            'away_points_from_relegation': self._calc_points_from_relegation(away_standing, season, competition, getattr(match, 'date', None)),
             'season_progress': self._calc_season_progress(match),
             # v2 motivation (used after next retrain)
             'home_is_safe': self._is_safe(home_standing),
