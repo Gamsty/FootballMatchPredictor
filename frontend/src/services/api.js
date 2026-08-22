@@ -17,8 +17,11 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api'
 const REQUEST_TIMEOUT_MS = 45000;
 
 // A handful of endpoints do real work per request rather than reading a table:
-// /value-bets walks a week of fixtures and fetches live odds per league, and
-// /predictions/calibration replays every evaluated prediction. Both can
+// /predictions/upcoming runs the stacked ensemble plus every market model over
+// the whole slate on a cold prediction cache (measured at 38s for 121 fixtures
+// — subsequent loads are served from cache in milliseconds), /value-bets walks
+// a week of fixtures and fetches live odds per league, and
+// /predictions/calibration replays every evaluated prediction. All can
 // legitimately run past the default. gunicorn's worker timeout is 120s, so
 // there is no point waiting longer than the server will work.
 const SLOW_ENDPOINT_TIMEOUT_MS = 120000;
@@ -144,7 +147,12 @@ export const footballAPI = {
 
     // Dashboard: batch predictions for upcoming matches
     getUpcomingPredictions: async (params = {}) => {
-        const response = await api.get('/predictions/upcoming', { params });
+        // The first load after a backend restart predicts the entire slate and
+        // took 38s locally — inside the 45s default, but not by enough to bet
+        // the app's main screen on.
+        const response = await api.get('/predictions/upcoming', {
+            params, timeout: SLOW_ENDPOINT_TIMEOUT_MS,
+        });
         return response.data;
     },
 

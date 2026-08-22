@@ -17,6 +17,7 @@ Pipeline: database (matches table) → compute features → match_features table
 
 import bisect
 import os
+import time
 import pandas as pd
 import numpy as np
 from collections import defaultdict
@@ -57,6 +58,13 @@ EARLY_SEASON_MATCHES = int(os.getenv('EARLY_SEASON_MATCHES', '5'))
 
 # Sentinel date meaning "after every match in the season".
 _END_OF_SEASON = datetime(2999, 1, 1)
+
+# How long a SQL-built league table may be reused. Results land after the fact —
+# a 15:00 kickoff gets its score when the fixture refresh next runs — so a table
+# built before that arrives is stale for every later fixture. Short enough that
+# a stale table cannot survive a matchday, long enough that one dashboard load
+# does not re-aggregate per fixture.
+DB_TABLE_CACHE_TTL = float(os.getenv('DB_TABLE_CACHE_TTL', '600'))
 
 
 def feature_row_is_current(entry, match) -> bool:
@@ -1598,11 +1606,18 @@ class FeatureEngineer:
 
         if not competition or season is None or date is None:
             return {}
-        day = date.date() if hasattr(date, 'date') else date
-        key = (competition, season, day)
+        # Keyed on the exact kickoff, not the day. Day-keying looked like a free
+        # win on cache hits and quietly lost information: with staggered
+        # kickoffs — 353 competition-days in the 2025 season alone — a 20:30
+        # fixture reused the table built for the 13:00 one and never saw the
+        # afternoon's results, while the training path did.
+        key = (competition, season, date)
         cached = self._db_table_cache.get(key)
         if cached is not None:
-            return cached
+            built_at, table = cached
+            if (time.monotonic() - built_at) < DB_TABLE_CACHE_TTL:
+                return table
+            del self._db_table_cache[key]
 
         rows = self.db.session.execute(text("""
             SELECT team_id,
@@ -1650,9 +1665,9 @@ class FeatureEngineer:
                            'ga': int(r[3] or 0), 'played': int(r[4] or 0)}
         positions = self._rank(table)
         built = {tid: self._table_entry(table, positions, tid) for tid in table}
-        if len(self._db_table_cache) > 256:
+        if len(self._db_table_cache) > 512:
             self._db_table_cache.clear()
-        self._db_table_cache[key] = built
+        self._db_table_cache[key] = (time.monotonic(), built)
         return built
 
     def get_standing_features(self, team_id, season, match=None):
