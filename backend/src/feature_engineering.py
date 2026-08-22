@@ -16,9 +16,11 @@ Pipeline: database (matches table) → compute features → match_features table
 """
 
 import bisect
+import os
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+from datetime import datetime
 from database import DatabaseManager, Match, Team, MatchFeatures, Standing
 from sqlalchemy import and_, or_
 
@@ -31,7 +33,30 @@ from sqlalchemy import and_, or_
 #
 # 2 — point-in-time league tables (was: end-of-season standings on every
 #     historical row) and rest days imputed to 7 rather than 0.
-FEATURE_PIPELINE_VERSION = '2'
+# 3 — early-season league position seeded from the previous season's final
+#     table. See EARLY_SEASON_MATCHES.
+FEATURE_PIPELINE_VERSION = '3'
+
+# How many matches a club must have played before this season's table is taken
+# at face value.
+#
+# Before that it carries no information at all. _rank breaks ties on points,
+# then goal difference, then goals for, then team id — so on matchday 1 every
+# club is level and the "league position" handed to the model is an artefact of
+# primary keys. Where a previous season exists, its FINAL table is a real
+# ordering that was already known when this match kicked off, which makes it a
+# legal point-in-time input.
+#
+# ONLY position is seeded this way. Points and goal difference stay at their
+# true current values (0 at the start of a season). Substituting an
+# end-of-season points total would hand the model a number it only ever saw on
+# end-of-season rows in training — precisely the train/serve skew that the
+# point-in-time work removed. Position is the one of the three on the same scale
+# in August as it is in May.
+EARLY_SEASON_MATCHES = int(os.getenv('EARLY_SEASON_MATCHES', '5'))
+
+# Sentinel date meaning "after every match in the season".
+_END_OF_SEASON = datetime(2999, 1, 1)
 
 
 def feature_row_is_current(entry, match) -> bool:
@@ -206,6 +231,10 @@ class FeatureEngineer:
         self._group_matches = defaultdict(list)   # (competition, season) -> matches
         self._group_teams = defaultdict(set)      # (competition, season) -> team ids
         self._table_cache = {}                    # (comp, season, date) -> table
+        # Serving-side equivalent, keyed to the day and filled by SQL rather than
+        # by the in-memory match cache (which single predictions never build).
+        self._db_table_cache = {}                 # (comp, season, day) -> table
+        self._domestic_cache = {}                 # (team_id, season) -> competition
 
     def close(self):
         """Close database connection"""
@@ -262,11 +291,15 @@ class FeatureEngineer:
 
     @staticmethod
     def _table_entry(table, positions, team_id):
-        row = table.get(team_id) or {'points': 0, 'gf': 0, 'ga': 0}
+        row = table.get(team_id) or {'points': 0, 'gf': 0, 'ga': 0, 'played': 0}
         return {
             'league_position': positions.get(team_id, len(positions) + 1),
             'points': row['points'],
             'goal_difference': row['gf'] - row['ga'],
+            # How many matches this entry rests on. _get_standing_from_cache uses
+            # it to tell "8th on merit" from "8th because the table is empty and
+            # the tiebreak fell that way".
+            'played': row.get('played', 0),
         }
 
     @staticmethod
@@ -316,13 +349,25 @@ class FeatureEngineer:
             matches.sort(key=lambda m: (m.date, m.id))
             table = {tid: {'points': 0, 'gf': 0, 'ga': 0, 'played': 0}
                      for tid in self._group_teams[group]}
-            for m in matches:
+            # Matches kicking off at the same moment are snapshotted together
+            # and only then applied. Walking them one at a time let a 15:00
+            # Saturday fixture see the results of the other 15:00 fixtures,
+            # ordered by primary key — a small leak, but the same kind as the
+            # one this method exists to remove.
+            i = 0
+            while i < len(matches):
+                j = i
+                while j < len(matches) and matches[j].date == matches[i].date:
+                    j += 1
                 positions = self._rank(table)
-                self._pit_standings[m.id] = {
-                    'home': self._table_entry(table, positions, m.home_team_id),
-                    'away': self._table_entry(table, positions, m.away_team_id),
-                }
-                self._apply_result(table, m)
+                for m in matches[i:j]:
+                    self._pit_standings[m.id] = {
+                        'home': self._table_entry(table, positions, m.home_team_id),
+                        'away': self._table_entry(table, positions, m.away_team_id),
+                    }
+                for m in matches[i:j]:
+                    self._apply_result(table, m)
+                i = j
 
     def _table_as_of(self, competition, season, date):
         """League table for one (competition, season) as of `date`.
@@ -349,6 +394,70 @@ class FeatureEngineer:
             self._table_cache.clear()
         self._table_cache[key] = built
         return built
+
+    def _previous_season_position(self, team_id, competition, season):
+        """Where this club finished in the same competition last season.
+
+        Returns None when there is no previous season on record for the
+        competition — then the current (uninformative) position stands rather
+        than being replaced by a guess.
+
+        A club with no row in last season's table was promoted into this one, or
+        is otherwise new to it. They are placed just below the bottom of that
+        table, which is the same convention _table_entry already uses for a club
+        missing from a ranking, and matches the fact that promoted sides start as
+        the division's weakest on average.
+        """
+        if not competition or season is None:
+            return None
+        try:
+            previous = int(season) - 1
+        except (TypeError, ValueError):
+            return None
+        # In-memory when bulk feature engineering has built the caches, SQL
+        # otherwise. Live predictions never call _build_match_cache, so without
+        # the second branch this silently returned None at serve time and the
+        # two paths disagreed about position while agreeing about everything
+        # else — the same split that let the serving leak survive this long.
+        if (competition, previous) in self._group_teams:
+            final = self._table_as_of(competition, previous, _END_OF_SEASON)
+        else:
+            final = self._table_as_of_db(competition, previous, _END_OF_SEASON)
+        if not final:
+            return None
+        entry = final.get(team_id)
+        if entry:
+            return entry['league_position']
+        return len(final) + 1
+
+    def _domestic_competition_db(self, team_id, season):
+        """The league this club played in that season, from SQL.
+
+        Serving counterpart to _domestic_competition, which reads the in-memory
+        group cache that single predictions never build.
+        """
+        from sqlalchemy import text
+
+        if season is None:
+            return None
+        key = (team_id, season)
+        cached = self._domestic_cache.get(key)
+        if cached is not None:
+            return cached or None
+        row = self.db.session.execute(text("""
+            SELECT competition FROM matches
+            WHERE season = :season
+              AND (home_team_id = :tid OR away_team_id = :tid)
+              AND competition NOT LIKE 'UEFA%'
+            GROUP BY competition
+            ORDER BY count(*) DESC
+            LIMIT 1
+        """), {'season': season, 'tid': team_id}).fetchone()
+        found = row[0] if row else ''
+        if len(self._domestic_cache) > 2048:
+            self._domestic_cache.clear()
+        self._domestic_cache[key] = found
+        return found or None
 
     def _domestic_competition(self, team_id, season):
         """The league this club played in that season, ignoring European ties."""
@@ -969,13 +1078,14 @@ class FeatureEngineer:
         if self._cache_built:
             return self._create_features_from_cache(match)
 
-        # DB query fallback (used for single predictions via API)
-        if self.is_european_competition(match):
-            home_standing = self.get_cl_standing_features(home_team_id, season)
-            away_standing = self.get_cl_standing_features(away_team_id, season)
-        else:
-            home_standing = self.get_standing_features(home_team_id, season)
-            away_standing = self.get_standing_features(away_team_id, season)
+        # DB query fallback (used for single predictions via API). European ties
+        # are handled inside get_standing_features, which substitutes the club's
+        # domestic table — the same rule the bulk path applies. Routing them to a
+        # separate method was how the two came to disagree: serving reported a
+        # club's Champions League group position (26th, 4 points) where training
+        # reported its league position (1st, 40 points).
+        home_standing = self.get_standing_features(home_team_id, season, match)
+        away_standing = self.get_standing_features(away_team_id, season, match)
 
         h2h_home, h2h_draws_val, h2h_away = self.calculate_head_to_head(home_team_id, away_team_id, match_date, 5)
 
@@ -1264,7 +1374,7 @@ class FeatureEngineer:
              kept for competitions we can't reconstruct (e.g. a club whose league
              isn't in our match history).
         """
-        defaults = {'league_position': 10, 'points': 0, 'goal_difference': 0}
+        defaults = {'league_position': 10, 'points': 0, 'goal_difference': 0, 'played': 0}
         match_comp = getattr(match, 'competition', '') or ''
         date = getattr(match, 'date', None)
         european = self.is_european_competition(match)
@@ -1277,21 +1387,38 @@ class FeatureEngineer:
             snapshot = self._pit_standings.get(getattr(match, 'id', None))
             if snapshot:
                 if team_id == match.home_team_id:
-                    return snapshot['home']
+                    return self._seed_early_position(snapshot['home'], team_id, comp, season)
                 if team_id == match.away_team_id:
-                    return snapshot['away']
+                    return self._seed_early_position(snapshot['away'], team_id, comp, season)
 
         if date is not None and comp:
             entry = self._table_as_of(comp, season, date).get(team_id)
             if entry:
-                return entry
+                return self._seed_early_position(entry, team_id, comp, season)
 
         stored = (self._standings_cache.get((team_id, season, comp))
                   or self._standings_cache.get((team_id, season, match_comp)))
         if stored:
             return {'league_position': stored.position, 'points': stored.points,
-                    'goal_difference': stored.goal_difference}
+                    'goal_difference': stored.goal_difference,
+                    'played': EARLY_SEASON_MATCHES}
         return defaults
+
+    def _seed_early_position(self, entry, team_id, competition, season):
+        """Replace a not-yet-meaningful league position with last season's finish.
+
+        Applied in ONE place so bulk feature engineering and live prediction
+        cannot drift apart — the two paths reach the table differently (stored
+        snapshot vs computed as-of) but both come through here. Returns a new
+        dict; snapshots are shared between the home and away lookups and must
+        not be mutated.
+        """
+        if entry.get('played', 0) >= EARLY_SEASON_MATCHES:
+            return entry
+        seeded = self._previous_season_position(team_id, competition, season)
+        if seeded is None:
+            return entry
+        return {**entry, 'league_position': seeded}
     
     def create_features_for_all_matches(self, save_to_db=True, force=False):
         """
@@ -1454,25 +1581,135 @@ class FeatureEngineer:
 
         return df
     
-    def get_standing_features(self, team_id, season):
-        """
-        Get league position, points, and goal difference for a team
+    def _table_as_of_db(self, competition, season, date):
+        """League table for (competition, season) as of `date`, straight from SQL.
 
-        Returns:
-            dict: Standing features (default if not found)
+        The serving counterpart to _table_as_of. Bulk feature engineering holds
+        every match in memory and can walk them; a single prediction cannot —
+        _build_match_cache is only called by create_features_for_all_matches, so
+        at serve time the in-memory group tables are empty.
+
+        One aggregate per (competition, season, day), memoised. Rounding the key
+        to the day matters: a Saturday slate shares one table rather than
+        re-querying per kickoff time, and results only land between matchdays
+        anyway.
         """
+        from sqlalchemy import text
+
+        if not competition or season is None or date is None:
+            return {}
+        day = date.date() if hasattr(date, 'date') else date
+        key = (competition, season, day)
+        cached = self._db_table_cache.get(key)
+        if cached is not None:
+            return cached
+
+        rows = self.db.session.execute(text("""
+            SELECT team_id,
+                   SUM(points) AS points,
+                   SUM(gf) AS gf,
+                   SUM(ga) AS ga,
+                   COUNT(*) AS played
+            FROM (
+                SELECT home_team_id AS team_id,
+                       CASE winner WHEN 'HOME_TEAM' THEN 3 WHEN 'DRAW' THEN 1 ELSE 0 END AS points,
+                       home_score AS gf, away_score AS ga
+                FROM matches
+                WHERE competition = :comp AND season = :season
+                  AND status = 'FINISHED' AND winner IS NOT NULL
+                  AND home_score IS NOT NULL AND away_score IS NOT NULL
+                  AND date < :cutoff
+                UNION ALL
+                SELECT away_team_id AS team_id,
+                       CASE winner WHEN 'AWAY_TEAM' THEN 3 WHEN 'DRAW' THEN 1 ELSE 0 END AS points,
+                       away_score AS gf, home_score AS ga
+                FROM matches
+                WHERE competition = :comp AND season = :season
+                  AND status = 'FINISHED' AND winner IS NOT NULL
+                  AND home_score IS NOT NULL AND away_score IS NOT NULL
+                  AND date < :cutoff
+            ) legs
+            GROUP BY team_id
+        """), {'comp': competition, 'season': season, 'cutoff': date}).fetchall()
+
+        # Every club in the division, not only those with a result yet. The
+        # in-memory table seeds all known teams at zero, and a table missing its
+        # winless clubs ranks everyone else too high — which is what made the two
+        # paths disagree on position while agreeing on points.
+        roster = self.db.session.execute(text("""
+            SELECT DISTINCT home_team_id AS team_id FROM matches
+            WHERE competition = :comp AND season = :season
+            UNION
+            SELECT DISTINCT away_team_id AS team_id FROM matches
+            WHERE competition = :comp AND season = :season
+        """), {'comp': competition, 'season': season}).fetchall()
+
+        table = {r[0]: {'points': 0, 'gf': 0, 'ga': 0, 'played': 0} for r in roster}
+        for r in rows:
+            table[r[0]] = {'points': int(r[1] or 0), 'gf': int(r[2] or 0),
+                           'ga': int(r[3] or 0), 'played': int(r[4] or 0)}
+        positions = self._rank(table)
+        built = {tid: self._table_entry(table, positions, tid) for tid in table}
+        if len(self._db_table_cache) > 256:
+            self._db_table_cache.clear()
+        self._db_table_cache[key] = built
+        return built
+
+    def get_standing_features(self, team_id, season, match=None):
+        """League position, points and goal difference as they stood at kickoff.
+
+        WHY THIS DOES NOT READ THE standings TABLE ANY MORE
+        ---------------------------------------------------
+        It used to, via db.get_team_standing(team_id, season), with no date
+        filter. Those rows are END-OF-SEASON tables. On the opening fixture of
+        2024-25 that returned Manchester United on 42 points with a goal
+        difference of -10 — their final table, handed to the model on matchday 1.
+
+        Bulk feature engineering was moved onto point-in-time tables, but this
+        method is the one every LIVE prediction goes through, and it was left
+        behind. The result was worse than the original leak: training learned
+        "points" as a running total while serving supplied a season-final one,
+        so the two disagreed about what the feature meant.
+
+        Falls back to the stored row only when the match is unknown (no
+        competition/date to reconstruct from) — callers that pass `match` get a
+        point-in-time answer.
+        """
+        if match is not None:
+            date = getattr(match, 'date', None)
+            match_comp = getattr(match, 'competition', None)
+            # A club's Champions League group position says little about its
+            # strength; its domestic table is the meaningful signal. Same rule as
+            # _get_standing_from_cache, so the two paths cannot diverge.
+            if self.is_european_competition(match):
+                competition = self._domestic_competition_db(team_id, season) or match_comp
+            else:
+                competition = match_comp
+            entry = self._table_as_of_db(competition, season, date).get(team_id)
+            if entry:
+                return self._seed_early_position(entry, team_id, competition, season)
+            seeded = self._previous_season_position(team_id, competition, season)
+            if seeded is not None:
+                return {'league_position': seeded, 'points': 0,
+                        'goal_difference': 0, 'played': 0}
+            return {'league_position': 10, 'points': 0, 'goal_difference': 0, 'played': 0}
+
+        # No match context — cannot place this in time. Stored rows are
+        # end-of-season, so they are only safe for a season already over.
         standing = self.db.get_team_standing(team_id, season)
         if standing:
             return {
                 'league_position': standing.position,
                 'points': standing.points,
-                'goal_difference': standing.goal_difference
+                'goal_difference': standing.goal_difference,
+                'played': EARLY_SEASON_MATCHES,
             }
         # Defaults for teams without standings data (e.g., old seasons)
         return {
             'league_position': 10,
             'points': 0,
-            'goal_difference': 0
+            'goal_difference': 0,
+            'played': 0,
         }
 
     def get_domestic_standing_features(self, team_id, season):

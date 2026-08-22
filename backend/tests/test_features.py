@@ -30,6 +30,20 @@ def engineer():
     from feature_engineering import FeatureEngineer
 
     fe = FeatureEngineer.__new__(FeatureEngineer)
+    # The DB-backed table lookups are the serving path; these tests drive the
+    # in-memory one, so hand it a session that finds nothing. Without a stub the
+    # class would reach for a real connection the moment an in-memory lookup
+    # misses.
+    class _EmptyResult:
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    fe.db = SimpleNamespace(session=SimpleNamespace(execute=lambda *a, **k: _EmptyResult()))
+    fe._db_table_cache = {}
+    fe._domestic_cache = {}
     fe._standings_cache = {}
     fe._date_index = {}
     fe._pit_standings = {}
@@ -100,7 +114,12 @@ class TestPointInTimeStandings:
             position=3, points=44, goal_difference=8)
         unknown = _match(99, 7, 8, datetime(2024, 9, 1), comp='Unknown League')
         got = engineer._get_standing_from_cache(7, 2024, unknown)
-        assert got == {'league_position': 3, 'points': 44, 'goal_difference': 8}
+        # Asserting the three feature-bearing keys rather than the whole dict:
+        # entries also carry `played`, which is bookkeeping for the early-season
+        # position seeding and not a feature.
+        assert got['league_position'] == 3
+        assert got['points'] == 44
+        assert got['goal_difference'] == 8
 
     def test_table_as_of_is_exclusive_of_the_date(self, engineer):
         self._load(engineer)
@@ -214,3 +233,89 @@ class TestFeatureStaleness:
         from feature_engineering import FEATURE_PIPELINE_VERSION, feature_row_is_current
         entry = (datetime(2026, 1, 1), FEATURE_PIPELINE_VERSION)
         assert feature_row_is_current(entry, self._match(None)) is True
+
+
+class TestSimultaneousKickoffs:
+    """
+    Matches kicking off at the same moment must be snapshotted against the same
+    table. Walking them one at a time ordered them by primary key, so a 15:00
+    Saturday fixture saw the results of the other 15:00 fixtures — a small leak
+    of the same kind the point-in-time work exists to remove.
+    """
+
+    SLATE = [
+        _match(10, 1, 2, datetime(2024, 9, 7, 15, 0), 3, 0, 'HOME_TEAM'),
+        _match(11, 3, 4, datetime(2024, 9, 7, 15, 0), 0, 2, 'AWAY_TEAM'),
+        _match(12, 1, 3, datetime(2024, 9, 14, 15, 0), 1, 1, 'DRAW'),
+    ]
+
+    def _load(self, fe):
+        for m in self.SLATE:
+            group = (m.competition, m.season)
+            fe._group_matches[group].append(m)
+            fe._group_teams[group].update({m.home_team_id, m.away_team_id})
+        fe._build_pit_standings()
+
+    def test_same_kickoff_sees_the_same_table(self, engineer):
+        self._load(engineer)
+        a, b = engineer._pit_standings[10], engineer._pit_standings[11]
+        for snap in (a, b):
+            assert snap['home']['points'] == 0
+            assert snap['away']['points'] == 0
+            assert snap['home']['played'] == 0
+
+    def test_a_later_kickoff_does_see_the_earlier_slate(self, engineer):
+        self._load(engineer)
+        later = engineer._pit_standings[12]
+        assert later['home']['points'] == 3     # team 1 won on the 7th
+        assert later['home']['played'] == 1
+        assert later['away']['points'] == 0     # team 3 lost
+
+
+class TestEarlySeasonPositionSeeding:
+    """
+    On matchday 1 every club is level, and _rank breaks the tie on team id — so
+    the league position handed to the model is an artefact of primary keys. Last
+    season's final table is a real ordering that was known before kickoff.
+    """
+
+    LAST_SEASON = [
+        _match(20, 1, 2, datetime(2023, 8, 1), 5, 0, 'HOME_TEAM', season=2023),
+        _match(21, 2, 3, datetime(2023, 8, 8), 0, 3, 'AWAY_TEAM', season=2023),
+        _match(22, 3, 1, datetime(2023, 8, 15), 0, 1, 'AWAY_TEAM', season=2023),
+    ]
+
+    def _load(self, fe):
+        for m in self.LAST_SEASON:
+            group = (m.competition, m.season)
+            fe._group_matches[group].append(m)
+            fe._group_teams[group].update({m.home_team_id, m.away_team_id})
+        fe._build_pit_standings()
+
+    def test_previous_season_position_is_used_before_matches_are_played(self, engineer):
+        from feature_engineering import FEATURE_PIPELINE_VERSION  # noqa: F401
+        self._load(engineer)
+        # Team 1 won both of its matches last season -> finished top.
+        assert engineer._previous_season_position(1, 'Test League', 2024) == 1
+        entry = {'league_position': 17, 'points': 0, 'goal_difference': 0, 'played': 0}
+        seeded = engineer._seed_early_position(entry, 1, 'Test League', 2024)
+        assert seeded['league_position'] == 1
+        # Points and goal difference are NOT seeded: substituting an
+        # end-of-season total is the train/serve skew this work removed.
+        assert seeded['points'] == 0
+        assert seeded['goal_difference'] == 0
+
+    def test_a_club_new_to_the_division_starts_below_the_bottom(self, engineer):
+        self._load(engineer)
+        assert engineer._previous_season_position(99, 'Test League', 2024) == 4
+
+    def test_seeding_stops_once_the_table_means_something(self, engineer):
+        self._load(engineer)
+        from feature_engineering import EARLY_SEASON_MATCHES
+        entry = {'league_position': 17, 'points': 12,
+                 'goal_difference': 4, 'played': EARLY_SEASON_MATCHES}
+        assert engineer._seed_early_position(entry, 1, 'Test League', 2024) is entry
+
+    def test_no_previous_season_leaves_the_entry_alone(self, engineer):
+        entry = {'league_position': 17, 'points': 0, 'goal_difference': 0, 'played': 0}
+        assert engineer._seed_early_position(entry, 1, 'Unknown League', 2024) is entry
