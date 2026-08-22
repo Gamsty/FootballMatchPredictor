@@ -302,15 +302,23 @@ class TestComboEarlySettle:
         # P/L = stake * (odds - 1) = 100 * 10.65 = 1065
         assert bet.profit_loss == round(100 * (11.65 - 1.0), 6)
 
-    def test_combo_void_when_any_leg_voids_and_none_lost(self, monkeypatch):
+    def test_combo_reduces_to_its_surviving_legs_when_one_voids(self, monkeypatch):
+        """
+        A void leg is set to 1.00 and the coupon settles on the rest — the rule
+        every bookmaker this app targets uses. Pinned in detail (including the
+        legacy no-stored-odds fallback) in test_settlement.py.
+        """
         from app import _settle_one_bet
-        legs = [{'match_id': 1}, {'match_id': 2}]
+        legs = [
+            {'match_id': 1, 'market': 'h2h', 'outcome_key': 'home', 'odds': 2.5},
+            {'match_id': 2, 'market': 'h2h', 'outcome_key': 'home', 'odds': 2.0},
+        ]
         self._patch_resolver(monkeypatch, ['won', 'void'])
-        bet = self._make_bet(legs=legs)
+        bet = self._make_bet(legs=legs, stake=100.0, odds=5.0)
         changed = _settle_one_bet(bet, SimpleNamespace())
         assert changed is True
-        assert bet.status == 'void'
-        assert bet.profit_loss == 0.0
+        assert bet.status == 'won'
+        assert bet.profit_loss == pytest.approx(100.0 * (2.5 - 1.0))
 
     def test_empty_combo_voids_immediately(self):
         """Malformed combo (no legs) shouldn't loop forever as pending."""
@@ -347,9 +355,10 @@ class TestCancelledMatch:
     @pytest.mark.parametrize('non_played_status', ['POSTPONED', 'SUSPENDED'])
     def test_single_bet_voids_on_postponed_or_suspended(self, non_played_status):
         """
-        POSTPONED and SUSPENDED matches must void the bet — otherwise a bet on
-        a postponed fixture stays pending forever even after the rescheduled
-        match plays under a NEW match_id. Matches typical bookie rules.
+        POSTPONED and SUSPENDED matches with no kickoff on record void the bet
+        — there is nothing left to wait for. A fixture that HAS a kickoff waits
+        out POSTPONE_VOID_AFTER_HOURS first, since the feed reschedules the same
+        row; that path is pinned in test_settlement.py.
         """
         from app import _settle_one_bet
         from datetime import datetime
@@ -367,12 +376,16 @@ class TestCancelledMatch:
         assert bet.status == 'void'
         assert bet.profit_loss == 0.0
 
-    def test_combo_voids_when_leg_postponed(self, monkeypatch):
-        """A combo with one POSTPONED leg should void rather than hang."""
+    def test_combo_with_an_abandoned_leg_settles_on_the_rest(self, monkeypatch):
+        """A combo with one abandoned leg must not hang, and must not refund a
+        coupon whose other legs won. The abandoned leg drops to 1.00."""
         from app import _settle_one_bet
         from datetime import datetime
-        legs = [{'match_id': 1}, {'match_id': 2}]
-        # Patch _resolve_leg to mimic: leg 0 won, leg 1 returns 'void' (postponed).
+        legs = [
+            {'match_id': 1, 'market': 'h2h', 'outcome_key': 'home', 'odds': 2.5},
+            {'match_id': 2, 'market': 'h2h', 'outcome_key': 'home', 'odds': 2.0},
+        ]
+        # Patch _resolve_leg to mimic: leg 0 won, leg 1 returns 'void' (abandoned).
         import app
         results = iter(['won', 'void'])
         monkeypatch.setattr(app, '_resolve_leg', lambda L: next(results))
@@ -383,7 +396,8 @@ class TestCancelledMatch:
         )
         changed = _settle_one_bet(bet, SimpleNamespace())
         assert changed is True
-        assert bet.status == 'void'
+        assert bet.status == 'won'
+        assert bet.profit_loss == pytest.approx(100.0 * 1.5)
 
 
 # ---------------------------------------------------------------------------
@@ -444,16 +458,26 @@ class TestMissingDataVoids:
 
 
 # ---------------------------------------------------------------------------
-# Auth gate for bet writes — without BET_WRITE_TOKEN env, allows all (backward
-# compat). With it set, requires matching X-Bet-Token header.
+# Auth gate for bet writes — outside production, a missing BET_WRITE_TOKEN allows
+# all (local-dev convenience). In production a missing token fails CLOSED, so a
+# dropped Key Vault reference can't quietly open the bet log to the internet.
+# With the token set, a matching X-Bet-Token header is required either way.
 # ---------------------------------------------------------------------------
 
 class TestBetWriteAuth:
-    def test_no_token_env_allows_unauthenticated(self, monkeypatch):
+    def test_no_token_env_allows_unauthenticated_in_dev(self, monkeypatch):
         from app import app as flask_app, _require_bet_write_token
         monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
+        monkeypatch.setenv('FLASK_ENV', 'development')
         with flask_app.test_request_context('/api/bets', method='POST'):
             assert _require_bet_write_token() is True
+
+    def test_no_token_env_denies_in_production(self, monkeypatch):
+        from app import app as flask_app, _require_bet_write_token
+        monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
+        monkeypatch.setenv('FLASK_ENV', 'production')
+        with flask_app.test_request_context('/api/bets', method='POST'):
+            assert _require_bet_write_token() is False
 
     def test_token_env_set_rejects_missing_header(self, monkeypatch):
         from app import app as flask_app, _require_bet_write_token
@@ -536,7 +560,7 @@ class TestFixtureScoreExtraction:
         import data_collection
         if 2021 not in data_collection.COMPETITIONS:
             import pytest
-            pytest.skip(f"Competition 2021 not in COMPETITIONS")
+            pytest.skip("Competition 2021 not in COMPETITIONS")
 
         # Future match: API returns score block with all-None values.
         future_match = self._fake_api_match(None, None, None, status='SCHEDULED')

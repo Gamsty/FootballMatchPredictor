@@ -2,7 +2,8 @@
 Flask API for Football Match Predictor
 
 Endpoints:
-    - /api/health                  — API health check and model status
+    - /api/health                  — Liveness: process + model status + build sha (always 200 if up)
+    - /api/health/ready            — Readiness: 503 when DB or model is unusable
     - /api/teams                   — List all teams
     - /api/teams/<id>              — Team details with statistics and recent form
     - /api/predict                 — Predict match outcome (H/D/A)
@@ -12,10 +13,16 @@ Endpoints:
     - /api/predictions/calibration — Bucket predictions vs actual outcomes (model calibration)
     - /api/value-bets              — +EV picks: model probabilities vs bookmaker odds
     - /api/admin/odds-status       — Odds-API quota + per-bookmaker divergence stats
+    - /api/admin/odds-refresh      — Drop the odds cache (X-Bet-Token gated)
+    - /api/admin/reload-model      — Hot-reload the production model from blob
     - /api/admin/refit-calibration — Re-fit temperature scaling on historical data
+    - /api/admin/backfill-predictions — Replay predictions over finished matches
+    - /api/admin/scrape-lineups    — Trigger the SofaScore lineups scraper
+    - /api/admin/snapshot-closing-odds — Capture closing odds for CLV
     - /api/bets                    — List/create paper bets
+    - /api/bets/combo              — Create a multi-leg combo bet
     - /api/bets/<id>               — Detail / delete a bet
-    - /api/bets/performance        — Aggregate ROI, win rate, CLV across all bets
+    - /api/bets/performance        — Aggregate ROI, win rate, fair-line CLV across all bets
     - /api/bets/settle             — Settle all pending bets against finished matches
     - /api/matches                 — List matches with optional filters
     - /api/matches/<id>            — Single match detail
@@ -28,14 +35,17 @@ Endpoints:
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import joblib
 from dotenv import load_dotenv
 import hmac
 import io
+import json
 import logging
 import os
 import re
+import time
+from threading import Lock, Thread
 
 from database import (
     DatabaseManager, Match, Team, Prediction, PredictionSnapshot, MatchFeatures,
@@ -52,7 +62,8 @@ from model_storage import load_model_bytes
 from odds_api import OddsAPIClient
 from telemetry import setup_telemetry
 from value_bets import value_picks
-from sqlalchemy import and_, desc, distinct
+from sqlalchemy import and_, case, desc, distinct, func, or_, text
+from sqlalchemy.orm import joinedload
 
 # Load environment variables. Only read a local .env file in development; in
 # production (Azure Container Apps), env vars come from Key Vault references and
@@ -84,10 +95,19 @@ ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "https://football-match-predictor-pearl.vercel.app",
 ]
-# Matches any Vercel deploy URL for this project: production alias (-pearl), per-commit
-# (-<sha>-gamstys-projects), branch previews. Stays scoped to football-match-predictor-*.
+# Matches this project's Vercel deploy URLs only:
+#   - production alias:  football-match-predictor-pearl.vercel.app
+#   - per-commit/branch: football-match-predictor-<sha|branch>-gamstys-projects.vercel.app
+#
+# The previous pattern ended in `-[a-z0-9-]+`, which matched ANY Vercel project whose
+# name merely starts with `football-match-predictor-` — including one a stranger could
+# create — handing them a CORS-allowed origin against this API. Anchoring the owner
+# slug closes that. Override via VERCEL_OWNER_SLUG if the Vercel team is renamed.
+VERCEL_OWNER_SLUG = os.getenv("VERCEL_OWNER_SLUG", "gamstys-projects")
 VERCEL_PREVIEW_REGEX = re.compile(
-    r"^https://football-match-predictor-[a-z0-9-]+\.vercel\.app$"
+    r"^https://football-match-predictor-(?:pearl|[a-z0-9-]+-"
+    + re.escape(VERCEL_OWNER_SLUG)
+    + r")\.vercel\.app$"
 )
 
 CORS(app, resources={
@@ -107,6 +127,34 @@ CORS(app, resources={
 # - dev: from backend/models/ on local disk
 model_data = None
 multi_market_models = None
+
+# --- Cross-worker reload propagation -------------------------------------
+# `model_data` is a module global, so it exists once per GUNICORN WORKER (and
+# once per replica). A POST to /api/admin/reload-model therefore only rebinds it
+# in whichever worker served that request — the others keep answering with the
+# previous model until they recycle at max_requests. After a nightly promotion
+# that means two different models serving the same endpoint non-deterministically.
+#
+# Fix: the worker that performs a reload stamps an epoch into a marker file; every
+# other worker notices on its next request (throttled stat, see below) and
+# re-applies the change to itself. In production /app/data is an Azure Files mount
+# shared by every replica, so the signal crosses replicas too; locally it falls
+# back to backend/data/.
+# `or` rather than a getenv default: the Bicep template sets this to an empty
+# string when no shared volume is mounted, and an empty path would send the
+# marker write to a bare '' filename — which fails inside the try/except that
+# guards it, so cross-worker reload would quietly stop working with nothing but
+# a warning in the logs. Empty means "not configured", same as ODDS_API_CACHE_FILE.
+RELOAD_MARKER_FILE = os.getenv("RELOAD_MARKER_FILE") or str(
+    Path(__file__).parent.parent / "data" / "model_reload.json"
+)
+# Checking on literally every request would put a stat() on the hot path for no
+# benefit — once per interval converges well inside a probe cycle.
+RELOAD_CHECK_INTERVAL = float(os.getenv("RELOAD_CHECK_INTERVAL", "10"))
+_applied_epoch = 0.0
+_last_epoch_check = 0.0
+_reload_lock = Lock()
+
 
 def load_model():
     """Load ML models at startup (blob in prod, local in dev)."""
@@ -193,12 +241,76 @@ prediction_cache = PredictionCache(default_ttl=7200)
 odds_client = OddsAPIClient()
 
 
+def _signal_reload(*, model: bool = True, odds: bool = False) -> None:
+    """
+    Publish a reload epoch so sibling workers/replicas re-apply what this worker
+    just did. Best-effort: if the marker can't be written we've still reloaded
+    ourselves, we've just lost the fan-out (and log it).
+    """
+    global _applied_epoch
+    epoch = time.time()
+    try:
+        path = Path(RELOAD_MARKER_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"epoch": epoch, "model": model, "odds": odds}),
+                       encoding="utf-8")
+        tmp.replace(path)  # atomic — a reader never observes a half-written marker
+    except OSError as e:
+        logger.warning("Could not write reload marker %s: %s", RELOAD_MARKER_FILE, e)
+    # This worker has, by definition, already applied it.
+    _applied_epoch = max(_applied_epoch, epoch)
+
+
+@app.before_request
+def _apply_pending_reload():
+    """Adopt a reload another worker performed. Costs one stat per interval."""
+    global _last_epoch_check, _applied_epoch
+    now = time.time()
+    if now - _last_epoch_check < RELOAD_CHECK_INTERVAL:
+        return
+    _last_epoch_check = now
+    try:
+        marker = json.loads(Path(RELOAD_MARKER_FILE).read_text(encoding="utf-8"))
+        epoch = float(marker.get("epoch", 0))
+    except (OSError, ValueError, TypeError):
+        return  # no marker yet, or mid-write — next check picks it up
+    if epoch <= _applied_epoch:
+        return
+    with _reload_lock:
+        if epoch <= _applied_epoch:  # another thread in this worker won the race
+            return
+        logger.info("Adopting reload signalled by peer worker (epoch=%.3f)", epoch)
+        try:
+            if marker.get("model", True):
+                load_model()
+                prediction_cache.clear()
+            if marker.get("odds"):
+                odds_client.clear_cache()
+        except Exception:
+            logger.exception("Peer-signalled reload failed; keeping current state")
+            return
+        _applied_epoch = epoch
+
+
 def warm_cache():
-    """Precompute predictions for upcoming matches so the first page load is fast."""
+    """
+    Precompute predictions for upcoming matches so the first page load is fast.
+
+    Runs on a background thread (see the launch below) — it used to run inline at
+    import, which blocked the worker from serving (and from answering health
+    probes) for as long as inference over the whole fixture list took. On a
+    scale-to-zero Container App that cost is paid on every cold start AND on every
+    max_requests worker recycle, times the worker count.
+
+    Bounded by WARM_CACHE_LIMIT so an unusually fat fixture window can't turn
+    startup into a multi-minute inference job.
+    """
     if not model_data:
         return
+    limit = max(1, int(os.getenv("WARM_CACHE_LIMIT", "60")))
     try:
-        matches = db.get_upcoming_matches(days=3)
+        matches = db.get_upcoming_matches(days=3)[:limit]
         count = 0
         for match in matches:
             try:
@@ -217,9 +329,15 @@ def warm_cache():
         logger.info("Cache warmed: %d matches precomputed", count)
     except Exception:
         logger.exception("Cache warm error")
+    finally:
+        # We may be on a background thread; scoped_session is thread-local, so
+        # this thread owns a session nobody else will ever tear down.
+        db.close()
 
-# Warm cache at startup
-warm_cache()
+
+# Warm the cache off the request path. Daemon so it never holds up shutdown.
+if os.getenv("WARM_CACHE", "true").lower() in ("1", "true", "yes"):
+    Thread(target=warm_cache, name="cache-warm", daemon=True).start()
 
 def team_dict(team):
     """Build a team dict with crest URL derived from api_id."""
@@ -257,17 +375,73 @@ def shutdown_session(exception=None):
 # HEALTH CHECK
 # ============================================================================
 
+# Commit the running image was built from. Set by the deploy step alongside the
+# image tag; blank in local dev. The deploy smoke test asserts on it — without a
+# build marker there is no way to tell whether a health check was answered by the
+# revision that was just pushed or by the one it replaced, so a smoke test could
+# pass against the previous, still-serving revision.
+GIT_SHA = os.getenv('GIT_SHA', '')
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Check API health and model status"""
+    """
+    Liveness: is this process alive and does it hold a model?
+
+    Deliberately does NOT touch the database. This is what the Container Apps
+    *liveness* probe polls, and a liveness failure restarts the container — so a
+    transient Postgres blip (Burstable B1ms) must not be able to trigger a restart
+    loop, nor can a slow DB connect stall the probe past its timeout. Database
+    reachability is reported by /api/health/ready instead, which the *readiness*
+    probe polls: that takes an unusable replica out of rotation without killing it.
+    """
     return jsonify({
         'status': 'healthy',
         'model_loaded': model_data is not None,
         'multi_market_loaded': multi_market_models is not None,
         'model_type': model_data['model_type'] if model_data else None,
         'cache_size': prediction_cache.size,
+        'version': GIT_SHA,
         'timestamp': datetime.now(timezone.utc).isoformat()
     }), 200
+
+
+def _database_ok() -> bool:
+    """Round-trip the DB with the cheapest possible statement."""
+    try:
+        db.session.execute(text('SELECT 1'))
+        return True
+    except Exception as e:
+        logger.warning("Database readiness probe failed: %s", e)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return False
+
+
+@app.route('/api/health/ready', methods=['GET'])
+def readiness_check():
+    """
+    Readiness: can this replica actually serve requests?
+
+    Returns 503 when the model failed to load or the database is unreachable.
+    Nearly every endpoint needs both, so without this a container whose DB had
+    gone away kept reporting healthy and stayed in the ingress rotation, serving
+    500s. Liveness (/api/health) stays green so we degrade rather than restart-loop.
+    """
+    db_ok = _database_ok()
+    model_ok = model_data is not None
+    ready = db_ok and model_ok
+    return jsonify({
+        'status': 'ready' if ready else 'not_ready',
+        'database': 'ok' if db_ok else 'unreachable',
+        'model_loaded': model_ok,
+        # Echoed here too so the deploy smoke test can assert readiness AND
+        # identity in one request.
+        'version': GIT_SHA,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }), (200 if ready else 503)
 
 
 def _error_response(message: str, status: int, exc: Exception | None = None, *, endpoint: str | None = None):
@@ -316,9 +490,17 @@ def _require_bet_write_token() -> bool:
     """
     expected_token = os.getenv("BET_WRITE_TOKEN")
     if not expected_token:
-        # Pre-auth deployment; don't block. Log once-ish so this isn't silently
-        # exploitable forever. (Real "log once" would need a sentinel; a warning
-        # per call is fine since /api/bets traffic is low.)
+        if os.getenv("FLASK_ENV", "development") == "production":
+            # Fail CLOSED in production. A deploy that drops the Key Vault
+            # reference (typo'd secretRef, rotated secret, missing param) must
+            # not silently downgrade to a publicly writable bet log — the
+            # backward-compat allowance is a local-dev convenience, not a
+            # production posture.
+            logger.error("BET_WRITE_TOKEN unset in production — refusing bet write. "
+                         "Set the BET_WRITE_TOKEN env var / Key Vault secret.")
+            return False
+        # Local/dev: don't block. Log per call so it isn't silently unauthenticated
+        # forever (/api/bets traffic is low enough that this isn't spammy).
         logger.warning("BET_WRITE_TOKEN unset — bet writes are unauthenticated. "
                        "Set BET_WRITE_TOKEN env var to require X-Bet-Token header.")
         return True
@@ -346,10 +528,14 @@ def reload_model():
     load_model()
     prediction_cache.clear()
     odds_dropped = odds_client.clear_cache()
+    # Fan the reload out: without this only THIS gunicorn worker picks up the new
+    # weights and the others keep serving the superseded model until they recycle.
+    _signal_reload(model=True, odds=True)
     return jsonify({
         "reloaded": True,
         "model_type": model_data["model_type"] if model_data else None,
         "odds_cache_entries_dropped": odds_dropped,
+        "propagated_to_peers": True,
     }), 200
 
 
@@ -464,6 +650,20 @@ def refit_calibration():
         model_data['calibrator'] = cal
         prediction_cache.clear()  # discard any cached uncalibrated predictions
 
+        # Fan out to sibling workers/replicas — they re-run load_model(), which
+        # picks the calibrator back up from blob. That only converges if we
+        # actually uploaded it; when we didn't, the refit is local to this worker
+        # and the others would reload the OLD calibrator, so we say so instead of
+        # silently splitting behaviour across workers.
+        if uploaded:
+            _signal_reload(model=True)
+        else:
+            logger.warning(
+                "Calibrator refit not uploaded (upload=%s, USE_BLOB_STORAGE=%s) — "
+                "it is live in this worker only; peers keep the previous calibrator.",
+                upload, os.getenv('USE_BLOB_STORAGE'),
+            )
+
         return jsonify({
             "fitted": True,
             "temperature": round(cal.temperature, 4),
@@ -473,6 +673,7 @@ def refit_calibration():
             "nll_before": round(cal.fit_nll_before, 4),
             "nll_after": round(cal.fit_nll_after, 4),
             "uploaded_to_blob": uploaded,
+            "propagated_to_peers": uploaded,
         }), 200
 
     except Exception as e:
@@ -678,6 +879,9 @@ def odds_refresh():
         return jsonify({'error': 'Unauthorized — provide X-Bet-Token header'}), 401
     try:
         dropped = odds_client.clear_cache()
+        # Peers hold their own in-memory copy of the odds cache; the file delete
+        # alone wouldn't evict it.
+        _signal_reload(model=False, odds=True)
         return jsonify({
             'dropped': dropped,
             'quota': odds_client.quota_status(),
@@ -727,7 +931,7 @@ def odds_status():
     }), 200
 
 
-def _persist_prediction(match, prediction_data: dict) -> None:
+def _persist_prediction(match, prediction_data: dict, *, commit: bool = True) -> None:
     """
     Persist a prediction in two places:
       1. `predictions` — upserts latest state (one row per match, used by calibration)
@@ -736,6 +940,11 @@ def _persist_prediction(match, prediction_data: dict) -> None:
 
     Best-effort: errors are logged but never raised — a DB blip must not
     take down a read endpoint.
+
+    commit=False leaves the write pending so a batch caller (the dashboard and
+    value-bet loops, which can touch dozens of matches per request) can commit
+    once at the end via _commit_persisted_predictions() instead of paying a
+    round-trip per match.
     """
     if not model_data or not match.id or not prediction_data:
         return
@@ -801,9 +1010,23 @@ def _persist_prediction(match, prediction_data: dict) -> None:
                 model_version=model_version,
             ))
 
-        db.session.commit()
+        if commit:
+            db.session.commit()
+        else:
+            # flush() still surfaces per-match integrity errors right here, so a
+            # bad row is attributed to its match rather than to the batch commit.
+            db.session.flush()
     except Exception as e:
         logger.warning("Persist prediction failed match_id=%s: %s", match.id, e)
+        db.session.rollback()
+
+
+def _commit_persisted_predictions() -> None:
+    """Commit the predictions a batch loop accumulated. Best-effort, as above."""
+    try:
+        db.session.commit()
+    except Exception:
+        logger.exception("Batched prediction persist failed")
         db.session.rollback()
 
 # ============================================================================
@@ -982,14 +1205,41 @@ def predict_markets():
         if not home_team or not away_team:
             return jsonify({'error': 'Invalid team ID'}), 404
 
+        # Resolve the fixture behind this pairing, if there is one, so we key the
+        # cache the same way the dashboard does. Keyed on the pair alone, this
+        # endpoint wrote to a separate ':manual' namespace and could never reuse
+        # (or contribute to) the entries warm_cache and /predictions/upcoming
+        # already computed for the very same match.
+        fixture = None
+        try:
+            fixture = (
+                db.session.query(Match)
+                .filter(
+                    Match.home_team_id == home_team_id,
+                    Match.away_team_id == away_team_id,
+                    Match.status.in_(['SCHEDULED', 'TIMED']),
+                )
+                .order_by(Match.date.asc())
+                .first()
+            )
+        except Exception as e:
+            logger.warning("Fixture lookup for cache key failed: %s", e)
+
+        date_str = None
+        if fixture is not None and isinstance(getattr(fixture, 'date', None), datetime):
+            date_str = fixture.date.strftime('%Y-%m-%d')
+
         # Check cache
-        cached = prediction_cache.get(home_team_id, away_team_id)
+        cached = prediction_cache.get(home_team_id, away_team_id, date_str)
         if cached:
             return jsonify(cached), 200
 
-        # Compute features
+        # Compute features. Competition and kickoff matter to the feature
+        # pipeline (league context, rest days), so pass them when we have a fixture.
         features_dict = compute_features(
-            home_team, away_team, feature_engineer, model_data
+            home_team, away_team, feature_engineer, model_data,
+            competition=getattr(fixture, 'competition', None) if date_str else None,
+            match_date=fixture.date if date_str else None,
         )
 
         # Full multi-market prediction
@@ -1003,8 +1253,9 @@ def predict_markets():
             'timestamp': datetime.now(timezone.utc).isoformat(),
         }
 
-        # Cache it
-        prediction_cache.set(home_team_id, away_team_id, response)
+        # Cache it under the same key the dashboard uses (None → ':manual' for
+        # hypothetical pairings with no scheduled fixture).
+        prediction_cache.set(home_team_id, away_team_id, response, date_str)
 
         return jsonify(response), 200
 
@@ -1016,9 +1267,20 @@ def predict_markets():
 def get_prediction_history():
     """Get historical predictions with accuracy"""
     try:
-        predictions = db.session.query(Prediction).join(Match).order_by(
-            desc(Match.date)
-        ).limit(100).all()
+        # Window size is a query param so callers aren't stuck with a silent 100.
+        limit = max(1, min(request.args.get('limit', 100, type=int) or 100, 500))
+        predictions = (
+            db.session.query(Prediction)
+            .join(Match)
+            # match / home_team / away_team are all dereferenced per row below.
+            .options(
+                joinedload(Prediction.match).joinedload(Match.home_team),
+                joinedload(Prediction.match).joinedload(Match.away_team),
+            )
+            .order_by(desc(Match.date))
+            .limit(limit)
+            .all()
+        )
 
         predictions_list = []
         for pred in predictions:
@@ -1050,7 +1312,12 @@ def get_prediction_history():
 
         return jsonify({
             'predictions': predictions_list,
+            # These are window statistics, not lifetime ones — they describe the
+            # `limit` most recent predictions this call returned. Lifetime model
+            # accuracy lives on /api/statistics/overview.
             'statistics': {
+                'scope': 'window',
+                'window_size': limit,
                 'total_predictions': len(predictions_list),
                 'evaluated_predictions': total,
                 'correct_predictions': correct,
@@ -1120,8 +1387,9 @@ def get_upcoming_predictions():
                     )
                     # Persist the snapshot so we can compute calibration + CLV
                     # against actual outcomes later. Best-effort; failures logged
-                    # but don't disrupt the response.
-                    _persist_prediction(match, prediction_data)
+                    # but don't disrupt the response. Committed once after the
+                    # loop — a commit per match meant N round-trips per request.
+                    _persist_prediction(match, prediction_data, commit=False)
 
                 # Classify match
                 tags, scores = classify_match(prediction_data)
@@ -1168,6 +1436,9 @@ def get_upcoming_predictions():
                     'tags': [],
                     'category_scores': {},
                 })
+
+        # One commit for every prediction persisted above.
+        _commit_persisted_predictions()
 
         # Sort
         if sort_by == 'confidence':
@@ -1291,7 +1562,7 @@ def get_value_bets():
                     prediction_cache.set(
                         match.home_team_id, match.away_team_id, prediction_data, date_str
                     )
-                    _persist_prediction(match, prediction_data)
+                    _persist_prediction(match, prediction_data, commit=False)
 
                 scanned += 1
                 odds = odds_client.odds_for_match(
@@ -1328,6 +1599,8 @@ def get_value_bets():
                     })
             except Exception as e:
                 logger.warning("Value-bet calc failed match_id=%s: %s", match.id, e)
+
+        _commit_persisted_predictions()
 
         sort_key = 'edge_median' if edge_ref == 'median' else 'edge_best'
         results.sort(key=lambda x: x.get(sort_key, 0), reverse=True)
@@ -1629,11 +1902,73 @@ _BET_OUTCOME_RESOLVERS = {
 }
 
 
-def _combo_legs_closing(legs: list[dict]) -> float | None:
+# A postponed fixture is usually replayed within days: football-data.org keeps
+# the same match row and moves `date` forward, so the bet settles against the
+# real result if we just wait. Voiding on sight threw that away and closed the
+# bet at 0 before the game had been played. Only give up once the scheduled
+# kickoff is this far in the past.
+POSTPONE_VOID_AFTER_HOURS = float(os.getenv('POSTPONE_VOID_AFTER_HOURS', '72'))
+
+
+def _match_abandoned(match) -> bool:
+    """True when a non-played match should void the bets riding on it.
+
+    CANCELLED is terminal and voids immediately. POSTPONED/SUSPENDED void only
+    after POSTPONE_VOID_AFTER_HOURS past the (possibly rescheduled) kickoff, so
+    a Saturday postponement replayed on Wednesday still settles normally.
+    """
+    status = getattr(match, 'status', None)
+    if status == 'CANCELLED':
+        return True
+    if status not in ('POSTPONED', 'SUSPENDED'):
+        return False
+    date = getattr(match, 'date', None)
+    if date is None:
+        # No kickoff on record — nothing to wait for.
+        return True
+    if date.tzinfo is not None:
+        date = date.astimezone(timezone.utc).replace(tzinfo=None)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        hours=POSTPONE_VOID_AFTER_HOURS)
+    return date < cutoff
+
+
+def _matches_by_id(ids) -> dict:
+    """Bulk-load matches by id. One IN-query, empty dict for an empty id set."""
+    wanted = [i for i in set(ids) if i]
+    if not wanted:
+        return {}
+    return {m.id: m for m in db.session.query(Match).filter(Match.id.in_(wanted)).all()}
+
+
+def _closing_snapshots(match_ids) -> dict:
+    """
+    (match_id, market, outcome_key) -> newest 'closing' OddsSnapshot.
+
+    One query for however many matches the caller names. Both CLV paths read
+    through this so a page of settled combos costs one SELECT rather than one
+    per leg.
+    """
+    ids = [i for i in set(match_ids or ()) if i]
+    if not ids:
+        return {}
+    rows = (db.session.query(OddsSnapshot)
+            .filter(OddsSnapshot.match_id.in_(ids))
+            .filter(OddsSnapshot.snapshot_type == 'closing')
+            .order_by(OddsSnapshot.snapshot_at.asc())
+            .all())
+    # Ascending, so the last write per key is the snapshot nearest kickoff.
+    return {(r.match_id, r.market, r.outcome_key): r for r in rows}
+
+
+def _combo_legs_closing(legs: list[dict], snapshots: dict | None = None) -> float | None:
     """
     Multiply the latest 'closing' OddsSnapshot for each leg to get the combo's
     effective closing odds. Returns None if any leg is missing a closing
     snapshot — partial coverage would silently misrepresent CLV.
+
+    Pass `snapshots` from _closing_snapshots when settling a whole page of bets;
+    otherwise each leg is looked up on its own.
 
     A combo's CLV is the bookmaker's combined post-line price at kickoff. Since
     we don't store combined snapshots, we reconstruct it from per-leg ones.
@@ -1644,23 +1979,69 @@ def _combo_legs_closing(legs: list[dict]) -> float | None:
     """
     if not legs:
         return None
+    if snapshots is None:
+        snapshots = _closing_snapshots(L.get('match_id') for L in legs)
     product = 1.0
     for leg in legs:
-        snap = (
-            db.session.query(OddsSnapshot)
-            .filter_by(
-                match_id=leg.get('match_id'),
-                market=leg.get('market'),
-                outcome_key=leg.get('outcome_key'),
-                snapshot_type='closing',
-            )
-            .order_by(desc(OddsSnapshot.snapshot_at))
-            .first()
-        )
+        snap = snapshots.get(
+            (leg.get('match_id'), leg.get('market'), leg.get('outcome_key')))
         if not snap or not snap.best_odds or snap.best_odds <= 1.0:
             return None
         product *= snap.best_odds
     return product
+
+
+# Outcomes that must ALL be priced before a market can be de-vigged. Normalising
+# 2 of 3 h2h prices would invent probability mass out of the missing one.
+_MARKET_OUTCOMES = {
+    'h2h':        {'home', 'draw', 'away'},
+    'totals_2_5': {'over', 'under'},
+    'btts':       {'yes', 'no'},
+}
+
+
+def _fair_closing_odds(match_ids, latest: dict | None = None) -> dict:
+    """
+    (match_id, market, outcome_key) -> de-vigged closing decimal odds.
+
+    WHY NOT bets.closing_odds
+    -------------------------
+    `closing_odds` holds the best price across trusted sharp books. Comparing a
+    Norsk Tipping stake against it is comparing an 8-12% margin to a 2-3% one:
+    the ratio is negative for essentially every bet, good or bad, so it measures
+    the bookmaker rather than the bet. Since this app's operator prices every
+    bet at NT, that made the headline CLV number uninformative.
+
+    The fair line removes the margin instead. Implied probabilities are built
+    from the MEDIAN closing price (the best price is a max over N books and is
+    biased high), normalised to sum to 1, then inverted. What comes back is the
+    market's honest estimate at kickoff, independent of where the bet was
+    placed — so "did I beat the closing line" becomes answerable for an NT
+    bettor.
+
+    One query for the whole page; markets with partial coverage are skipped.
+    """
+    if latest is None:
+        latest = _closing_snapshots(match_ids)
+    priced: dict = {}
+    for (match_id, market, outcome), snap in latest.items():
+        price = snap.median_odds or snap.best_odds
+        if price and price > 1.0:
+            priced.setdefault((match_id, market), {})[outcome] = float(price)
+
+    fair: dict = {}
+    for (match_id, market), prices in priced.items():
+        expected = _MARKET_OUTCOMES.get(market)
+        if expected is not None and set(prices) != expected:
+            continue
+        overround = sum(1.0 / p for p in prices.values())
+        if overround <= 0:
+            continue
+        for outcome, price in prices.items():
+            fair_prob = (1.0 / price) / overround
+            if fair_prob > 0:
+                fair[(match_id, market, outcome)] = 1.0 / fair_prob
+    return fair
 
 
 def _resolve_leg_for_match(leg: dict, match: Match | None) -> str | None:
@@ -1680,7 +2061,7 @@ def _resolve_leg_for_match(leg: dict, match: Match | None) -> str | None:
     """
     if not match:
         return None
-    if match.status in ('CANCELLED', 'POSTPONED', 'SUSPENDED'):
+    if _match_abandoned(match):
         return 'void'
     if match.status != 'FINISHED' or match.home_score is None or match.away_score is None:
         return None
@@ -1703,7 +2084,36 @@ def _resolve_leg(leg: dict) -> str | None:
     return _resolve_leg_for_match(leg, match)
 
 
-def _settle_one_bet(bet: Bet, match: Match) -> bool:
+def _combo_effective_odds(bet: Bet, legs: list[dict], leg_results: list[str]) -> float | None:
+    """
+    The combo's price once void legs are set to 1.00.
+
+    When every leg won this returns `bet.odds_at_bet` unchanged: per-leg prices
+    are stored rounded to 2dp, so multiplying them back drifts a few tenths of a
+    percent off the combined price the bookmaker actually quoted. Only when a
+    leg voids do we have to reconstruct, and then the product of the surviving
+    legs is the best estimate available.
+
+    Returns None when a surviving leg has no usable stored price — the caller
+    refunds rather than guessing a payout.
+    """
+    if all(r == 'won' for r in leg_results):
+        return bet.odds_at_bet
+    product = 1.0
+    for leg, result in zip(legs, leg_results):
+        if result != 'won':
+            continue
+        try:
+            price = float(leg.get('odds'))
+        except (TypeError, ValueError):
+            return None
+        if price <= 1.0:
+            return None
+        product *= price
+    return product
+
+
+def _settle_one_bet(bet: Bet, match: Match, *, leg_matches: dict | None = None) -> bool:
     """
     Resolve a single bet against the finished match. Returns True if a change
     was made (bet became won/lost/void). Idempotent: settled bets are skipped.
@@ -1726,7 +2136,13 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
             bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
             bet.profit_loss = 0.0
             return True
-        leg_results = [_resolve_leg(leg) for leg in legs]
+        if leg_matches is None:
+            leg_results = [_resolve_leg(leg) for leg in legs]
+        else:
+            leg_results = [
+                _resolve_leg_for_match(leg, leg_matches.get(leg.get('match_id')))
+                for leg in legs
+            ]
 
         # Early-settle on first lost leg: a combo is dead the moment ANY leg
         # loses, even if other legs are still pending. Without this, a Saturday
@@ -1743,24 +2159,27 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
             return False
 
         # All legs settled, none lost. Either all won, or some void.
-        if any(r == 'void' for r in leg_results):
-            # In real bookmakers, a void leg reduces the combo to remaining legs.
-            # We don't model partial-stake refund here — treat as void.
+        #
+        # A void leg does NOT kill the coupon. Every bookmaker this app targets
+        # — Norsk Tipping included — sets the void selection to odds 1.00 and
+        # settles on what remains. Treating the whole combo as void refunded
+        # coupons that had actually won and understated realised P/L.
+        effective_odds = _combo_effective_odds(bet, legs, leg_results)
+        if not any(r == 'won' for r in leg_results) or effective_odds is None:
             bet.status = 'void'
             bet.profit_loss = 0.0
         else:
             bet.status = 'won'
-            bet.profit_loss = bet.stake * (bet.odds_at_bet - 1.0)
+            bet.profit_loss = round(bet.stake * (effective_odds - 1.0), 2)
         bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
         return True
 
     # Single-leg bet (h2h, totals_2_5, btts, compound).
     #
-    # Terminal-but-not-played statuses (CANCELLED, POSTPONED, SUSPENDED,
-    # AWARDED with no scores) void the bet. Without this, a postponed match
-    # leaves the bet pending forever — and bookies typically void rather
-    # than re-bind to the rescheduled fixture.
-    if match.status in ('CANCELLED', 'POSTPONED', 'SUSPENDED'):
+    # Terminal-but-not-played statuses void the bet — see _match_abandoned for
+    # the CANCELLED-now / POSTPONED-after-a-grace-period split. Without any of
+    # this, a cancelled match leaves the bet pending forever.
+    if _match_abandoned(match):
         bet.status = 'void'
         bet.settled_at = datetime.now(timezone.utc).replace(tzinfo=None)
         bet.profit_loss = 0.0
@@ -1787,7 +2206,7 @@ def _settle_one_bet(bet: Bet, match: Match) -> bool:
         bet.profit_loss = 0.0
     elif outcome:
         bet.status = 'won'
-        bet.profit_loss = bet.stake * (bet.odds_at_bet - 1.0)
+        bet.profit_loss = round(bet.stake * (bet.odds_at_bet - 1.0), 2)
     else:
         bet.status = 'lost'
         bet.profit_loss = -bet.stake
@@ -1804,19 +2223,38 @@ def _settle_pending_bets(match_ids: list[int] | None = None) -> int:
     """
     q = db.session.query(Bet).filter(Bet.status == 'pending')
     if match_ids:
-        q = q.filter(Bet.match_id.in_(match_ids))
+        # A combo's match_id anchors to its EARLIEST leg, so filtering on that
+        # column alone skipped combos whose other legs are the ones that just
+        # finished — they stayed pending until some unrelated full sweep ran.
+        # Pending combos are few; re-check them all rather than trying to index
+        # into a JSON column.
+        q = q.filter(or_(Bet.match_id.in_(match_ids), Bet.market == 'combo'))
     pending = q.all()
+    if not pending:
+        return 0
+
+    # One SELECT covering every match these bets touch — anchors and combo legs
+    # alike — instead of one per bet plus one per leg.
+    wanted = {b.match_id for b in pending}
+    for b in pending:
+        for leg in (b.combo_legs or []):
+            wanted.add(leg.get('match_id'))
+    matches = _matches_by_id(wanted)
+
     settled = 0
     for bet in pending:
-        match = db.session.query(Match).filter_by(id=bet.match_id).first()
-        if match and _settle_one_bet(bet, match):
+        match = matches.get(bet.match_id)
+        # Combos resolve from their legs, so a missing anchor is survivable.
+        if match is None and bet.market != 'combo':
+            continue
+        if _settle_one_bet(bet, match, leg_matches=matches):
             settled += 1
     if settled:
         db.session.commit()
     return settled
 
 
-def _enrich_combo_legs(legs: list[dict] | None) -> list[dict] | None:
+def _enrich_combo_legs(legs: list[dict] | None, matches: dict | None = None) -> list[dict] | None:
     """
     Augment each combo leg's snapshot with current match state — score, status,
     and per-leg resolved result (won/lost/void/pending). Lets the UI show a
@@ -1824,14 +2262,17 @@ def _enrich_combo_legs(legs: list[dict] | None) -> list[dict] | None:
     per-leg request from the frontend.
 
     Bulk-fetches all leg matches in one IN-query so an N-leg combo costs ONE
-    extra DB hit, not N. Returns a new list (doesn't mutate the JSON column).
+    extra DB hit, not N. Pass `matches` (id -> Match) when the caller has
+    already loaded them for a whole page of bets — then it costs none at all.
+    Returns a new list (doesn't mutate the JSON column).
     """
     if not legs:
         return legs
     ids = [L.get('match_id') for L in legs if L.get('match_id')]
     if not ids:
         return legs
-    matches = {m.id: m for m in db.session.query(Match).filter(Match.id.in_(ids)).all()}
+    if matches is None:
+        matches = _matches_by_id(ids)
     enriched: list[dict] = []
     for leg in legs:
         out = dict(leg)
@@ -1847,8 +2288,16 @@ def _enrich_combo_legs(legs: list[dict] | None) -> list[dict] | None:
     return enriched
 
 
-def _bet_to_dict(bet: Bet) -> dict:
-    match = bet.match
+def _bet_to_dict(bet: Bet, matches: dict | None = None, fair: dict | None = None) -> dict:
+    """Render one bet for the API.
+
+    `matches` is an optional id -> Match map covering the bet's own match and
+    every combo leg's match. List endpoints build it once per page; without it
+    each bet lazy-loads its match (plus both teams) and each combo re-queries
+    its legs. `fair` is the matching de-vigged-closing-price map from
+    _fair_for_bets — omitted, `fair_closing_odds` comes back None.
+    """
+    match = (matches or {}).get(bet.match_id) or bet.match
     return {
         'id': bet.id,
         'match_id': bet.match_id,
@@ -1866,7 +2315,13 @@ def _bet_to_dict(bet: Bet) -> dict:
         'outcome_key': bet.outcome_key,
         'outcome_label': bet.outcome_label,
         'odds_at_bet': bet.odds_at_bet,
+        # The best price across trusted sharp books at kickoff. Kept for
+        # continuity; `fair_closing_odds` below is the one to compare against
+        # when the bet was priced at a single high-margin bookmaker.
         'closing_odds': bet.closing_odds,
+        'fair_closing_odds': (None if bet.market == 'combo'
+                              else (fair or {}).get(
+                                  (bet.match_id, bet.market, bet.outcome_key))),
         'stake': bet.stake,
         'bookmaker': bet.bookmaker,
         'model_prob_at_bet': bet.model_prob_at_bet,
@@ -1881,8 +2336,84 @@ def _bet_to_dict(bet: Bet) -> dict:
         # snapshot fields (home_team/away_team/odds/prob/outcome) PLUS live
         # match state (home_score/away_score/match_status/result) so the UI
         # can show how each leg finished without an extra per-leg fetch.
-        'combo_legs': _enrich_combo_legs(bet.combo_legs) if bet.market == 'combo' else bet.combo_legs,
+        'combo_legs': (_enrich_combo_legs(bet.combo_legs, matches)
+                       if bet.market == 'combo' else bet.combo_legs),
+        # Payout price after any void leg is set to 1.00. Equals odds_at_bet
+        # unless a leg voided; None while the combo is still running.
+        'effective_odds': _settled_combo_effective_odds(bet, matches),
     }
+
+
+def _settled_combo_effective_odds(bet: Bet, matches: dict | None) -> float | None:
+    """Reduced combo price for a settled combo, for display alongside the quote."""
+    if bet.market != 'combo' or bet.status != 'won' or not bet.combo_legs:
+        return None
+    results = [_resolve_leg_for_match(leg, (matches or {}).get(leg.get('match_id')))
+               for leg in bet.combo_legs] if matches is not None else None
+    if results is None or any(r is None for r in results):
+        return None
+    eff = _combo_effective_odds(bet, bet.combo_legs, results)
+    return round(eff, 4) if eff is not None else None
+
+
+# A double-clicked "Log bet" button, or a retry after a timeout that actually
+# succeeded, writes the same wager twice and double-counts it in ROI forever.
+# There is no natural key to make unique (the same pick at the same price is a
+# legitimate second bet on another day), so we reject only exact repeats inside
+# a short window.
+DUPLICATE_BET_WINDOW_SECONDS = float(os.getenv('DUPLICATE_BET_WINDOW_SECONDS', '120'))
+
+
+def _recent_duplicate_bet(*, match_id: int, market: str, outcome_key: str,
+                          odds: float, stake: float) -> Bet | None:
+    """The identical bet if one was logged within the dedupe window, else None."""
+    if DUPLICATE_BET_WINDOW_SECONDS <= 0:
+        return None
+    cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+              - timedelta(seconds=DUPLICATE_BET_WINDOW_SECONDS))
+    return (db.session.query(Bet)
+            .filter(Bet.match_id == match_id,
+                    Bet.market == market,
+                    Bet.outcome_key == outcome_key,
+                    Bet.odds_at_bet == odds,
+                    Bet.stake == stake,
+                    Bet.placed_at >= cutoff)
+            .first())
+
+
+def _fair_for_bets(bets: list) -> dict:
+    """(match_id, market, outcome_key) -> de-vigged closing odds for a page of bets.
+
+    /api/bets/performance reports fair-line CLV in aggregate; without this the
+    detail view had nothing to compute the same number from and fell back to
+    `closing_odds` — the best sharp price, which reads negative for every
+    Norsk Tipping bet regardless of merit. Two views showing different CLV for
+    the same bet is worse than either one alone.
+    """
+    wanted = {b.match_id for b in bets}
+    for b in bets:
+        for leg in (b.combo_legs or []):
+            wanted.add(leg.get('match_id'))
+    return _fair_closing_odds(wanted)
+
+
+def _matches_for_bets(bets: list) -> dict:
+    """id -> Match for every match a page of bets touches (anchors + combo legs).
+
+    Teams are eager-loaded because _bet_to_dict reads both names on every row.
+    """
+    wanted = {b.match_id for b in bets}
+    for b in bets:
+        for leg in (b.combo_legs or []):
+            wanted.add(leg.get('match_id'))
+    ids = [i for i in wanted if i]
+    if not ids:
+        return {}
+    rows = (db.session.query(Match)
+            .options(joinedload(Match.home_team), joinedload(Match.away_team))
+            .filter(Match.id.in_(ids))
+            .all())
+    return {m.id: m for m in rows}
 
 
 @app.route('/api/bets', methods=['GET', 'POST'])
@@ -1920,7 +2451,12 @@ def bets_collection():
             if status in ('pending', 'won', 'lost', 'void'):
                 q = q.filter(Bet.status == status)
             bets = q.order_by(desc(Bet.placed_at)).limit(limit).all()
-            return jsonify({'bets': [_bet_to_dict(b) for b in bets], 'count': len(bets)}), 200
+            matches = _matches_for_bets(bets)
+            fair = _fair_for_bets(bets)
+            return jsonify({
+                'bets': [_bet_to_dict(b, matches, fair) for b in bets],
+                'count': len(bets),
+            }), 200
         except Exception as e:
             return _error_response("Failed to load bets", 500, e, endpoint="bets_list")
 
@@ -1968,6 +2504,14 @@ def bets_collection():
         if not match:
             return jsonify({'error': 'Match not found'}), 404
 
+        if (dupe := _recent_duplicate_bet(match_id=match_id, market=market,
+                                          outcome_key=outcome_key, odds=odds,
+                                          stake=stake)):
+            return jsonify({
+                'error': 'Identical bet logged moments ago — not duplicating it.',
+                'existing_bet_id': dupe.id,
+            }), 409
+
         bet = Bet(
             match_id=match_id,
             market=market,
@@ -1989,7 +2533,7 @@ def bets_collection():
         _settle_one_bet(bet, match)
         db.session.commit()
 
-        return jsonify(_bet_to_dict(bet)), 201
+        return jsonify(_bet_to_dict(bet, _matches_for_bets([bet]))), 201
     except Exception as e:
         db.session.rollback()
         return _error_response("Failed to create bet", 500, e, endpoint="bets_create")
@@ -2119,6 +2663,27 @@ def create_combo_bet():
         # matter for combo settle — _resolve_leg walks each leg individually.
         anchor_leg = min(validated_legs, key=lambda L: L['date'] or '9999')
 
+        # Same double-submit protection as singles. Legs are compared as a set
+        # of (match, market, outcome) so leg ordering in the payload doesn't
+        # let a repeat slip through.
+        def _leg_signature(legs):
+            return {(L.get('match_id'), L.get('market'), L.get('outcome_key'))
+                    for L in legs}
+
+        signature = _leg_signature(validated_legs)
+        for candidate in (db.session.query(Bet)
+                          .filter(Bet.market == 'combo',
+                                  Bet.stake == stake,
+                                  Bet.placed_at >= (datetime.now(timezone.utc).replace(tzinfo=None)
+                                                    - timedelta(seconds=DUPLICATE_BET_WINDOW_SECONDS)))
+                          .all() if DUPLICATE_BET_WINDOW_SECONDS > 0 else []):
+            existing = candidate.combo_legs or []
+            if len(existing) == len(validated_legs) and _leg_signature(existing) == signature:
+                return jsonify({
+                    'error': 'Identical combo logged moments ago — not duplicating it.',
+                    'existing_bet_id': candidate.id,
+                }), 409
+
         bet = Bet(
             match_id=anchor_leg['match_id'],
             market='combo',
@@ -2139,10 +2704,11 @@ def create_combo_bet():
 
         # Settle now in case all legs are already finished (logging a historical
         # combo). _settle_one_bet handles combo by walking combo_legs.
-        _settle_one_bet(bet, bet.match)
+        matches = _matches_for_bets([bet])
+        _settle_one_bet(bet, bet.match, leg_matches=matches)
         db.session.commit()
 
-        return jsonify(_bet_to_dict(bet)), 201
+        return jsonify(_bet_to_dict(bet, matches)), 201
     except Exception as e:
         db.session.rollback()
         return _error_response("Failed to create combo bet", 500, e, endpoint="bets_create_combo")
@@ -2164,7 +2730,7 @@ def bet_detail(bet_id):
         except Exception as e:
             db.session.rollback()
             return _error_response("Failed to delete bet", 500, e, endpoint="bet_delete")
-    return jsonify(_bet_to_dict(bet)), 200
+    return jsonify(_bet_to_dict(bet, _matches_for_bets([bet]), _fair_for_bets([bet]))), 200
 
 
 @app.route('/api/bets/settle', methods=['POST'])
@@ -2189,20 +2755,45 @@ def bets_performance():
     Response includes per-market AND per-league breakdowns and a CLV summary
     when closing odds are available. The per-league split is what feeds the
     Recent-ROI widget on the landing page.
+
+    Three CLV numbers, none of them interchangeable:
+      avg_clv_fair    singles vs the DE-VIGGED closing line. Read this one — it
+                      is margin-free, so it stays meaningful for an operator who
+                      prices every bet at Norsk Tipping.
+      avg_clv         singles vs the best price across trusted sharp books.
+                      Structurally negative at NT (8-12% margin vs 2-3%); kept
+                      for continuity with the older client.
+      avg_clv_combos  combos vs the product of their legs' closing prices. Held
+                      separate because a multiplicative ratio doesn't average
+                      against single-leg ones.
+
+    Likewise win_rate covers every settled bet while expected_win_rate averages
+    model probability over singles only; win_rate_singles is the like-for-like
+    counterpart to compare against.
     """
     try:
         # Settle pending so stats are current
         _settle_pending_bets()
 
-        q = db.session.query(Bet)
+        # by_league reads b.match.competition on every row; without the
+        # joinedload that is one SELECT per bet plus two per match for teams.
+        q = db.session.query(Bet).options(
+            joinedload(Bet.match).joinedload(Match.home_team),
+            joinedload(Bet.match).joinedload(Match.away_team),
+        )
         if (m := request.args.get('market')):
             q = q.filter(Bet.market == m)
         if (since := request.args.get('since')):
             try:
                 since_dt = datetime.fromisoformat(since)
-                q = q.filter(Bet.placed_at >= since_dt)
             except ValueError:
                 return jsonify({'error': 'since must be ISO date'}), 400
+            # placed_at is naive UTC. Handing Postgres a tz-aware literal makes
+            # it compare timestamp to timestamptz through the session TimeZone,
+            # which silently shifts the cutoff on any non-UTC connection.
+            if since_dt.tzinfo is not None:
+                since_dt = since_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            q = q.filter(Bet.placed_at >= since_dt)
 
         bets = q.all()
         if not bets:
@@ -2235,28 +2826,65 @@ def bets_performance():
         avg_model_prob = (sum(b.model_prob_at_bet for b in non_combo_with_prob) / len(non_combo_with_prob)
                           if non_combo_with_prob else None)
         win_rate = len(won) / len(settled) if settled else 0
+        # expected_win_rate below averages model probability over SINGLES only
+        # (combo probabilities are products and belong to a different scale).
+        # Pairing it with the all-bets win rate compared a number dragged down
+        # by combos against a number that never saw one, so report the
+        # singles-only rate as its counterpart.
+        settled_singles = [b for b in settled if b.market != 'combo']
+        singles_win_rate = (sum(1 for b in settled_singles if b.status == 'won')
+                            / len(settled_singles)) if settled_singles else None
 
-        # CLV: avg of (placed_odds / closing_odds - 1). Positive = bet at better
-        # price than the eventual closing line.
+        # CLV, three ways. All are avg of (placed_odds / reference - 1); they
+        # differ only in what the reference price is, and they are NOT
+        # interchangeable — see the endpoint docstring.
         #
-        # Singles: just use bet.closing_odds (set by snapshot-odds cron's
-        # apply_to_bets pass).
-        #
-        # Combos: closing_odds field is never populated by the snapshot cron
-        # (it only matches market+outcome on the single bet shape). Instead,
-        # multiply the latest 'closing' OddsSnapshot for each leg. A combo
-        # qualifies for CLV only if EVERY leg has a closing snapshot — partial
-        # data would understate or overstate the combined price.
-        clv_bets: list[tuple] = []  # (bet, closing_odds)
+        #   avg_clv         singles vs bet.closing_odds, the best price across
+        #                   trusted sharp books (written by the snapshot cron's
+        #                   apply_to_bets pass).
+        #   avg_clv_combos  combos vs the product of their legs' closing prices.
+        #                   closing_odds is never populated for combos — the cron
+        #                   matches market+outcome on the single-bet shape — so
+        #                   it is reconstructed per leg, and only when EVERY leg
+        #                   has a snapshot. Held separate because a multiplicative
+        #                   ratio does not average against single-leg ones: one
+        #                   3-leg coupon would move the headline more than a dozen
+        #                   singles.
+        #   avg_clv_fair    singles vs the de-vigged closing line. The one to read.
+        clv_singles: list[tuple] = []   # (bet, closing_odds)
+        clv_combos: list[tuple] = []
+        clv_match_ids = {b.match_id for b in settled}
+        for b in settled:
+            for leg in (b.combo_legs or []):
+                clv_match_ids.add(leg.get('match_id'))
+        snapshots = _closing_snapshots(clv_match_ids)
         for b in settled:
             if b.market == 'combo' and b.combo_legs:
-                legs_closing = _combo_legs_closing(b.combo_legs)
+                legs_closing = _combo_legs_closing(b.combo_legs, snapshots)
                 if legs_closing is not None:
-                    clv_bets.append((b, legs_closing))
+                    clv_combos.append((b, legs_closing))
             elif b.closing_odds and b.closing_odds > 1.0:
-                clv_bets.append((b, b.closing_odds))
-        avg_clv = (sum(b.odds_at_bet / cl - 1 for b, cl in clv_bets) / len(clv_bets)
-                   if clv_bets else None)
+                clv_singles.append((b, b.closing_odds))
+
+        def _mean_clv(pairs):
+            return (sum(b.odds_at_bet / cl - 1 for b, cl in pairs) / len(pairs)
+                    if pairs else None)
+
+        avg_clv = _mean_clv(clv_singles)
+        avg_clv_combos = _mean_clv(clv_combos)
+
+        # Fair-line CLV — the number an NT bettor can actually act on. See
+        # _fair_closing_odds for why the best-price comparison above is
+        # dominated by the margin gap rather than by bet quality.
+        fair = _fair_closing_odds(clv_match_ids, snapshots)
+        fair_pairs = []
+        for b in settled:
+            if b.market == 'combo':
+                continue
+            fair_odds = fair.get((b.match_id, b.market, b.outcome_key))
+            if fair_odds and fair_odds > 1.0:
+                fair_pairs.append((b, fair_odds))
+        avg_clv_fair = _mean_clv(fair_pairs)
 
         # Per-market breakdown
         by_market: dict[str, dict] = {}
@@ -2313,8 +2941,16 @@ def bets_performance():
             'expected_win_rate': round(avg_model_prob, 4) if avg_model_prob is not None else None,
             'singles_count': len(non_combo),
             'combos_count': len(bets) - len(non_combo),
+            'win_rate_singles': round(singles_win_rate, 4) if singles_win_rate is not None else None,
+            # avg_clv is singles-only and priced against the best sharp book —
+            # structurally negative for a single-bookmaker operator. avg_clv_fair
+            # is the margin-free comparison and is the one to read.
             'avg_clv': round(avg_clv, 4) if avg_clv is not None else None,
-            'clv_sample_size': len(clv_bets),
+            'clv_sample_size': len(clv_singles),
+            'avg_clv_fair': round(avg_clv_fair, 4) if avg_clv_fair is not None else None,
+            'clv_fair_sample_size': len(fair_pairs),
+            'avg_clv_combos': round(avg_clv_combos, 4) if avg_clv_combos is not None else None,
+            'clv_combos_sample_size': len(clv_combos),
             'by_market': by_market,
             'by_league': by_league,
             'by_league_excludes_combos': True,
@@ -2460,7 +3096,13 @@ def get_matches():
         # Cap to 500 — without this, a single request could pull every row in the table.
         limit = max(1, min(request.args.get('limit', 50, type=int) or 50, 500))
 
-        query = db.session.query(Match)
+        # Eager-load both teams. The serializer below reads match.home_team.name
+        # and match.away_team.name, which lazy-loads two extra SELECTs per row —
+        # at limit=500 that is 1000 additional queries for one request.
+        query = db.session.query(Match).options(
+            joinedload(Match.home_team),
+            joinedload(Match.away_team),
+        )
 
         if season:
             query = query.filter(Match.season == season)
@@ -2613,24 +3255,36 @@ def get_upcoming_matches():
 def get_statistics_overview():
     """Get overall statistics"""
     try:
-        total_matches = db.session.query(Match).filter(Match.status == 'FINISHED').count()
-        home_wins = db.session.query(Match).filter(
-            and_(Match.status == 'FINISHED', Match.winner == 'HOME_TEAM')
-        ).count()
-        draws = db.session.query(Match).filter(
-            and_(Match.status == 'FINISHED', Match.winner == 'DRAW')
-        ).count()
-        away_wins = db.session.query(Match).filter(
-            and_(Match.status == 'FINISHED', Match.winner == 'AWAY_TEAM')
-        ).count()
+        # One aggregate query instead of four COUNTs plus a full table load.
+        # This previously hydrated every FINISHED match (40k+ ORM objects) purely
+        # to sum two integer columns, then did the same for every Prediction —
+        # by far the heaviest endpoint in the API, for numbers Postgres can add.
+        def _wins(value):
+            return func.coalesce(func.sum(case((Match.winner == value, 1), else_=0)), 0)
 
-        matches = db.session.query(Match).filter(Match.status == 'FINISHED').all()
-        home_goals = sum(m.home_score or 0 for m in matches)
-        away_goals = sum(m.away_score or 0 for m in matches)
+        total_matches, home_wins, draws, away_wins, home_goals, away_goals = (
+            db.session.query(
+                func.count(Match.id),
+                _wins('HOME_TEAM'),
+                _wins('DRAW'),
+                _wins('AWAY_TEAM'),
+                func.coalesce(func.sum(Match.home_score), 0),
+                func.coalesce(func.sum(Match.away_score), 0),
+            )
+            .filter(Match.status == 'FINISHED')
+            .one()
+        )
 
-        predictions = db.session.query(Prediction).filter(Prediction.actual_winner.isnot(None)).all()
-        total_predictions = len(predictions)
-        correct_predictions = len([p for p in predictions if p.correct])
+        total_predictions, correct_predictions = (
+            db.session.query(
+                func.count(Prediction.id),
+                func.coalesce(
+                    func.sum(case((Prediction.correct.is_(True), 1), else_=0)), 0
+                ),
+            )
+            .filter(Prediction.actual_winner.isnot(None))
+            .one()
+        )
         model_accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
 
         return jsonify({
@@ -2671,7 +3325,18 @@ def get_head_to_head():
         if not team1_id or not team2_id:
             return jsonify({'error': 'Missing team1_id or team2_id'}), 400
 
-        matches = db.session.query(Match).filter(
+        # Resolve both teams up front. The response builder used to call
+        # db.session.get(Team, id).name directly, which raised AttributeError on
+        # None and surfaced as a 500 for what is plainly a 404.
+        team1 = db.session.get(Team, team1_id)
+        team2 = db.session.get(Team, team2_id)
+        if not team1 or not team2:
+            return jsonify({'error': 'Team not found'}), 404
+
+        matches = db.session.query(Match).options(
+            joinedload(Match.home_team),
+            joinedload(Match.away_team),
+        ).filter(
             and_(
                 (
                     (Match.home_team_id == team1_id) & (Match.away_team_id == team2_id)
@@ -2726,14 +3391,14 @@ def get_head_to_head():
         return jsonify({
             'team1': {
                 'id': team1_id,
-                'name': db.session.get(Team, team1_id).name,
+                'name': team1.name,
                 'wins': team1_wins,
                 'goals_scored': team1_goals,
                 'goals_conceded': team2_goals
             },
             'team2': {
                 'id': team2_id,
-                'name': db.session.get(Team, team2_id).name,
+                'name': team2.name,
                 'wins': team2_wins,
                 'goals_scored': team2_goals,
                 'goals_conceded': team1_goals

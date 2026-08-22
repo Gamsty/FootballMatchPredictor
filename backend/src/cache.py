@@ -13,14 +13,20 @@ from threading import Lock
 class PredictionCache:
     """Thread-safe in-memory cache with TTL expiry."""
 
-    def __init__(self, default_ttl=3600):
+    def __init__(self, default_ttl=3600, max_size=2000):
         """
         Args:
             default_ttl: Default time-to-live in seconds (1 hour)
+            max_size: Hard ceiling on retained entries. Expiry alone only ever
+                triggered on lookup, so a key nobody asks for again — every
+                fixture that has since kicked off — sat in the dict until the
+                worker recycled. Each entry is a full multi-market payload, so
+                that is real memory in a process already holding ~500MB of models.
         """
         self._cache = {}
         self._lock = Lock()
         self.default_ttl = default_ttl
+        self.max_size = max_size
 
     def _make_key(self, home_team_id, away_team_id, date_str=None):
         """Build cache key from match identifiers."""
@@ -39,7 +45,7 @@ class PredictionCache:
             return entry['data']
 
     def set(self, home_team_id, away_team_id, data, date_str=None, ttl=None):
-        """Store prediction in cache."""
+        """Store prediction in cache, evicting expired (then oldest) entries."""
         key = self._make_key(home_team_id, away_team_id, date_str)
         ttl = ttl or self.default_ttl
         with self._lock:
@@ -47,6 +53,23 @@ class PredictionCache:
                 'data': data,
                 'expires': time.time() + ttl,
             }
+            if len(self._cache) > self.max_size:
+                self._evict_locked()
+
+    def _evict_locked(self):
+        """Drop expired entries; if still over budget, drop soonest-to-expire.
+
+        Caller must hold the lock.
+        """
+        now = time.time()
+        for k in [k for k, v in self._cache.items() if now > v['expires']]:
+            del self._cache[k]
+        overflow = len(self._cache) - self.max_size
+        if overflow > 0:
+            # Soonest-expiring first ≈ oldest-written first, since writes share
+            # a TTL. Cheaper than tracking access order and good enough here.
+            for k, _ in sorted(self._cache.items(), key=lambda kv: kv[1]['expires'])[:overflow]:
+                del self._cache[k]
 
     def clear(self):
         """Clear all cached predictions."""

@@ -11,8 +11,6 @@ What this catches that unit tests don't:
 
 from __future__ import annotations
 
-import json
-import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -42,8 +40,18 @@ def client(monkeypatch):
     monkeypatch.delenv('BET_WRITE_TOKEN', raising=False)
 
     # Stub the model_storage loader so import doesn't try blob/disk
+    # WARM_CACHE=false: module import no longer warms inline, it spawns a thread —
+    # which would race the global-stubbing below and hit the unreachable DB.
+    monkeypatch.setenv('WARM_CACHE', 'false')
     with patch('model_storage.load_model_bytes', side_effect=Exception('mock')):
-        import app  # imports + executes module body (load_model, warm_cache)
+        import app  # imports + executes module body (load_model)
+
+    # FLASK_ENV=production above exists only to stop load_dotenv() at import.
+    # Now that import is done, drop back out of production: the bet-write gate
+    # refuses unauthenticated writes in production (by design), and these tests
+    # deliberately run with BET_WRITE_TOKEN cleared to exercise validation paths
+    # rather than the 401 path.
+    monkeypatch.setenv('FLASK_ENV', 'testing')
 
     app.app.config['TESTING'] = True
 
