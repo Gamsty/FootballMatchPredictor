@@ -408,13 +408,24 @@ az storage blob upload ...
 # 5. Vercel: set VITE_API_URL=https://<container-app-fqdn>/api, redeploy
 ```
 
-### Continuous deployment
+### CI, and a deliberately manual deploy
 
-Push to `main` triggers `.github/workflows/backend.yml`:
-1. Lint + test against ephemeral Postgres
-2. Build Docker image, push to ACR with commit SHA tag
-3. Update Container App revision
-4. Smoke-test `/api/health/ready` and check the reported `version` matches the deployed commit — roll back automatically if it doesn't
+`.github/workflows/backend.yml` runs on every push and pull request:
+1. Lint (`src/`, `jobs/`, `tests/`) + test against an ephemeral Postgres
+
+Deploying is a separate, **manually triggered** job — Actions → Backend CI/CD →
+Run workflow, from `main`. It is not wired to a merge: this project is developed
+and run locally, and a merge should not be able to replace the running
+production image on its own. `needs: test` still applies, so a manual run cannot
+skip the suite.
+
+2. Build the Docker image, push to ACR tagged with the commit SHA
+3. Update the Container App revision, stamping `GIT_SHA` on it
+4. Smoke-test `/api/health/ready` and require the reported `version` to match the
+   commit being deployed — the previous image is restored automatically if not
+
+`.github/workflows/frontend.yml` runs lint + `vite build` on pull requests. It
+does not deploy; Vercel builds from `main` itself.
 
 ## Author
 

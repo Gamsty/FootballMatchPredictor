@@ -1,5 +1,13 @@
 name: Backend CI/CD
 
+# Tests run automatically on every push and pull request. DEPLOYING DOES NOT —
+# it is manual-only, via "Run workflow" in the Actions tab (or
+# `gh workflow run backend.yml`). This project is developed and run locally; a
+# merge to main should not be able to push a new image at production on its own.
+#
+# To go back to deploy-on-merge, restore the build-and-deploy `if:` to
+#   github.event_name == 'push' && github.ref == 'refs/heads/main'
+
 on:
   push:
     branches: [main]
@@ -63,7 +71,9 @@ jobs:
 
   build-and-deploy:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Manual trigger only, and only from main — see the note at the top of the
+    # file. `needs: test` still holds, so a manual run cannot skip the suite.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

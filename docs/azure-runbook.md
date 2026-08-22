@@ -432,7 +432,19 @@ GitHub → Settings → Branches → Add rule for `main`:
 
 ### 10.4 Test workflow
 
-Merg en PR til `main` → workflow `Backend CI/CD` skal kjøre og deploye automatisk.
+Merg en PR til `main` → workflow `Backend CI/CD` kjører lint + tester.
+Den **deployer ikke**. Deploy er en egen jobb som må startes manuelt:
+
+    Actions → Backend CI/CD → Run workflow → branch: main
+
+eller `gh workflow run backend.yml --ref main`. Grunnen er at prosjektet
+utvikles og kjøres lokalt — en merge til `main` skal ikke kunne bytte ut
+imaget som kjører i produksjon av seg selv. `needs: test` gjelder fortsatt,
+så en manuell kjøring kan ikke hoppe over testene.
+
+Vil du tilbake til deploy-på-merge, sett `if:` på `build-and-deploy` til
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`.
+
 Frontend har sin egen workflow (`Frontend CI`) som kjører lint + `vite build`.
 Den deployer **ikke** — Vercel gjør det fra git — men den stopper en ødelagt
 frontend på PR-en i stedet for i produksjon.
