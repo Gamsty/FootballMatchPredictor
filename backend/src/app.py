@@ -156,6 +156,13 @@ _last_epoch_check = 0.0
 _reload_lock = Lock()
 
 
+# Fewest distinct probabilities an isotonic calibrator must be able to emit per
+# class before it is trusted. It is a step function, so this is a direct measure
+# of how much of the model's output survives it. 50 is roughly a 2%-wide bucket,
+# which is about the smallest edge worth acting on.
+MIN_CALIBRATOR_RESOLUTION = int(os.getenv('MIN_CALIBRATOR_RESOLUTION', '50'))
+
+
 def load_model():
     """Load ML models at startup (blob in prod, local in dev)."""
     global model_data, multi_market_models
@@ -185,37 +192,58 @@ def load_model():
         multi_market_models = None
 
     # Load optional calibrator. Two kinds supported:
-    #   - calibrator.json (TemperatureCalibrator — preferred for production)
-    #   - calibrator_isotonic.pkl (IsotonicCalibrator — more flexible, less
-    #     stable across retrains, may not preserve argmax)
-    # If both exist, isotonic wins (newer/explicitly-chosen). Absence is fine
-    # — predictions stay uncalibrated.
+    #   - calibrator.json (TemperatureCalibrator) — one scalar, monotone, so it
+    #     rescales confidence without ever changing which outcome the model
+    #     picked and without reducing how many distinct values it can express.
+    #   - calibrator_isotonic.pkl (IsotonicCalibrator) — strictly more flexible
+    #     and can fix shape a single T cannot, but it is a STEP FUNCTION and it
+    #     is fitted per class then renormalised, so it does neither of those
+    #     things for free.
+    #
+    # Temperature is tried first. This used to be the other way round, with a
+    # comment calling calibrator.json "preferred for production" directly above
+    # code that preferred isotonic. The isotonic calibrator in service had 18
+    # distinct outputs on its worst class: six different fixtures came out as
+    # three predictions, and it flipped the model's pick on two of them.
+    # Absence of both is fine — predictions stay uncalibrated.
     if model_data:
         model_data['calibrator'] = None
-        # Try isotonic first
         try:
-            from calibrator import IsotonicCalibrator
-            iso_bytes = load_model_bytes("calibrator_isotonic.pkl")
-            iso_path = Path(__file__).parent.parent / 'models' / 'calibrator_isotonic.pkl'
-            iso_path.parent.mkdir(parents=True, exist_ok=True)
-            iso_path.write_bytes(iso_bytes)
-            cal = IsotonicCalibrator.load(iso_path)
+            cal_bytes = load_model_bytes("calibrator.json")
+            import json as _json
+            cal = TemperatureCalibrator.from_dict(_json.loads(cal_bytes.decode('utf-8')))
             model_data['calibrator'] = cal
             logger.info(
-                "IsotonicCalibrator loaded",
-                extra={"fit_samples": cal.fit_samples, "classes": len(cal.models)},
+                "TemperatureCalibrator loaded",
+                extra={"temperature": cal.temperature, "fit_samples": cal.fit_samples},
             )
         except Exception:
-            # Fall through to temperature
+            # Fall through to isotonic, but only if it can actually express a
+            # range of probabilities. A coarse one is worse than none: value
+            # betting compares model probability to a bookmaker price, and an
+            # edge is not meaningful when the model can only emit ~20 values.
             try:
-                cal_bytes = load_model_bytes("calibrator.json")
-                import json as _json
-                cal = TemperatureCalibrator.from_dict(_json.loads(cal_bytes.decode('utf-8')))
-                model_data['calibrator'] = cal
-                logger.info(
-                    "TemperatureCalibrator loaded",
-                    extra={"temperature": cal.temperature, "fit_samples": cal.fit_samples},
-                )
+                from calibrator import IsotonicCalibrator
+                iso_bytes = load_model_bytes("calibrator_isotonic.pkl")
+                iso_path = Path(__file__).parent.parent / 'models' / 'calibrator_isotonic.pkl'
+                iso_path.parent.mkdir(parents=True, exist_ok=True)
+                iso_path.write_bytes(iso_bytes)
+                cal = IsotonicCalibrator.load(iso_path)
+                resolution = cal.resolution()
+                if resolution < MIN_CALIBRATOR_RESOLUTION:
+                    logger.warning(
+                        "IsotonicCalibrator rejected: %d distinct outputs on its worst "
+                        "class (need >= %d). Serving uncalibrated rather than quantised. "
+                        "Refit on more samples via /api/admin/refit-calibration.",
+                        resolution, MIN_CALIBRATOR_RESOLUTION,
+                    )
+                else:
+                    model_data['calibrator'] = cal
+                    logger.info(
+                        "IsotonicCalibrator loaded",
+                        extra={"fit_samples": cal.fit_samples, "classes": len(cal.models),
+                               "resolution": resolution},
+                    )
             except Exception as e:
                 logger.info(f"No calibrator available — predictions stay uncalibrated: {e}")
 

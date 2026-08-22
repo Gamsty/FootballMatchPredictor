@@ -251,3 +251,73 @@ def test_fit_reduces_ece_on_miscalibrated_data():
     assert ece_after < ece_before
     # The fix should be substantial — at least halve the ECE
     assert ece_after < ece_before * 0.6
+
+
+class TestIsotonicResolution:
+    """
+    An isotonic calibrator is a step function. Fit on too few samples it has very
+    few steps, and the probability space collapses: distinct fixtures come out
+    with byte-identical probabilities and an edge against a bookmaker price stops
+    meaning anything.
+
+    Found in service, not in theory. The deployed calibrator had 18 distinct
+    outputs on its worst class (1,067 fit samples). Six different fixtures
+    rendered as three predictions on the dashboard, and because isotonic is
+    fitted per class and then renormalised, it also flipped the model's pick on
+    two of them.
+    """
+
+    def _fit(self, n, seed=0):
+        import numpy as np
+        from calibrator import IsotonicCalibrator
+        rng = np.random.default_rng(seed)
+        probs = rng.dirichlet([2.0, 2.0, 2.0], size=n)
+        labels = np.array([rng.choice(3, p=p) for p in probs])
+        cal = IsotonicCalibrator()
+        cal.fit(probs, labels)
+        return cal
+
+    def test_resolution_counts_distinct_outputs(self):
+        cal = self._fit(2000)
+        assert cal.resolution() > 0
+
+    def test_a_small_fit_produces_a_coarse_calibrator(self):
+        """The condition the loader screens for."""
+        small = self._fit(150)
+        large = self._fit(4000)
+        assert small.resolution() < large.resolution()
+
+    def test_resolution_is_zero_for_an_unfitted_calibrator(self):
+        from calibrator import IsotonicCalibrator
+        assert IsotonicCalibrator().resolution() == 0
+
+    def test_isotonic_can_reorder_outcomes(self):
+        """
+        Why nothing downstream may assume the calibrated argmax matches the raw
+        one. Fitted per class then renormalised, isotonic is not monotone in the
+        joint distribution — unlike temperature scaling.
+        """
+        import numpy as np
+        from calibrator import IsotonicCalibrator
+        rng = np.random.default_rng(7)
+        n = 600
+        probs = rng.dirichlet([2.0, 2.0, 2.0], size=n)
+        # Label draws far more often than the model expects, so the draw class's
+        # isotonic curve lifts hard and can overtake a marginal favourite.
+        labels = np.array([1 if rng.random() < 0.62 else rng.choice([0, 2]) for _ in range(n)])
+        cal = IsotonicCalibrator()
+        cal.fit(probs, labels)
+        flipped = sum(1 for p in probs
+                      if int(np.argmax(p)) != int(np.argmax(cal.transform(p))))
+        assert flipped > 0, "expected per-class isotonic to reorder at least one row"
+
+    def test_temperature_scaling_never_reorders(self):
+        """The property that makes temperature safe as the default."""
+        import numpy as np
+        from calibrator import TemperatureCalibrator
+        rng = np.random.default_rng(3)
+        probs = rng.dirichlet([2.0, 2.0, 2.0], size=500)
+        for t in (0.5, 0.8, 1.3, 2.0):
+            cal = TemperatureCalibrator(temperature=t)
+            for p in probs:
+                assert int(np.argmax(p)) == int(np.argmax(cal.transform(p)))

@@ -228,7 +228,10 @@ def predict_match_result(features_dict, model_data, apply_calibration: bool = Tr
     raw_draw = float(proba[1])
     raw_away = float(proba[0])
 
-    # Apply calibration if available — single-T rescaling preserves argmax
+    # Apply calibration if available. Temperature scaling is monotone, so the
+    # ranking survives it. An isotonic calibrator is fitted per class and then
+    # renormalised, which can reorder outcomes — so nothing downstream may
+    # assume the calibrated argmax matches the raw one.
     calibrator = model_data.get('calibrator') if apply_calibration else None
     if calibrator is not None:
         # Calibrator expects same class order as `proba`
@@ -241,7 +244,10 @@ def predict_match_result(features_dict, model_data, apply_calibration: bool = Tr
         home_prob, draw_prob, away_prob = raw_home, raw_draw, raw_away
         is_calibrated = False
 
-    # Argmax doesn't change under temperature scaling — compute from either
+    # Recomputed from the CALIBRATED probabilities. This was previously
+    # justified with "argmax doesn't change under temperature scaling" — true of
+    # temperature, false of the isotonic calibrator that was actually in
+    # service, which flipped the pick on two of six fixtures sampled.
     pred_idx = int(np.argmax([away_prob, draw_prob, home_prob]))
     outcome_map = {0: 'AWAY_WIN', 1: 'DRAW', 2: 'HOME_WIN'}
 
