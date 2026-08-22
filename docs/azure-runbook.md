@@ -185,6 +185,117 @@ Remove-Item football_predictor.dump
 
 ---
 
+## 6.1 Skjemamigrasjoner (kolonner + indekser)
+
+`init_db()` kjorer ved oppstart av containeren og er idempotent. Den gjor tre ting:
+
+1. `create_all` — lager tabeller som mangler.
+2. ADD COLUMN — legger til kolonner som kom til etter at tabellen ble laget
+   (listen `MIGRATIONS` i `backend/src/database.py`).
+3. Indekssynk — lager indekser som er deklarert på modellene, men mangler i
+   databasen, og dropper de som star oppfort som overflodige.
+
+Steg 3 finnes fordi `create_all` bare lager indekser som del av CREATE TABLE. En
+indeks som ble lagt til i `__table_args__` etter at tabellen alt fantes, havner
+aldri i en eksisterende database — og ingenting feiler. Det var tilfellet for
+`ix_matches_home_date_status` / `ix_matches_away_date_status` i produksjon.
+
+Loggen ved oppstart viser hva som skjedde:
+
+```
+Migration: created index ix_matches_home_date_status on matches
+Migration: dropped redundant index ix_matches_id on matches
+```
+
+### Feature-pipeline-versjon
+
+`match_features.pipeline_version` stempler hvilken feature-definisjon som
+produserte hver rad. Den inkrementelle rekalkuleringen sammenlignet før bare mot
+`match.updated_at` — den ser at en kamp har fått resultat, men aldri at selve
+pipelinen har endret seg. Rader bygget med sesongsluttabeller så derfor
+permanent oppdaterte ut, og den ukentlige retrain-jobben ville trent videre på
+dem.
+
+Migrasjonen legger til kolonnen med NULL på eksisterende rader, som leses som
+«ukjent — bygg på nytt». Første retrain etter deploy rekalkulerer altså hele
+`match_features` én gang (~5 min på 40k kamper, godt innenfor jobbens
+2-timers `replicaTimeout`). Kjøringene etterpå hopper over som normalt.
+
+Endrer du betydningen av en feature senere: bump
+`FEATURE_PIPELINE_VERSION` i `backend/src/feature_engineering.py`. Da rydder
+neste kjøring opp av seg selv — ingen `force=True` å huske.
+
+```powershell
+# Sjekk fordelingen etter en retrain
+psql $DATABASE_URL -c "SELECT pipeline_version, count(*) FROM match_features GROUP BY 1"
+```
+
+### Hvis unik-indeksen på standings feiler
+
+`uq_standings_team_season_comp` er UNIQUE. Har databasen allerede duplikater,
+logger oppstarten dette og fortsetter uten indeksen:
+
+```
+Migration: could not create index uq_standings_team_season_comp on standings
+(IntegrityError: ...). If it is UNIQUE, de-duplicate first.
+```
+
+Rydd opp — behold nyeste rad per (team_id, season, competition) — og restart
+container-appen slik at migrasjonen kjorer på nytt:
+
+```sql
+DELETE FROM standings s
+USING standings dup
+WHERE s.team_id = dup.team_id
+  AND s.season = dup.season
+  AND s.competition = dup.competition
+  AND s.id < dup.id;
+```
+
+Merk: CREATE INDEX tar en skrivelås på tabellen. På vart datavolum (~40k
+matches-rader) tar det under et sekund, men det skjer ved oppstart av hver
+worker — ikke deploy midt i en kamphelg hvis du nettopp la til en stor indeks.
+
+---
+
+## 6.2 Engangsreparasjon: syntetiske lag-IDer
+
+Gjelder databaser som ble fylt for `generate_team_id` ble deterministisk.
+
+Lag som bare finnes i football-data.co.uk-CSVene far en syntetisk `api_id`. Den
+ble tidligere utledet fra Pythons innebygde `hash()`, som randomiserer
+streng-hashing per prosess. IDen var derfor ulik for hver kjoring, mens
+`add_team` matcher pa nettopp `api_id` — sa hver ny lasting la inn en ny
+Team-rad per klubb, og klubbens kamphistorikk ble splittet over duplikatene.
+Feature engineering slar opp pa primaernokkelen, sa form, h2h og hviledager ble
+regnet ut pa en brokdel av den faktiske historikken.
+
+Generatoren bruker na crc32 (stabil pa tvers av prosesser). Ryddejobben:
+
+```powershell
+# 1. Se hva som ville skjedd — skriver ingenting
+python jobs/remap_synthetic_team_ids.py
+
+# 2. Slå sammen duplikatlag og skriv nye deterministiske api_id-er
+python jobs/remap_synthetic_team_ids.py --apply
+
+# 3. Valgfritt: slett duplikatkamper som sammenslåingen avdekker.
+#    Kun kamper UTEN prediksjoner/spill/snapshots slettes; resten rapporteres.
+python jobs/remap_synthetic_team_ids.py --apply --merge-matches
+```
+
+Jobben rorer ikke lag med ekte football-data.org-IDer, og den er idempotent —
+andre kjoring rapporterer null endringer. Kjor den for neste
+`python src/load_external_csv.py`, ellers legges det inn enda et sett duplikater.
+
+Etter opprydding bor features regnes pa nytt, siden historikken na er samlet:
+
+```powershell
+python src/feature_engineering.py
+```
+
+---
+
 ## 7. Last opp modeller til Blob Storage (Fase 4)
 
 ```powershell
@@ -211,7 +322,10 @@ az storage blob upload `
 $APP_URL = az containerapp show --name $CA --resource-group $RG --query properties.configuration.ingress.fqdn -o tsv
 Write-Host "Backend URL: https://$APP_URL"
 
+# /api/health er liveness: svarer 200 selv uten DB/modell.
 curl "https://$APP_URL/api/health"
+# /api/health/ready er den som faktisk sier om appen kan betjene trafikk.
+curl "https://$APP_URL/api/health/ready"
 ```
 
 Hvis det feiler, sjekk loggene:
@@ -313,12 +427,53 @@ GitHub repo → Settings → Secrets and variables → Actions → New repositor
 ### 10.3 Branch protection
 
 GitHub → Settings → Branches → Add rule for `main`:
-- Require status checks before merging → "test"
+- Require status checks before merging → "test" (backend) og "build" (frontend)
 - Require branches to be up to date
 
 ### 10.4 Test workflow
 
 Merg en PR til `main` → workflow `Backend CI/CD` skal kjøre og deploye automatisk.
+Frontend har sin egen workflow (`Frontend CI`) som kjører lint + `vite build`.
+Den deployer **ikke** — Vercel gjør det fra git — men den stopper en ødelagt
+frontend på PR-en i stedet for i produksjon.
+
+### 10.5 Smoke test og automatisk rollback
+
+Deploy-jobben sjekker `/api/health/ready`, ikke `/api/health`.
+
+Det er ikke en detalj: `/api/health` er bevisst prosess-only og svarer
+`200 {"status":"healthy"}` selv uten database og uten modell lastet. Den gamle
+smoke-testen traff den, så et deploy som ikke kunne betjene en eneste request
+ble rapportert som vellykket. `/api/health/ready` svarer 503 til både databasen
+og modellen er brukbar.
+
+Begge endepunkter returnerer nå også `version` — commit-sha-en imaget ble bygget
+fra, satt som `GIT_SHA` ved deploy. Smoke-testen krever at den matcher commit-en
+som trigget kjøringen. Uten det kunne testen bli besvart av den **forrige**
+revisjonen mens den nye fortsatt startet opp, og passere på feil grunnlag.
+
+Sjekk hva som faktisk kjører:
+
+```powershell
+$APP_URL = az containerapp show --name $CA --resource-group $RG --query properties.configuration.ingress.fqdn -o tsv
+curl "https://$APP_URL/api/health/ready"
+# -> {"status":"ready","database":"ok","model_loaded":true,"version":"<sha>"}
+```
+
+Feiler smoke-testen, ruller jobben tilbake til imaget som lå der før deploy
+(`GIT_SHA` følger med tilbake, så `/api/health` ikke lyver om hva som kjører).
+Det feilende imaget blir liggende i ACR tagget med sin commit-sha, så det kan
+undersøkes:
+
+```powershell
+az containerapp show --name $CA --resource-group $RG --query "properties.template.containers[0].image" -o tsv
+```
+
+Merk: `infra.yml` deployer med `backendImageTag=latest` fra
+`main.parameters.prod.json`. En infra-deploy setter altså imaget til `latest` og
+nullstiller `GIT_SHA` (Bicep eier hele env-arrayet). Det er tilsiktet — for
+`latest` vet vi genuint ikke hvilken sha som kjører, og en tom verdi er mer
+ærlig enn en utdatert. Kjør backend-workflowen på nytt for å feste den igjen.
 
 ---
 
