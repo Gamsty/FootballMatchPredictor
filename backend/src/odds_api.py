@@ -43,7 +43,7 @@ import os
 import re
 import statistics
 import time
-from threading import Lock
+from threading import RLock
 
 import requests
 from rapidfuzz import fuzz
@@ -143,6 +143,10 @@ _TEAM_ALIASES_RAW = {
     'LOSC Lille':                 {'Lille'},
     'FC Nantes':                  {'Nantes'},
     'PSV':                        {'PSV Eindhoven'},
+    # football-data.co.uk spellings that share no token with the canonical name,
+    # so neither substring nor fuzzy matching reaches them.
+    'NEC':                        {'Nijmegen', 'NEC Nijmegen'},
+    'Fortuna Sittard':            {'For Sittard'},
     'FC Twente \'65':             {'Twente', 'FC Twente'},
     'AFC Ajax':                   {'Ajax'},
     'Feyenoord Rotterdam':        {'Feyenoord'},
@@ -168,7 +172,17 @@ def _normalize(name: str) -> str:
     n = name.lower().strip()
     n = re.sub(r'\b(fc|afc|cf|sc|ac|ssc|as|aj|cd|ud|sl|sd|fk|bk|sk|us|nk|sv|tsv|vfb|vfl|psv|kaa|kvc)\b', '', n)
     n = re.sub(r'[^a-z0-9äöüáéíóúñ&]+', ' ', n)
-    return ' '.join(n.split())
+    stripped = ' '.join(n.split())
+    if stripped:
+        return stripped
+    # Every token was a club-type token, so the whole name vanished — 'PSV' is
+    # the live example, and it was actively dangerous: _matches does a substring
+    # test, and '' is a substring of every string, so a name that normalized to
+    # empty matched every team on the board. Fall back to punctuation-only
+    # normalization, which always leaves something behind.
+    fallback = re.sub(r'[^a-z0-9äöüáéíóúñ&]+', ' ',
+                      name.lower().strip())
+    return ' '.join(fallback.split())
 
 
 _ALIAS_INDEX: dict[str, frozenset[str]] = {}
@@ -192,9 +206,13 @@ def _matches(name_a: str, name_b: str) -> bool:
         return False
     a = _normalize(name_a)
     b = _normalize(name_b)
+    if not a or not b:
+        return False
     if a == b:
         return True
-    if a in b or b in a:
+    # Substring is what makes 'Arsenal' match 'Arsenal FC'. Require three
+    # characters on the shorter side so a short remnant can't swallow the league.
+    if len(a) >= 3 and len(b) >= 3 and (a in b or b in a):
         return True
     alias_set = _ALIAS_INDEX.get(a) or _ALIAS_INDEX.get(b)
     if alias_set and a in alias_set and b in alias_set:
@@ -221,6 +239,12 @@ class OddsAPIClient:
     CACHE_TTL = 7 * 24 * 3600
     MAX_RETRIES = 3            # transient 5xx / connection errors only
     INITIAL_BACKOFF = 1.0      # exponential: 1s, 2s, 4s
+    REQUEST_TIMEOUT = 10.0     # per HTTP attempt
+    # Hard ceiling on one fetch_odds call, retries and backoff included.
+    # Without it the worst case was 3 attempts x 10s timeout + 1s + 2s backoff
+    # = 33s per league, and /api/value-bets loops leagues — enough consecutive
+    # bad responses would blow past gunicorn's 120s timeout and kill the worker.
+    FETCH_DEADLINE = 25.0
     DEFAULT_REGIONS = 'eu'     # 'eu', 'uk', 'us', 'au' — comma-separated for multiple
     # h2h and totals are available on the bulk /sports/{sport}/odds endpoint.
     # btts is ONLY available on /sports/{sport}/events/{eventId}/odds (per-event)
@@ -244,7 +268,13 @@ class OddsAPIClient:
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv('ODDS_API_KEY')
         self._cache: dict[str, dict] = {}
-        self._lock = Lock()
+        # Reentrant: the public methods lock, and some of them call each other.
+        self._lock = RLock()
+        try:
+            self.fetch_deadline = float(
+                os.getenv('ODDS_API_FETCH_DEADLINE', self.FETCH_DEADLINE))
+        except (TypeError, ValueError):
+            self.fetch_deadline = float(self.FETCH_DEADLINE)
         # Latest known quota state from response headers — populated by every successful fetch.
         self._quota_remaining: int | None = None
         self._quota_used: int | None = None
@@ -281,20 +311,29 @@ class OddsAPIClient:
         return f'{sport_key}|{",".join(sorted(markets))}|{regions}'
 
     def _cache_get(self, key: str):
-        entry = self._cache.get(key)
-        if not entry or time.time() > entry['expires']:
-            return None
-        return entry['data']
+        with self._lock:
+            entry = self._cache.get(key)
+            if not entry or time.time() > entry['expires']:
+                return None
+            return entry['data']
 
     def _cache_set(self, key: str, data, ttl: float | None = None):
-        self._cache[key] = {
-            'data': data,
-            'expires': time.time() + (ttl if ttl is not None else self.cache_ttl),
-        }
-        # Best-effort disk persist — survives restarts. We do this synchronously
-        # because the volume is small (1 file write per league per refresh),
-        # and async would risk losing the write if the process dies mid-fetch.
-        self._save_cache()
+        now = time.time()
+        with self._lock:
+            self._cache[key] = {
+                'data': data,
+                # stored_at is recorded rather than derived. cache_age() used to
+                # reconstruct it as expires - cache_ttl, which is wrong for any
+                # entry written with a different TTL — a negative-cached entry
+                # (10 min) made the UI report 'cached just now' immediately after
+                # a circuit-breaker trip, when nothing had been fetched at all.
+                'stored_at': now,
+                'expires': now + (ttl if ttl is not None else self.cache_ttl),
+            }
+            snapshot = dict(self._cache)
+        # Persist outside the lock: this is disk I/O, and holding the lock across
+        # it serialised every caller behind a file write.
+        self._save_cache(snapshot)
 
     def _load_cache(self):
         """Restore cache from disk on startup. Silently drops the file if it's
@@ -307,22 +346,34 @@ class OddsAPIClient:
             now = time.time()
             # Strip expired entries on load so we don't serve stale data
             # just because a long TTL was set before a quota outage.
-            self._cache = {
+            live = {
                 k: v for k, v in raw.items()
                 if isinstance(v, dict) and v.get('expires', 0) > now
             }
+            with self._lock:
+                self._cache = live
+            raw_count = len(raw)
             logger.info(
                 "Odds cache loaded from %s: %d live entries (skipped %d expired)",
-                self._cache_file, len(self._cache), len(raw) - len(self._cache),
+                self._cache_file, len(live), raw_count - len(live),
             )
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("Odds cache load failed (%s): %s. Starting fresh.",
                            self._cache_file, e)
-            self._cache = {}
+            with self._lock:
+                self._cache = {}
 
-    def _save_cache(self):
-        """Persist current cache state to disk. Atomic write via tmp+rename so a
-        crash mid-write can't leave a corrupt file."""
+    def _save_cache(self, snapshot: dict | None = None):
+        """Persist cache state to disk. Atomic write via tmp+rename so a crash
+        mid-write can't leave a corrupt file.
+
+        Takes a snapshot so the caller can copy under the lock and serialise
+        outside it — json.dump over the live dict would also risk mutation
+        during iteration.
+        """
+        if snapshot is None:
+            with self._lock:
+                snapshot = dict(self._cache)
         try:
             # makedirs('') would raise — guard for the case where the operator
             # set ODDS_API_CACHE_FILE to a bare filename in the cwd.
@@ -331,7 +382,7 @@ class OddsAPIClient:
                 os.makedirs(parent, exist_ok=True)
             tmp = self._cache_file + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(self._cache, f)
+                json.dump(snapshot, f)
             os.replace(tmp, self._cache_file)
         except OSError as e:
             # Don't crash the request just because the disk is full / read-only.
@@ -344,14 +395,16 @@ class OddsAPIClient:
         None if the cache is empty OR every entry has already expired (so the
         UI doesn't show 'cached 8d ago' when in reality the next call refetches).
         """
-        if not self._cache:
-            return None
         now = time.time()
-        live = [v for v in self._cache.values() if v.get('expires', 0) > now]
+        with self._lock:
+            live = [v for v in self._cache.values() if v.get('expires', 0) > now]
         if not live:
             return None
-        # 'expires' = set-time + ttl. So set-time = expires - ttl. Age = now - set-time.
-        most_recent_set = max(v['expires'] - self.cache_ttl for v in live)
+        # stored_at is written by _cache_set. Entries persisted by an older build
+        # don't carry it, so fall back to the old derivation for those.
+        most_recent_set = max(
+            v.get('stored_at', v['expires'] - self.cache_ttl) for v in live
+        )
         return max(0.0, now - most_recent_set)
 
     def clear_cache(self) -> int:
@@ -402,8 +455,7 @@ class OddsAPIClient:
             return []  # nothing to fetch — caller asked only for unsupported markets
 
         key = self._cache_key(sport_key, markets, regions)
-        with self._lock:
-            cached = self._cache_get(key)
+        cached = self._cache_get(key)
         if cached is not None:
             return cached
 
@@ -422,8 +474,7 @@ class OddsAPIClient:
             # Cache the empty result so we don't re-evaluate on every call in
             # the same loop. Short TTL — we want to recover quickly if the
             # quota window flips over.
-            with self._lock:
-                self._cache_set(key, [], ttl=self.NEGATIVE_CACHE_TTL)
+            self._cache_set(key, [], ttl=self.NEGATIVE_CACHE_TTL)
             return []
 
         params = {
@@ -433,10 +484,17 @@ class OddsAPIClient:
             'oddsFormat': 'decimal',
         }
         url = f'{self.BASE_URL}/sports/{sport_key}/odds/'
+        deadline = time.monotonic() + self.fetch_deadline
 
         for attempt in range(self.MAX_RETRIES):
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                logger.warning("Odds API: deadline of %.0fs exhausted for %s — giving up",
+                               self.fetch_deadline, sport_key)
+                return []
             try:
-                r = requests.get(url, params=params, timeout=10)
+                r = requests.get(url, params=params,
+                                 timeout=min(self.REQUEST_TIMEOUT, max(1.0, budget)))
                 # Always update quota from response headers (succeeds or not, header is present)
                 self._update_quota_from_headers(r.headers)
                 # 429 = quota / rate limit; don't retry (it'll just fail again immediately)
@@ -444,6 +502,11 @@ class OddsAPIClient:
                     logger.error("Odds API 429 for %s (quota exhausted or rate-limited). "
                                  "Remaining=%s, used=%s", sport_key,
                                  self._quota_remaining, self._quota_used)
+                    # Negative-cache like any other permanent 4xx. Recovery used to
+                    # depend entirely on the quota header being present on the 429;
+                    # without it the circuit breaker stays disarmed and every
+                    # remaining league in the same scan re-issues a doomed request.
+                    self._cache_set(key, [], ttl=self.NEGATIVE_CACHE_TTL)
                     return []
                 # 4xx that aren't 429 are permanent — bad key, bad sport, unsupported
                 # market. We negative-cache for 10 min so subsequent calls in the
@@ -452,8 +515,7 @@ class OddsAPIClient:
                 if 400 <= r.status_code < 500:
                     logger.warning("Odds API %s for %s: %s",
                                    r.status_code, sport_key, r.text[:200])
-                    with self._lock:
-                        self._cache_set(key, [], ttl=self.NEGATIVE_CACHE_TTL)
+                    self._cache_set(key, [], ttl=self.NEGATIVE_CACHE_TTL)
                     return []
                 # 5xx = transient, retry with backoff
                 if r.status_code >= 500:
@@ -464,12 +526,12 @@ class OddsAPIClient:
                             "[quota remaining=%s]",
                             len(data), sport_key, ','.join(markets), regions,
                             self._quota_remaining)
-                with self._lock:
-                    self._cache_set(key, data)
+                self._cache_set(key, data)
                 return data
             except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
-                if attempt < self.MAX_RETRIES - 1:
-                    backoff = self.INITIAL_BACKOFF * (2 ** attempt)
+                backoff = self.INITIAL_BACKOFF * (2 ** attempt)
+                if (attempt < self.MAX_RETRIES - 1
+                        and time.monotonic() + backoff < deadline):
                     logger.warning("Odds API transient error for %s (attempt %d/%d): %s "
                                    "— retrying in %.1fs",
                                    sport_key, attempt + 1, self.MAX_RETRIES, e, backoff)
@@ -719,11 +781,15 @@ class OddsAPIClient:
         import math
 
         # Pull any cached payload for this sport (markets/regions agnostic).
-        relevant = [v['data'] for k, v in self._cache.items()
-                    if k.startswith(sport_key + '|') and time.time() <= v['expires']]
+        now = time.time()
+        with self._lock:
+            relevant = [v for k, v in self._cache.items()
+                        if k.startswith(sport_key + '|') and now <= v['expires']]
         if not relevant:
             return None
-        events = relevant[0]
+        # Newest payload rather than whichever market/region combination happened
+        # to be first in dict order.
+        events = max(relevant, key=lambda v: v.get('stored_at', v['expires']))['data']
 
         per_book: dict[str, list[float]] = {}
         for event in events:

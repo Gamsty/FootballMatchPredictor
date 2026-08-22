@@ -4,7 +4,8 @@ Data Collection Module — Multi-League Edition
 Fetches football match data from the Football-Data.org API (v4).
 Free tier allows 10 requests/minute, so we enforce a 6-second delay between calls.
 
-Supported competitions (free tier):
+Supported competitions (free tier) — COMPETITIONS below is the source of truth
+(it also carries Eredivisie 2003 and UEFA Champions League 2001):
     - Premier League (2021)
     - Championship (2016)
     - Bundesliga (2002)
@@ -22,11 +23,14 @@ Data pipeline:
 
 import requests
 import pandas as pd
+import logging
 import time
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables (reads FOOTBALL_API_KEY from .env)
 load_dotenv()
@@ -62,12 +66,32 @@ class FootballDataCollector:
         self.api_key = api_key or os.getenv('FOOTBALL_API_KEY')
         self.base_url = 'https://api.football-data.org/v4'
         self.headers = {'X-Auth-Token': self.api_key}
-        # Free tier: 10 requests/min, so we wait 6 seconds between API calls
-        self.rate_limit_delay = 6
+        # Free tier: 10 requests/min, so we space calls 6 seconds apart.
+        self.rate_limit_delay = float(os.getenv('FOOTBALL_API_DELAY', '6'))
+        self.request_timeout = float(os.getenv('FOOTBALL_API_TIMEOUT', '20'))
+        self.max_retries = 3
+        self._last_request_at = 0.0
+
+    def _throttle(self):
+        """Space requests `rate_limit_delay` apart, measured from the last call.
+
+        Throttling BEFORE the request rather than sleeping after it means a lone
+        call pays nothing: /api/fixtures/refresh used to sit through a full 6s
+        sleep after its final chunk, inside the HTTP request, holding a gunicorn
+        worker for no reason. N chunks now cost N-1 waits instead of N.
+        """
+        elapsed = time.time() - self._last_request_at
+        if elapsed < self.rate_limit_delay:
+            time.sleep(self.rate_limit_delay - elapsed)
+        self._last_request_at = time.time()
 
     def _make_requests(self, endpoint, params=None):
         """
-        Make API request with error handling and rate limiting
+        Make an API request with rate limiting, retries and error handling.
+
+        Retries 429 (honouring Retry-After) and 5xx with backoff. The previous
+        version slept only on the SUCCESS path, so a burst of failures hammered
+        the API with no delay at all, and nothing was ever retried.
 
         Args:
             endpoint (str): API endpoint (e.g., '/competitions')
@@ -78,22 +102,60 @@ class FootballDataCollector:
         """
         url = f"{self.base_url}{endpoint}"
 
-        try:
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status() # Raise exception for bad status codes
+        for attempt in range(self.max_retries):
+            self._throttle()
+            try:
+                response = requests.get(url, headers=self.headers, params=params,
+                                        timeout=self.request_timeout)
+            except requests.exceptions.RequestException as e:
+                if attempt < self.max_retries - 1:
+                    backoff = 2 ** attempt
+                    logger.warning("football-data network error on %s (attempt %d/%d): %s"
+                                   " - retrying in %ss",
+                                   endpoint, attempt + 1, self.max_retries, e, backoff)
+                    time.sleep(backoff)
+                    continue
+                logger.warning("football-data gave up on %s: %s", endpoint, e)
+                return None
 
-            # Rate limiting
-            time.sleep(self.rate_limit_delay)
+            if response.status_code == 429:
+                # Free tier is 10/min; the header tells us how long to back off.
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else self.rate_limit_delay * 2
+                except (TypeError, ValueError):
+                    wait = self.rate_limit_delay * 2
+                if attempt < self.max_retries - 1:
+                    logger.warning("football-data 429 on %s - waiting %.0fs", endpoint, wait)
+                    time.sleep(wait)
+                    continue
+                logger.error("football-data 429 on %s after %d attempts",
+                             endpoint, self.max_retries)
+                return None
 
-            return response.json()
+            if response.status_code >= 500:
+                if attempt < self.max_retries - 1:
+                    backoff = 2 ** attempt
+                    logger.warning("football-data %s on %s - retrying in %ss",
+                                   response.status_code, endpoint, backoff)
+                    time.sleep(backoff)
+                    continue
+                logger.error("football-data %s on %s after %d attempts",
+                             response.status_code, endpoint, self.max_retries)
+                return None
 
-        except requests.exceptions.HTTPError as e:
-            print(f"HTTP Error: {e}")
-            print(f"Response: {response.text}")
-            return None
-        except requests.exceptions.RequestException as e:
-            print(f"Request Error: {e}")
-            return None
+            if response.status_code >= 400:
+                logger.error("football-data %s on %s: %s",
+                             response.status_code, endpoint, response.text[:200])
+                return None
+
+            try:
+                return response.json()
+            except ValueError as e:
+                logger.error("football-data returned non-JSON for %s: %s", endpoint, e)
+                return None
+
+        return None
 
     def get_competitions(self):
         """
@@ -266,7 +328,8 @@ class FootballDataCollector:
                 flattened.append(flat_match)
 
             except (KeyError, TypeError) as e:
-                print(f"Error processing match {match.get('id', 'unknown')}: {e}")
+                logger.warning("Error processing match %s: %s",
+                               match.get('id', 'unknown'), e)
                 continue
 
         return pd.DataFrame(flattened)
@@ -295,9 +358,13 @@ class FootballDataCollector:
         # API allows max 10-day window per request, so split into chunks
         all_matches = []
         chunk_size = 10
+        # Bound so the closing log can't NameError on a zero-length window.
+        date_from = date_to = None
         # Start `backfill_days` in the past so yesterday's finished matches
         # get their score + FINISHED status synced too.
-        start = datetime.now() - timedelta(days=backfill_days)
+        # UTC: kickoff times and our DateTime columns are UTC, so a local-time
+        # boundary shifts the whole window by the host's offset.
+        start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=backfill_days)
         remaining = days + backfill_days
 
         while remaining > 0:
@@ -361,10 +428,11 @@ class FootballDataCollector:
                     'winner': score.get('winner'),
                 })
             except (KeyError, TypeError) as e:
-                print(f"Error processing fixture {match.get('id', '?')}: {e}")
+                logger.warning("Error processing fixture %s: %s", match.get('id', '?'), e)
                 continue
 
-        print(f"Fetched {len(fixtures)} upcoming fixtures ({date_from} to {date_to})")
+        logger.info("Fetched %d upcoming fixtures (%s to %s)",
+                    len(fixtures), date_from, date_to)
         return fixtures
 
 
